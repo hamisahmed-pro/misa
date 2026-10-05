@@ -1215,11 +1215,32 @@ static int provider_complete_ondevice(const MModelMeta *meta, MVal **args,
     }
     rt = ondevice_runtime(mfile);
     if (strcmp(rt, "coreml") == 0) {
+#ifdef __APPLE__
+        /* Phase 5, M3: the CoreML backend lives in platform_apple.m.
+         * misa_coreml_infer returns 1 (JSON in out->text), 0 (E50x in
+         * out->ecode), or -1 (load/inference failure -> E400). */
+        {
+            char *json = NULL;
+            char ce[8] = {0};
+            int cr = misa_coreml_infer(meta, args, nargs, &json, ce,
+                                      errbuf, errcap);
+            if (cr == 1) {
+                out->text = json;
+                return PC_OK;
+            }
+            if (cr == 0) {
+                snprintf(out->ecode, sizeof out->ecode, "%s",
+                         ce[0] ? ce : "E502");
+                return PC_ECODE;
+            }
+            return PC_MODEL_ERR;
+        }
+#else
         snprintf(out->ecode, sizeof out->ecode, "E503");
         snprintf(errbuf, errcap,
-                 "CoreML models (.mlpackage/.mlmodelc) need Apple "
-                 "hardware (milestone M3)");
+                 "CoreML models (.mlpackage/.mlmodelc) need Apple hardware");
         return PC_ECODE;
+#endif
     }
     if (strcmp(rt, "tflite") == 0) {
         snprintf(out->ecode, sizeof out->ecode, "E503");

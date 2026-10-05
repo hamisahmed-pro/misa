@@ -12,6 +12,7 @@
 		389A41E7BB553E0FDD761616 /* misa_model.c in Sources */ = {isa = PBXBuildFile; fileRef = 1767C53B368CE2A78E7BA14B /* misa_model.c */; };
 		C21F7AED084AC1E7166BE148 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52DCA1184E276D97B02C226C /* Foundation.framework */; };
 		B99A213C11C777E0E7D59583 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A438725A3F59822B03017FC /* UIKit.framework */; };
+		CF0326433FC7B859471F35D5 /* CoreML.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5B94892EB4E90F6863A9A0FC /* CoreML.framework */; };
 		AE71F94A1E5DB48D74DB20DB /* prog_arm64.o in Frameworks */ = {isa = PBXBuildFile; fileRef = 6CDDD84D9ED73F3DA06455AA /* prog_arm64.o */; };
 		EB5E3D336E698DB6F26A6700 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "../../impl/misa/aot/rt/main.m"; sourceTree = SOURCE_ROOT; };
 		F72306D94B43F606D6B827F5 /* platform_apple.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "../../impl/misa/aot/rt/platform_apple.m"; sourceTree = SOURCE_ROOT; };
@@ -25,10 +26,12 @@
 		0D0F0622355761369C7461F5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		52DCA1184E276D97B02C226C /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
 		2A438725A3F59822B03017FC /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		5B94892EB4E90F6863A9A0FC /* CoreML.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreML.framework; path = System/Library/Frameworks/CoreML.framework; sourceTree = SDKROOT; };
 		14389818311E9EFFC95493EC /* MisaApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MisaApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0B0EAC1C67A2F2EB9E6EB6F7 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (
 			C21F7AED084AC1E7166BE148 /* Foundation.framework in Frameworks */,
 			B99A213C11C777E0E7D59583 /* UIKit.framework in Frameworks */,
+			CF0326433FC7B859471F35D5 /* CoreML.framework in Frameworks */,
 			AE71F94A1E5DB48D74DB20DB /* prog_arm64.o in Frameworks */,
 		); runOnlyForDeploymentPostprocessing = 0; };
 		B04831CC372489EBF0287850 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
@@ -42,7 +45,7 @@
 		AA0596BBDB4DCC95D5D4F10C = {isa = PBXGroup; children = (9F73E21E9318E16563416867, 268FFCB220060D98B3A51DB4, 99B2612622859F92D7197CBF, 0D0F0622355761369C7461F5, 6F7199ED7B63CDA338A0FB82); sourceTree = "<group>"; };
 		9F73E21E9318E16563416867 /* Runtime */ = {isa = PBXGroup; children = (B0B22CC6C699B8EE7AB374A7, B86E4E7C0A783CA1F8A5209A, 863F6FB5483BD9D03F6D29D6, EB5E3D336E698DB6F26A6700, F72306D94B43F606D6B827F5, 1081D6E15D7802B8669C779D, 53BE42226BB8035CB277F0FC, 1767C53B368CE2A78E7BA14B); name = Runtime; sourceTree = "<group>"; };
 		268FFCB220060D98B3A51DB4 /* Program */ = {isa = PBXGroup; children = (6CDDD84D9ED73F3DA06455AA); name = Program; path = program; sourceTree = "<group>"; };
-		99B2612622859F92D7197CBF /* Frameworks */ = {isa = PBXGroup; children = (52DCA1184E276D97B02C226C, 2A438725A3F59822B03017FC); name = Frameworks; sourceTree = "<group>"; };
+		99B2612622859F92D7197CBF /* Frameworks */ = {isa = PBXGroup; children = (52DCA1184E276D97B02C226C, 2A438725A3F59822B03017FC, 5B94892EB4E90F6863A9A0FC); name = Frameworks; sourceTree = "<group>"; };
 		6F7199ED7B63CDA338A0FB82 /* Products */ = {isa = PBXGroup; children = (14389818311E9EFFC95493EC); name = Products; sourceTree = "<group>"; };
 		34A04005BCAF206EEC990BD9 /* MisaApp */ = {isa = PBXNativeTarget; buildConfigurationList = 31107D0D11ECF16E15FA6E65 /* Build configuration list for PBXNativeTarget "MisaApp" */; buildPhases = (
 			B04831CC372489EBF0287850 /* Resources */,

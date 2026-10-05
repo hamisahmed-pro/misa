@@ -793,10 +793,14 @@ same arch with a different platform — `xcrun clang` handles it via
 
 Nothing in §4–§9 has been compiled or run. Concretely outstanding:
 
-1. `platform_apple.m` — sketch only; needs compile + runtime
-   testing of `misa_platform_http_post/get` against a real
-   endpoint, the `NSUserDefaults`→Keychain P3 migration, and the
-   fatal-alert presentation path.
+1. `platform_apple.m` — the NSURLSession transport is implemented
+   and the CoreML on-device backend (`misa_coreml_infer`, Phase 5 M3)
+   is written; both are compile-verified by the macOS CI job
+   (`.github/workflows/ios.yml`), but neither has run on hardware:
+   needs runtime testing of `misa_platform_http_post/get` against a
+   real endpoint, a real `.mlpackage` inference, the
+   `NSUserDefaults`→Keychain P3 migration, and the fatal-alert
+   presentation path.
 2. `ui_uikit.m` — skeleton only; `misa_ui_set_arg` (all 11
    components × args), `misa_ui_set_handler` trampolines,
    `misa_ui_show_screen` layout, `List`'s `UITableViewDataSource`,
@@ -817,6 +821,39 @@ Nothing in §4–§9 has been compiled or run. Concretely outstanding:
 When 1–4 are done, M7's exit proof is: **the same `.misa`
 codebase that builds to a web page (M3) installs and runs on an
 iPhone.**
+
+---
+
+## 11. On-device CoreML models (Phase 5, M3)
+
+A `provider` block with `model: file("plantdoc.mlpackage")` builds
+for Apple targets without E504 (`misa build --target
+aarch64-apple-ios-simulator` etc.). The program object carries only
+the embedded model path; the model itself ships as a bundle resource:
+
+1. Convert the model with coremltools
+   (`ct.convert(..., convert_to="mlprogram")` → `plantdoc.mlpackage`).
+   A pre-compiled `.mlmodelc` also works and skips the first-launch
+   compile.
+2. In Xcode: add the `.mlpackage` to the MisaApp target (it lands in
+   Copy Bundle Resources), or drop it in `ios/MisaApp/model/` and add
+   it to the target.
+3. At runtime `misa_coreml_infer` (`impl/misa/aot/rt/platform_apple.m`)
+   resolves the model in this order: the embedded path as given → the
+   app bundle's resources (`pathForResource:ofType:`) → the Documents
+   directory → as given (then load fails with E400 naming the path).
+4. v1 mapping: `Float`→scalar (float32 multi-array `[1]`, or a native
+   double/int64 scalar input), `[Float]`→1-D float32 multi-array,
+   `Text`→string input; input binding is by declared param name, else
+   positional over sorted input names; the first model output is
+   serialized to JSON. Shape mismatch → E501, unsupported
+   signature → E502. A missing model → E400 (not E501/E502: the file
+   isn't there at all).
+5. The Xcode template links CoreML.framework (added to
+   `gen_xcodeproj.py`; re-run it after pulling).
+
+Device verification is still pending hardware — the exact steps are in
+spec/ONDEVICE.md §6.
 
 ---
 

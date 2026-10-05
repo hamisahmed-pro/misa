@@ -196,6 +196,19 @@ MVal *misa_model_call(const MModelMeta *meta, MVal **args, int nargs,
 MVal *misa_model_call_meta(const char *meta_text, MVal **args, int nargs,
                            int line, int col);
 
+/* CoreML on-device backend (platform_apple.m; Apple targets only).
+ * Mirrors the v1 type mapping of the ORT backend: Float -> scalar,
+ * [Float] -> 1-D float32, Text -> string; first model output is
+ * serialized to JSON in *out_json (misa_alloc'd).
+ * Returns 1 on success, 0 when an E50x failure applies (ecode set to
+ * "E501"/"E502"/"E503", errbuf carries the message), -1 on
+ * load/inference failure (errbuf carries the message; the caller
+ * raises E400). Never called on non-Apple targets (the call site in
+ * misa_model.c is guarded by #ifdef __APPLE__). */
+int misa_coreml_infer(const MModelMeta *meta, MVal **args, int nargs,
+                      char **out_json, char *ecode,
+                      char *errbuf, size_t errcap);
+
 #ifdef __cplusplus
 }
 #endif

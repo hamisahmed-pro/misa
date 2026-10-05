@@ -48,8 +48,10 @@ ids.update({
     "ref:Info.plist": uid("ref:Info.plist"),
     "ref:Foundation": uid("ref:Foundation"),
     "ref:UIKit": uid("ref:UIKit"),
+    "ref:CoreML": uid("ref:CoreML"),
     "build:Foundation": uid("build:Foundation"),
     "build:UIKit": uid("build:UIKit"),
+    "build:CoreML": uid("build:CoreML"),
     "group:main": uid("group:main"),
     "group:rt": uid("group:rt"),
     "group:program": uid("group:program"),
@@ -89,7 +91,7 @@ W("\tobjects = {")
 for fname, _, _ in SOURCES:
     W("\t\t%s /* %s in Sources */ = {isa = PBXBuildFile; fileRef = %s /* %s */; };"
       % (ids["build:" + fname], fname, ids["ref:" + fname], fname))
-for fw in ("Foundation", "UIKit"):
+for fw in ("Foundation", "UIKit", "CoreML"):
     W("\t\t%s /* %s.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = %s /* %s.framework */; };"
       % (ids["build:" + fw], fw, ids["ref:" + fw], fw))
 W("\t\t%s /* prog_arm64.o in Frameworks */ = {isa = PBXBuildFile; fileRef = %s /* prog_arm64.o */; };"
@@ -110,13 +112,15 @@ W("\t\t%s /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileTyp
   % ids["ref:Foundation"])
 W("\t\t%s /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };"
   % ids["ref:UIKit"])
+W("\t\t%s /* CoreML.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreML.framework; path = System/Library/Frameworks/CoreML.framework; sourceTree = SDKROOT; };"
+  % ids["ref:CoreML"])
 W("\t\t%s /* MisaApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MisaApp.app; sourceTree = BUILT_PRODUCTS_DIR; };"
   % ids["productref"])
 
 # ---- PBXFrameworksBuildPhase / Resources / Sources ----
 W("\t\t%s /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ("
   % ids["phase:frameworks"])
-for fw in ("Foundation", "UIKit"):
+for fw in ("Foundation", "UIKit", "CoreML"):
     W("\t\t\t%s /* %s.framework in Frameworks */," % (ids["build:" + fw], fw))
 W("\t\t\t%s /* prog_arm64.o in Frameworks */," % ids["build:prog_arm64.o"])
 W("\t\t); runOnlyForDeploymentPostprocessing = 0; };")
@@ -139,8 +143,9 @@ W("\t\t%s /* Runtime */ = {isa = PBXGroup; children = (%s); name = Runtime; sour
   % (ids["group:rt"], rt_children))
 W("\t\t%s /* Program */ = {isa = PBXGroup; children = (%s); name = Program; path = program; sourceTree = \"<group>\"; };"
   % (ids["group:program"], ids["ref:prog_arm64.o"]))
-W("\t\t%s /* Frameworks */ = {isa = PBXGroup; children = (%s, %s); name = Frameworks; sourceTree = \"<group>\"; };"
-  % (ids["group:frameworks"], ids["ref:Foundation"], ids["ref:UIKit"]))
+W("\t\t%s /* Frameworks */ = {isa = PBXGroup; children = (%s, %s, %s); name = Frameworks; sourceTree = \"<group>\"; };"
+  % (ids["group:frameworks"], ids["ref:Foundation"], ids["ref:UIKit"],
+     ids["ref:CoreML"]))
 W("\t\t%s /* Products */ = {isa = PBXGroup; children = (%s); name = Products; sourceTree = \"<group>\"; };"
   % (ids["group:products"], ids["productref"]))
 

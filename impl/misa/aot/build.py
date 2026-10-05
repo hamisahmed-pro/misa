@@ -595,6 +595,13 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
                         "line": item.line, "col": item.col, "hint": ""}]
                 staged_models.append(src)
                 continue
+            if rt == "coreml" and "apple" in eff_target:
+                # M3: the Xcode template compiles platform_apple.m with
+                # the CoreML backend and links CoreML.framework; the
+                # .mlpackage ships as a bundle resource (see
+                # docs/ios-cross.md). The program object carries only
+                # the embedded model path.
+                continue
             if rt == "onnx":
                 why = (f"ONNX Runtime AOT is wired for the host target "
                        f"only in M2")

@@ -8,6 +8,8 @@
   %.17g — the values are identical IEEE-754 doubles).
 - E501 shape mismatch in the compiled binary.
 - E504 still fires at build time for .mlpackage on the host.
+- E504 is lifted for .mlpackage on Apple targets (M3): the
+  ios-simulator program object builds cleanly.
 - E504 fires when ORT is not vendored (simulated via MISA_NO_ORT=1).
 
 Usage: test_ondevice.py [--keep]
@@ -176,6 +178,17 @@ def main():
     rc, so, se = build(ml_src, os.path.join(work, "coreml"))
     check("E504 for .mlpackage on host",
           rc != 0 and "E504" in (so + se), (so + se)[-300:])
+
+    # --- 8. E504 lifted for CoreML on Apple targets (M3) --------------
+    # The ios-simulator target emits a program object only; the build
+    # must accept the .mlpackage (the Xcode template links it).
+    rc, so, se = run([MISA, "build", ml_src, "-o",
+                      os.path.join(work, "coreml_sim.o"),
+                      "--target", "aarch64-apple-ios-simulator"])
+    check("no E504 for .mlpackage on ios-simulator",
+          rc == 0 and "E504" not in (so + se), (so + se)[-500:])
+    check("simulator program object emitted",
+          os.path.isfile(os.path.join(work, "coreml_sim.o")))
 
     print(f"\n{passed} passed, {len(failed)} failed")
     if not keep:

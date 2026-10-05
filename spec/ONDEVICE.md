@@ -102,9 +102,38 @@ networking disabled and still diagnoses. That is the exit proof.
   compiled binaries; E504 remains for unwired runtimes/targets.
   Verified: `plantdoc_edge` binary diagnoses with no network namespace,
   probabilities bit-identical to the interpreter.
-- **M3:** CoreML backend in `platform_apple.m` (compile-verified by
-  the macOS CI job; device test when hardware is available).
+- **M3 (implemented, device-unverified):** CoreML backend in
+  `platform_apple.m` (`misa_coreml_infer`, declared in `misa_rt.h`):
+  `.mlpackage`/`.mlmodelc` load via `+[MLModel modelWithContentsOfURL:]`,
+  lazy per-process cache, v1 type mapping (Float→scalar incl. native
+  double/int64 scalar inputs, [Float]→1-D float32 multi-array,
+  Text→string), input binding by declared param name with fallback to
+  positional over sorted input names, first output → JSON, E501/E502
+  surface with exact codes, load/inference failure → E400. The Xcode
+  template links CoreML.framework. `misa build --target
+  aarch64-apple-ios-simulator` (and the other Apple targets) no longer
+  E504 on CoreML models; the .mlpackage ships as a bundle resource
+  (see docs/ios-cross.md). Status: compile-verified by the macOS CI
+  job; **no device run yet** — verification steps below.
 - **M4:** TFLite/NNAPI on Android.
+
+### Device verification for M3 (pending hardware)
+
+1. On a Mac: convert `examples/models/tiny_classifier.onnx` (or train
+   any 4→3 classifier) to CoreML with coremltools
+   (`ct.convert(..., convert_to="mlprogram")` → `plantdoc.mlpackage`).
+2. `python3 impl/bin/misa build examples/plantdoc_edge_coreml.misa
+   -o ios/MisaApp/program/prog_arm64.o --target
+   aarch64-apple-ios-simulator` (provider block points at the
+   .mlpackage; build must succeed — E504 is lifted for Apple targets).
+3. In Xcode: add the `.mlpackage` to the MisaApp target's Copy Bundle
+   Resources (or `ios/MisaApp/model/` + target membership).
+4. Run on the simulator: the app must print the same probabilities as
+   the interpreter's offline run (bit-identical doubles, modulo the
+   `%.17g` rendering note in M2).
+5. Negative paths on device: wrong-length `[Float]` → E501;
+   non-numeric model → E502; missing .mlpackage → E400 with the
+   resolved path in the message.
 
 ## 7. Non-goals (Phase 5)
 
