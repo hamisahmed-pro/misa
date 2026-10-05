@@ -15,7 +15,7 @@ import json
 import os
 import sys
 
-WEB_DIR = os.path.expanduser("~/workspace/misa/web")
+WEB_DIR = os.environ.get("MISA_WEB_DIR", os.path.expanduser("~/workspace/misa/web"))
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8471
 
 REPLY = {

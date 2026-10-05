@@ -35,13 +35,13 @@ jobs:
       - name: Start stub server and Chrome
         run: |
           cd $GITHUB_WORKSPACE/tests/web
-          nohup python3 stub_server.py 8471 > /tmp/stub.log 2>&1 &
+          MISA_WEB_DIR=$GITHUB_WORKSPACE/web nohup python3 stub_server.py 8471 > /tmp/stub.log 2>&1 &
           google-chrome --headless --no-sandbox --disable-gpu --remote-debugging-port=9222 --allow-file-access-from-files about:blank > /tmp/chrome.log 2>&1 &
           sleep 6
       - name: Web checks (stub layer)
         run: |
           cd $GITHUB_WORKSPACE/tests/web
-          export MISA_WEB_BASE="file://$GITHUB_WORKSPACE/web"
+          export MISA_WEB_BASE="http://localhost:8471"
           export MISA_ROOT="$GITHUB_WORKSPACE"
           node cdp_web_test.js "$MISA_WEB_BASE"
           node cdp_web_m5_test.js
@@ -56,5 +56,5 @@ jobs:
             exit 0
           fi
           cd $GITHUB_WORKSPACE/tests/web
-          export MISA_WEB_BASE="file://$GITHUB_WORKSPACE/web"
+          export MISA_WEB_BASE="http://localhost:8471"
           node cdp_web_live_test.js
