@@ -1,0 +1,41 @@
+// Misa tour: core language features (no AI calls yet)
+
+app Tour {
+    title: "Tour",
+    version: "0.1.0",
+}
+
+type Pet {
+    name: Text,
+    legs: Int,
+}
+
+let name = "Misa"
+var counter = 0
+let pets: [Pet] = [
+    { name: "cat", legs: 4 },
+    { name: "spider", legs: 8 },
+]
+
+print("Hello from {name}!")
+
+for pet in pets {
+    print("{pet.name} has {pet.legs} legs")
+}
+
+while counter < 3 {
+    counter = counter + 1
+}
+
+if counter == 3 {
+    print("counted to three")
+} else {
+    print("something is very wrong")
+}
+
+let total_legs = pets[0].legs + pets[1].legs
+print("total legs: {total_legs}")
+
+assert(counter == 3, "counter should be 3")
+assert(total_legs == 12, "two pets, twelve legs")
+print("tour complete")

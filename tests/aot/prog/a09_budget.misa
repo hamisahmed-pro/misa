@@ -1,0 +1,21 @@
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    pricey: mock("pricey"),
+}
+
+type Verdict {
+    condition: Text,
+}
+
+model checkit(notes: Text) -> Verdict
+    with mock.pricey
+    budget { tokens: 1000 }
+    prompt v1 """
+    Notes: {notes}. Respond with structured data only.
+    """
+
+let v = checkit("test")
+print("unreachable")

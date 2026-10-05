@@ -1,0 +1,49 @@
+app tour {
+    name: "v0.2 tour",
+}
+
+// v0.2 tour: functions, maps, try/catch, fs, http, imports live here.
+// Run: misa run examples/v02tour.misa
+
+import "tourlib.misa"
+
+fn word_count(text: Text) -> Map<Text, Int> {
+    var counts: Map<Text, Int> = {}
+    var current = ""
+    for ch in text {
+        if ch == " " {
+            if len(current) > 0 {
+                var n = 0
+                try {
+                    n = counts[current]
+                } catch e {
+                    n = 0
+                }
+                counts[current] = n + 1
+                current = ""
+            }
+        } else {
+            current = current + ch
+        }
+    }
+    return counts
+}
+
+let counts = word_count("the cat sat on the mat")
+print(counts["the"])
+print(counts["cat"])
+print(double(21))
+
+try {
+    let page = http.get("https://example.com/")
+    print("fetched {len(page)} chars")
+} catch e {
+    print("net unavailable ({e.code}), skipping")
+}
+
+try {
+    fs.write("tour-out.txt", "counts: {len(counts)} words")
+    print(fs.read("tour-out.txt"))
+} catch e {
+    print("fs failed: {e.message}")
+}

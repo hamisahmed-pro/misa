@@ -1,0 +1,7 @@
+fn double(n: Int) -> Int {
+    return n * 2
+}
+
+fn quad(n: Int) -> Int {
+    return double(double(n))
+}

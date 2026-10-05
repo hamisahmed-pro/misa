@@ -1,0 +1,96 @@
+// WebSlice: Phase 4 M3/M4 verification app (Emscripten + DOM).
+//
+// Host:   misa run examples/webslice.misa --mock examples/webslice.mock.json
+// Web:    misa build --target wasm32-unknown-emscripten \
+//             examples/webslice.misa -o web/misa.js \
+//             --preload-file examples/webslice.mock.json@/mock.json
+//         then serve web/ over HTTP and open shell.html?mock=/mock.json
+
+app WebSlice {
+    title: "WebSlice",
+    version: "0.1.0",
+}
+
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    echo: mock("scripted"),
+    pricey: mock("pricey"),
+}
+
+type Echo {
+    answer: Text,
+}
+
+model ask(q: Text) -> Echo
+    with mock.echo
+    budget { tokens: 2000, latency: 30s, cost: $1.00 }
+    prompt v1 """
+    Answer: {q}. Respond with structured data only.
+    """
+
+model ask_tiny(q: Text) -> Echo
+    with mock.pricey
+    budget { tokens: 10, latency: 30s, cost: $1.00 }
+    prompt v1 """
+    Answer: {q}. Respond with structured data only.
+    """
+
+screen Home {
+    Column {
+        Heading(text: "Web slice")
+        Text(text: "hello from wasm")
+        Banner(text: "info banner", style: "info")
+        Banner(text: "warning banner", style: "warning")
+        Row {
+            Text(text: "left")
+            Spacer()
+            Text(text: "right")
+        }
+        List(items: ["one", "two", "three"])
+        TextInput(id: name, hint: "your name")
+        Button(label: "Greet", onTap: || {
+            navigate(Greet(name.text))
+        })
+        Button(label: "Ask model", onTap: || {
+            let r = ask("2+2?")
+            navigate(ModelOut(r.answer))
+        })
+        Button(label: "Blow budget", onTap: || {
+            try {
+                let r = ask_tiny("expensive?")
+                navigate(ModelOut("unexpected: {r.answer}"))
+            } catch e {
+                navigate(ModelOut("caught {e.code}"))
+            }
+        })
+        Button(label: "Next", onTap: || {
+            navigate(Second())
+        })
+    }
+}
+
+screen Greet(n: Text) {
+    Column {
+        Heading(text: "Hello {n}!")
+        Button(label: "Back", onTap: || { navigate(Home()) })
+    }
+}
+
+screen ModelOut(a: Text) {
+    Column {
+        Text(text: "model said: {a}")
+        Button(label: "Back", onTap: || { navigate(Home()) })
+    }
+}
+
+screen Second {
+    Column {
+        Text(text: "second screen")
+        Button(label: "Back", onTap: || { navigate(Home()) })
+    }
+}
+
+navigate(Home())

@@ -1,0 +1,42 @@
+if 1 < 2 {
+    print("t1")
+} else {
+    print("f1")
+}
+
+if false {
+    print("f2")
+} else {
+    print("t2")
+}
+
+var i = 0
+while i < 5 {
+    if i == 3 {
+        print("three")
+    }
+    i = i + 1
+}
+print("w{i}")
+
+print(true and "yes")
+print(false and "no")
+print(true or "yes")
+print(false or "fallback")
+print(0 or "zero-fallback")
+
+var total = 0
+for x in [1, 2, 3, 4] {
+    total = total + x
+}
+print(total)
+
+var n = 0
+for c in "" {
+    n = n + 1
+}
+print("empty:{n}")
+
+for x in [10] {
+    print("one:{x}")
+}

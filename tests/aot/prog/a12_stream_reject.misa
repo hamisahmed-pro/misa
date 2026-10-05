@@ -1,0 +1,16 @@
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    m: mock("m"),
+}
+
+model mm() -> Text
+    with mock.m
+    prompt v1 """
+    hi
+    """
+
+stream s = mm()
+print("unreachable")

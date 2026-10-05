@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Misa Android app manifest (Phase 4, M6). Debuggable build for
+     Hamis's own device first; store signing is a later step (his
+     keys). INTERNET is needed for model calls / http.get. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.misa.app">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.camera"
+        android:required="false" />
+
+    <!-- M6 slice: minSdk 24 (matches d8 --min-api 24), target 35. -->
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="35" />
+
+    <application
+        android:label="MisaApp"
+        android:debuggable="true"
+        android:allowBackup="false">
+        <activity
+            android:name=".MisaActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

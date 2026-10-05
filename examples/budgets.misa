@@ -1,0 +1,29 @@
+// Budget enforcement demo. The mock reports 180,000 tokens used;
+// the budget allows 1,000 -> run must abort with E500 BudgetExceeded.
+
+app Budgets {
+    title: "Budgets",
+    version: "0.1.0",
+}
+
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    pricey: mock("over_budget"),
+}
+
+type Verdict {
+    condition: Text,
+}
+
+model checkit(notes: Text) -> Verdict
+    with mock.pricey
+    budget { tokens: 1000 }
+    prompt v1 """
+    Notes: {notes}. Respond with structured data only.
+    """
+
+let v = checkit("test")
+print("unreachable: budget was not enforced")

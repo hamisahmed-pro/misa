@@ -1,0 +1,4 @@
+import "a11_util.misa"
+
+print(double(21))
+print(quad(3))

@@ -1,0 +1,17 @@
+screen Home(title: Text) {
+    Text(text: "hello {title}", id: t1)
+    Button(label: "go", onTap: || { print("tap") })
+    Column {
+        Text(text: "nested")
+    }
+    if title == "x" {
+        Text(text: "ex")
+    } else {
+        Text(text: "other")
+    }
+    for i in [1, 2] {
+        Text(text: "n{i}")
+    }
+}
+
+navigate(Home("world"))

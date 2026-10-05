@@ -1,0 +1,4 @@
+// Phase 4 M3: http.get smoke test on the web target.
+// Build: misa build --target wasm32-unknown-emscripten tests/web/webfetch.misa -o web/fetch.js
+// Serve web/ over HTTP, load shell.html, read the printed length from the console.
+print(len(http.get("http://localhost:8471/shell.html")))

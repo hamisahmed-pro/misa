@@ -1,0 +1,59 @@
+// WebModelNet: Phase 4 M5 verification app (network model calls on web).
+//
+// The provider is OpenAI-protocol; the base URL and key come from the
+// page's JS env bridge (never baked into the wasm):
+//   shell.html?app=webmodel.js
+//     &env_TESTKEY=dummy
+//     &env_MISA_OPENAI_BASE_URL=http://localhost:8471/api
+//
+// The test server (tests/web/stub_server.py) serves web/ statically and
+// answers POST /api/chat/completions with a canned OpenAI-shaped reply.
+// A second page load with a dead-port base URL exercises the catchable
+// transport-failure path.
+
+app WebModelNet {
+    title: "WebModelNet",
+    version: "0.1.0",
+}
+
+provider openai {
+    key: env("TESTKEY"),
+}
+
+models {
+    stub: openai("misa-stub"),
+}
+
+type Echo {
+    answer: Text,
+}
+
+model netask(q: Text) -> Echo
+    with openai.stub
+    budget { tokens: 2000, latency: 30s, cost: $1.00 }
+    prompt v1 """
+    Answer: {q}. Respond with structured data only.
+    """
+
+screen Home {
+    Column {
+        Heading(text: "Web model net test")
+        Button(label: "Net model", onTap: || {
+            try {
+                let r = netask("2+2?")
+                navigate(Done("net ok: {r.answer}"))
+            } catch e {
+                navigate(Done("caught {e.code}"))
+            }
+        })
+    }
+}
+
+screen Done(t: Text) {
+    Column {
+        Text(text: "{t}")
+        Button(label: "Back", onTap: || { navigate(Home()) })
+    }
+}
+
+navigate(Home())

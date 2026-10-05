@@ -1,0 +1,51 @@
+try {
+    let m = {"a": 1}
+    print(m["nope"])
+    print("bad")
+} catch e {
+    print("caught {e.code}")
+}
+
+try {
+    throw {code: "E999", message: "boom"}
+} catch e {
+    print("{e.code}: {e.message}")
+}
+
+try {
+    assert(false, "boom-assert")
+    print("bad")
+} catch e {
+    print("assert {e.code}")
+}
+
+try {
+    print(int("abc"))
+} catch e {
+    print("int-parse {e.code}")
+}
+
+fn risky(n: Int) -> Int {
+    if n == 0 {
+        throw {code: "E111", message: "zero!"}
+    }
+    return 100 / n
+}
+
+try {
+    print(risky(0))
+} catch e {
+    print("risky {e.code} {e.message}")
+}
+print(risky(4))
+
+try {
+    try {
+        throw {code: "E1", message: "inner"}
+    } catch e {
+        print("inner {e.code}")
+        throw {code: "E2", message: "outer"}
+    }
+} catch e {
+    print("rethrown {e.code}")
+}

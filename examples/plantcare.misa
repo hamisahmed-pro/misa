@@ -1,0 +1,66 @@
+// PlantCare: the Misa vision sketch as a runnable program.
+// Uses the mock provider; run with: misa run plantcare.lm --mock mocks.json
+
+app PlantCare {
+    title: "PlantCare",
+    version: "0.1.0",
+}
+
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    diag: mock("scripted"),
+}
+
+type Diagnosis {
+    condition: Text,
+    confidence: Float,
+    treatment: [Text],
+    urgent: Bool,
+}
+
+model diagnose(plant: Photo, notes: Text) -> Diagnosis
+    with mock.diag
+    budget { tokens: 2000, latency: 5s, cost: $0.01 }
+    prompt v3 """
+    You are a botanist. Photo: {plant}. Notes: {notes}.
+    Respond with structured data only.
+    """
+
+screen Home {
+    Column {
+        TextInput(id: notes, hint: "Describe the symptoms...")
+        Button(label: "Diagnose", onTap: || {
+            let result = diagnose(Photo("leaf.jpg"), notes.text)
+            navigate(ResultScreen(result))
+        })
+    }
+}
+
+screen ResultScreen(d: Diagnosis) {
+    Column {
+        Heading(text: "Diagnosis: {d.condition}")
+        if d.urgent {
+            Banner(text: "Needs attention today", style: "warning")
+        } else {
+            Banner(text: "All clear", style: "info")
+        }
+        for tip in d.treatment {
+            Text(text: tip)
+        }
+    }
+}
+
+eval diagnose_healthy_plant {
+    model: diagnose,
+    given: { plant: Photo("healthy.jpg"), notes: "looks fine" },
+    expect: result.confidence > 0.7 and not result.urgent,
+    runs: 3,
+}
+
+// drive one diagnosis at the top level, then show the result screen
+let demo = diagnose(Photo("leaf.jpg"), "yellow spots on leaves")
+print("condition: {demo.condition} ({demo.confidence})")
+navigate(ResultScreen(demo))

@@ -1,0 +1,1 @@
+{"bad_shape":{"condition":"unknown"},"diag":{"condition":"nitrogen deficiency","confidence":0.91,"treatment":["Add nitrogen-rich fertilizer","Water deeply twice a week"],"urgent":false},"pricey":{"_usage":{"input_tokens":90000,"latency_ms":10,"output_tokens":90000},"response":{"condition":"healthy"}}}

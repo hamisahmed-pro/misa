@@ -1,0 +1,25 @@
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    summarizer: mock("summarizer"),
+}
+
+type Summary {
+    title: Text,
+    score: Int,
+    tags: [Text],
+}
+
+model summarize(notes: Text) -> Summary
+    with mock.summarizer
+    prompt v1 """
+    Summarize: {notes}. Respond with structured data only.
+    """
+
+let s = summarize("some notes here")
+print(s.title)
+print(s.score)
+print(s.tags)
+print(s)

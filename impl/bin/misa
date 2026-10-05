@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""misa - the Misa language toolchain (v0.3).
+
+Usage:
+  misa run <file.misa> [--mock mocks.json] [--json]
+  misa check <file.misa> [--json]
+  misa fmt <file.misa> [--write]
+  misa test <file.misa> [--mock mocks.json] [--json]
+  misa build <file.misa> [-o output] [--emit-llvm file.ll] [--target triple] [--preload-file src@dst]... [--json]
+  misa build --list-targets
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".."))
+
+from misa.parser import parse_source, ParseError
+from misa.lexer import LexError
+from misa.checker import Checker, check_file
+from misa.fmt import Formatter
+from misa.interp import Interpreter
+from misa.loader import load as load_with_imports
+from misa.errors import MisaError
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"misa: error: {msg}\n")
+    sys.exit(code)
+
+
+def load_program(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+
+
+def load_mock(path):
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"cannot load mock file {path}: {e}")
+
+
+def emit_errors(errors, as_json):
+    if as_json:
+        print(json.dumps(errors, indent=2))
+    else:
+        for e in errors:
+            loc = f"{e['line']}:{e['col']}" \
+                if e.get("line") else "<unknown>"
+            sys.stderr.write(f"{loc}: {e['code']}: {e['message']}\n")
+            if e.get("hint"):
+                sys.stderr.write(f"  hint: {e['hint']}\n")
+
+
+def cmd_check(path, as_json):
+    errors = check_file(path)
+    if errors:
+        emit_errors(errors, as_json)
+        return 1
+    if not as_json:
+        print(f"{path}: OK")
+    return 0
+
+
+def cmd_fmt(path, write):
+    src = load_program(path)
+    try:
+        out = Formatter().format_program(parse_source(src, path))
+    except (ParseError, LexError) as e:
+        die(f"{e.line}:{e.col}: {e}")
+    if write:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(out)
+    else:
+        sys.stdout.write(out)
+    return 0
+
+
+def cmd_run(path, mock_path, as_json):
+    mock_scripts = load_mock(mock_path)
+    merged, load_errors, _order, _file_of = load_with_imports(path)
+    if merged is None:
+        emit_errors(load_errors, as_json)
+        return 1
+    errors = load_errors + Checker().check(merged, file_of=_file_of)
+    if errors:
+        emit_errors(errors, as_json)
+        return 1
+    interp = Interpreter(mock_scripts=mock_scripts)
+    try:
+        interp.run(merged)
+    except MisaError as e:
+        emit_errors([e.to_dict()], as_json)
+        return 1
+    return 0
+
+
+def cmd_test(path, mock_path, as_json):
+    mock_scripts = load_mock(mock_path)
+    merged, load_errors, _order, _file_of = load_with_imports(path)
+    if merged is None:
+        emit_errors(load_errors, as_json)
+        return 1
+    errors = load_errors + Checker().check(merged, file_of=_file_of)
+    if errors:
+        emit_errors(errors, as_json)
+        return 1
+    interp = Interpreter(mock_scripts=mock_scripts)
+    interp.load(merged)
+    results = []
+    failed = 0
+    for name, edecl in interp.evals.items():
+        mdecl = interp.models[edecl.model_name]
+        # given args in model param order
+        given = {k: v for k, v in edecl.given}
+        run_results = []
+        ok_all = True
+        for run in range(edecl.runs):
+            try:
+                arg_values = []
+                for pn, _ in mdecl.params:
+                    node = given[pn]
+                    arg_values.append(
+                        interp.eval_expr(node, interp.global_env))
+                result = interp.call_model(mdecl, arg_values, edecl)
+                env = __import__("misa.interp",
+                                 fromlist=["Env"]).Env(interp.global_env)
+                env.define("result", result, False)
+                for pn, _ in mdecl.params:
+                    env.define(pn, arg_values[
+                        [p for p, _ in mdecl.params].index(pn)], False)
+                passed = interp.truthy(
+                    interp.eval_expr(edecl.expect, env))
+                run_results.append({"run": run + 1, "pass": bool(passed),
+                                    "error": None})
+                if not passed:
+                    ok_all = False
+            except MisaError as e:
+                run_results.append({"run": run + 1, "pass": False,
+                                    "error": e.to_dict()})
+                ok_all = False
+        results.append({"eval": name, "model": edecl.model_name,
+                        "pass": ok_all, "runs": run_results})
+        if not ok_all:
+            failed += 1
+    if as_json:
+        print(json.dumps(results, indent=2))
+    else:
+        for r in results:
+            status = "PASS" if r["pass"] else "FAIL"
+            print(f"{status}  {r['eval']}  (model {r['model']}, "
+                  f"{len(r['runs'])} runs)")
+            for rr in r["runs"]:
+                if not rr["pass"]:
+                    detail = rr["error"]["message"] if rr["error"] \
+                        else "expect was false"
+                    print(f"       run {rr['run']}: FAIL: {detail}")
+        total = len(results)
+        print(f"\n{total - failed}/{total} evals passed")
+    return 1 if failed else 0
+
+
+def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
+    from misa.aot.build import build, canonical_target, host_triple
+    if not out:
+        base = os.path.basename(path)
+        stem = base[:-5] if base.endswith(".misa") else base
+        if target and canonical_target(target) != host_triple():
+            # cross targets: object file, except emscripten (M3) which
+            # links to misa.js + misa.wasm.
+            if canonical_target(target) == "wasm32-unknown-emscripten":
+                out = stem + ".js"
+            else:
+                out = stem + ".o"
+        elif base.endswith(".misa"):
+            out = base[:-5]
+        else:
+            out = base + ".bin"
+    try:
+        ok, errors = build(path, out, emit_llvm=emit_llvm or "",
+                           target=target or "",
+                           preload_files=preload_files)
+    except RuntimeError as e:
+        die(str(e))
+    if not ok:
+        emit_errors(errors, as_json)
+        return 1
+    if not as_json:
+        print(f"built {out}")
+    return 0
+
+
+def cmd_list_targets():
+    from misa.aot.build import list_targets
+    rows = list_targets()
+    w = max(len(t) for t, _, _, _ in rows)
+    print(f"{'triple'.ljust(w)}  status (C compiler | entry)")
+    for triple, status, cc, entry in rows:
+        print(f"{triple.ljust(w)}  {status} ({cc} | {entry})")
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return 0
+    cmd = argv[1]
+    args = argv[2:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    if cmd == "check" and len(args) == 1:
+        return cmd_check(args[0], as_json)
+    if cmd == "fmt" and 1 <= len(args) <= 2:
+        return cmd_fmt(args[0], "--write" in args)
+    if cmd == "run" and 1 <= len(args) <= 3:
+        mock = None
+        if "--mock" in args:
+            i = args.index("--mock")
+            mock = args[i + 1]
+        return cmd_run(args[0], mock, as_json)
+    if cmd == "test" and 1 <= len(args) <= 3:
+        mock = None
+        if "--mock" in args:
+            i = args.index("--mock")
+            mock = args[i + 1]
+        return cmd_test(args[0], mock, as_json)
+    if cmd == "build" and 1 <= len(args) <= 12:
+        if "--list-targets" in args:
+            return cmd_list_targets()
+        out = None
+        emit_llvm = ""
+        target = ""
+        preload_files = []
+        rest = []
+        i = 0
+        while i < len(args):
+            if args[i] == "-o" and i + 1 < len(args):
+                out = args[i + 1]
+                i += 2
+            elif args[i] == "--emit-llvm" and i + 1 < len(args):
+                emit_llvm = args[i + 1]
+                i += 2
+            elif args[i] == "--target" and i + 1 < len(args):
+                target = args[i + 1]
+                i += 2
+            elif args[i] == "--preload-file" and i + 1 < len(args):
+                # web target (M3): bundle a host file into the virtual
+                # FS, as src or src@dst.
+                preload_files.append(args[i + 1])
+                i += 2
+            else:
+                rest.append(args[i])
+                i += 1
+        if len(rest) != 1:
+            die(f"usage: misa build <file.misa> [-o output] "
+                f"[--emit-llvm file.ll] [--target triple] "
+                f"[--preload-file src@dst]")
+        return cmd_build(rest[0], out, emit_llvm, target, as_json,
+                         preload_files)
+    die(f"unknown command: {' '.join(argv[1:])}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

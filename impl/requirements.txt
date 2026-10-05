@@ -1,0 +1,6 @@
+# Misa toolchain Python dependencies.
+#
+# Only `misa build` (the LLVM AOT backend) needs anything beyond the
+# stdlib. Pinned: llvmlite's API moves between releases (0.50 removed
+# TargetMachine.target and made binding.initialize() raise).
+llvmlite==0.50.0

@@ -1,0 +1,14 @@
+name: host
+on: [push, workflow_dispatch]
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install llvmlite==0.50.0
+      - name: Interpreter suite
+        run: python3 tests/run_tests.py
+      - name: AOT parity suite
+        run: python3 tests/aot/run_aot_tests.py

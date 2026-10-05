@@ -1,0 +1,40 @@
+// AndroidSlice: Phase 4 M6 verification app (Android Views driver).
+//
+// Host (text driver):  misa run examples/android.misa
+// Object:              misa build --target aarch64-linux-android \
+//                          examples/android.misa -o /tmp/android.o
+// APK:                 python3 scripts/build_apk.py \
+//                          --misa examples/android.misa
+
+app AndroidSlice {
+    title: "AndroidSlice",
+    version: "0.1.0",
+}
+
+screen Home {
+    Column {
+        Heading(text: "Misa on Android")
+        Text(text: "native widgets, one codebase")
+        Banner(text: "info banner", style: "info")
+        Row {
+            Text(text: "left")
+            Spacer()
+            Text(text: "right")
+        }
+        List(items: ["one", "two", "three"])
+        TextInput(id: name, hint: "your name")
+        Button(label: "Greet", onTap: || {
+            navigate(Greet(name.text))
+        })
+    }
+}
+
+screen Greet(n: Text) {
+    Column {
+        Heading(text: "Hello {n}!")
+        Text(text: "from a Misa program running on Android")
+        Button(label: "Back", onTap: || { navigate(Home()) })
+    }
+}
+
+navigate(Home())
