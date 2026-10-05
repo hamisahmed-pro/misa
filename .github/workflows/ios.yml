@@ -1,0 +1,65 @@
+name: ios
+# Phase 7 (M7) verification on a real Apple toolchain — free via GitHub
+# Actions macOS runners. No MacBook required.
+on: [push, workflow_dispatch]
+jobs:
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install llvmlite==0.50.0
+
+      - name: Build PlantDoc program object (iOS simulator)
+        run: |
+          chmod +x impl/bin/misa
+          python3 impl/bin/misa build examples/plantdoc.misa \
+            -o ios/MisaApp/program/prog_arm64.o \
+            --target aarch64-apple-ios-simulator
+
+      - name: Compile ObjC runtime (simulator SDK)
+        run: |
+          cd impl/misa/aot/rt
+          for f in platform_apple.m ui_uikit.m main.m misa_model.c misa_rt.c; do
+            xcrun --sdk iphonesimulator clang -arch arm64 -c "$f" -o /tmp/sim_$f.o
+          done
+          echo "simulator SDK compile OK"
+
+      - name: Compile ObjC runtime (device SDK)
+        run: |
+          cd impl/misa/aot/rt
+          for f in platform_apple.m ui_uikit.m; do
+            xcrun --sdk iphoneos clang -arch arm64 -c "$f" -o /tmp/dev_$f.o
+          done
+          echo "device SDK compile OK"
+
+      - name: Xcode build (simulator, no signing)
+        run: |
+          cd ios/MisaApp
+          xcodebuild -project MisaApp.xcodeproj -target MisaApp \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            build CODE_SIGNING_ALLOWED=NO
+
+      - name: Simulator smoke test (launch, no crash)
+        run: |
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name "MisaApp.app" -type d | head -1)
+          echo "app: $APP"
+          test -n "$APP"
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          ds = json.load(sys.stdin)['devices']
+          for runtime, devs in ds.items():
+              for d in devs:
+                  if 'iPhone' in d['name'] and d['isAvailable']:
+                      print(d['udid']); sys.exit()
+          ")
+          echo "simulator: $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" com.misa.misaapp
+          sleep 10
+          # still alive and no crash log?
+          xcrun simctl spawn "$UDID" launchctl list | grep -i misa
+          echo "smoke test OK: app launched and running"
