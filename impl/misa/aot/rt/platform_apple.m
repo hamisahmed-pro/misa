@@ -525,7 +525,7 @@ int misa_coreml_infer(const MModelMeta *meta, MVal **args, int nargs,
             return 0;
         }
 
-        MLFeatureProvider *inProvider =
+        id<MLFeatureProvider> inProvider =
             [[MLDictionaryFeatureProvider alloc]
                 initWithDictionary:fdict error:&err];
         if (!inProvider) {
