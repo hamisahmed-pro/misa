@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install llvmlite==0.50.0 onnxruntime==1.21.0
+      - run: pip install llvmlite==0.50.0 onnxruntime==1.21.0 onnx==1.17.0
       - name: Vendor ONNX Runtime C library (AOT on-device, M2)
         run: |
           mkdir -p ~/workspace/deps/ort
