@@ -39,13 +39,13 @@ jobs:
           cd ios/MisaApp
           xcodebuild -project MisaApp.xcodeproj -target MisaApp \
             -sdk iphonesimulator \
-            -derivedDataPath /tmp/misa-dd \
             -destination 'platform=iOS Simulator,name=iPhone 16' \
             build CODE_SIGNING_ALLOWED=NO
 
       - name: Simulator smoke test (launch, no crash)
         run: |
-          APP=$(find /tmp/misa-dd -name "MisaApp.app" -type d | head -1)
+          APP=$(find ios/MisaApp/build ~/Library/Developer/Xcode/DerivedData \
+            -name "MisaApp.app" -type d 2>/dev/null | head -1)
           echo "app: $APP"
           test -n "$APP"
           UDID=$(xcrun simctl list devices available -j | python3 -c "
