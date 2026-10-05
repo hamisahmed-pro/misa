@@ -2,7 +2,9 @@ name: android-emulator
 # Boots the Misa APK on a real (emulated) Android phone in CI and proves
 # the app launches and renders. This is the device-level verification
 # the build sandbox cannot do (no device/emulator there).
-on: [push, workflow_dispatch]
+# Manual trigger only: the emulator run is slow and minute-heavy, and
+# Android code changes rarely — run it deliberately, not on every push.
+on: [workflow_dispatch]
 jobs:
   emulator:
     runs-on: ubuntu-latest

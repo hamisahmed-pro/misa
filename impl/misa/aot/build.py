@@ -122,14 +122,14 @@ TARGETS = {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-arm64",
         "entry": "main",
-        "status": "object only in M1 (link+sign on a Mac: M7)",
+        "status": "object only (link+sign on a Mac: M7 runtime in rt/*.m, template in ios/MisaApp)",
         "desc": "Apple ARM64 (iOS/macOS)",
     },
     "x86_64-apple-darwin": {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-x86_64",
         "entry": "main",
-        "status": "object only in M1 (link+sign on a Mac: M7)",
+        "status": "object only (link+sign on a Mac: M7 runtime in rt/*.m, template in ios/MisaApp)",
         "desc": "Apple x86-64 (macOS Intel)",
     },
 }

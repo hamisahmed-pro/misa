@@ -675,43 +675,52 @@ intent).
 
 ---
 
-## 7. Xcode project template notes
+## 7. Xcode project template (`ios/MisaApp`)
 
-Goal: a project the Mac operator can open, drop the transfer
-package into, and build — no Misa knowledge required.
+The template is a real, openable Xcode project — the Mac operator
+drops the transfer package's `prog_arm64.o` into `ios/MisaApp/program/`
+and presses Run. No Misa knowledge required. Regenerate with
+`ios/MisaApp/gen_xcodeproj.py` if the file list changes (it verifies
+every object id is defined).
 
-1. **New project:** iOS → App. Product name e.g. `MisaApp`;
-   Interface: **Storyboard — None** (the UI is 100% programmatic
-   via the driver); Language: **Objective-C**; uncheck tests.
-   **[VERIFY ON THE MAC]:** current Xcode template wording; the
-   no-storyboard choice is what matters.
-2. **Add files:** drag `prog_arm64.o`, `rt/*.h`, `rt/*.c`,
-   `rt/*.m` into the project navigator → "Copy items if needed",
-   add to the app target. The `.o` goes to *Link Binary With
-   Libraries* (or just add it — Xcode links object files added to
-   the target). **[VERIFY ON THE MAC]:** confirm Xcode accepts a
-   raw `.o` in Link Binary With Libraries vs. Compile Sources.
-3. **Bridging:** none needed — everything is C/ObjC. The headers
-   already wrap declarations in `extern "C"`; `.c` files compile
-   as C, `.m` as ObjC (ARC). No Swift in the first ship.
-4. **Build Settings:** Architectures = `arm64` (device);
-   `x86_64` slice only for the simulator (`prog_x64.o` + rebuild
-   runtime with `-arch x86_64 -isysroot $(xcrun --sdk
-   iphonesimulator --show-sdk-path)`). iOS Deployment Target:
-   15.0+ recommended (os_log `%{public}.*s` and current
-   `UIStackView`/`UIAlertController` APIs all predate it) —
-   **[VERIFY ON THE MAC]** against the Xcode of the day.
-5. **Info.plist:** `NSCameraUsageDescription` (required if any
-   screen uses `CameraButton` — iOS kills the app at capture time
-   without it); remove storyboard keys (`UIMainStoryboardFile`,
-   `UILaunchStoryboardName`) since the template is codeless; keep
-   `UIApplicationSceneManifest` only if using scene delegates
-   (the `main.m` sketch in §5 uses the classic AppDelegate path —
-   match the template to the sketch).
-6. **Bundle layout:** standard single-target app bundle —
-   `MisaApp.app` with the linked Mach-O, `Info.plist`, assets.
-   No extra resources needed for the first ship (no bundled
-   assets; provider keys come from app-supplied config, §4.4 P3).
+What the template encodes (so nobody re-derives it):
+
+1. **No storyboard** — the UI is 100% programmatic via the UIKit
+   driver (`rt/main.m` builds the window + root view controller).
+   `Info.plist` carries no `UIMainStoryboardFile` /
+   `UILaunchStoryboardName` keys and uses the `UILaunchScreen` stub.
+2. **Sources:** `rt/main.m`, `rt/platform_apple.m`, `rt/ui_uikit.m`,
+   `rt/misa_rt.c`, `rt/misa_model.c` (Compile Sources, ARC on).
+   Headers (`misa_rt.h`, `misa_ui.h`, `misa_platform.h`) are referenced
+   for navigation; everything is C/ObjC so no bridging header and no
+   Swift in the first ship.
+3. **The program object** `program/prog_arm64.o` is in *Link Binary
+   With Libraries* — Xcode links raw `.o` files added to the target.
+   **[VERIFY ON THE MAC]:** confirm the current Xcode accepts the `.o`
+   in Link Binary With Libraries vs. Compile Sources.
+4. **Build Settings:** `ARCHS = arm64` (device); `SDKROOT = iphoneos`;
+   iOS Deployment Target 15.0 (`os_log %{public}.*s` and the
+   `UIStackView`/`UIAlertController` APIs used all predate it —
+   **[VERIFY ON THE MAC]** against the Xcode of the day). The `x86_64`
+   slice is simulator-only: swap in `prog_x64.o` (`misa build --target
+   x86_64-apple-darwin`) and build against the simulator SDK.
+5. **Info.plist:** `NSCameraUsageDescription` is present (required if
+   any screen uses `CameraButton` — iOS kills the app at capture time
+   without it).
+6. **Signing:** automatic (`CODE_SIGN_STYLE = Automatic`); the Mac
+   operator sets their Development Team once (§8 checklist).
+
+Status 2026-10-05: `rt/platform_apple.m`, `rt/main.m`, `rt/ui_uikit.m`
+are implemented (were §4.4/§5/§6 sketches). Linux-side verification:
+delimiter balance, `@interface`/`@implementation`/`@end` pairing, and
+every `misa_*` call cross-checked against `misa_rt.h` /
+`misa_platform.h` / `misa_ui.h` (script: `/tmp/check_objc.py` —
+this box has no Apple SDK and GCC cannot parse ObjC blocks, so a full
+compile is Mac-side only). All Foundation/UIKit API usage is
+transcribed from the reviewed sketches above; runtime behavior is
+Mac-side verification. The `.xcodeproj` is generated, not
+hand-edited: `project.pbxproj` balances and every referenced object id
+resolves (checked by the generator).
 
 ---
 

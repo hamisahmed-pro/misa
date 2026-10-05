@@ -1,0 +1,61 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+		419E96B8B822D450ADB21EF6 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = EB5E3D336E698DB6F26A6700 /* main.m */; };
+		52542E03311E7ECC96104DCF /* platform_apple.m in Sources */ = {isa = PBXBuildFile; fileRef = F72306D94B43F606D6B827F5 /* platform_apple.m */; };
+		661C4F0AFAB0FC81FE6DECBD /* ui_uikit.m in Sources */ = {isa = PBXBuildFile; fileRef = 1081D6E15D7802B8669C779D /* ui_uikit.m */; };
+		D7497D3F70CDA90CEA3CAC3F /* misa_rt.c in Sources */ = {isa = PBXBuildFile; fileRef = 53BE42226BB8035CB277F0FC /* misa_rt.c */; };
+		389A41E7BB553E0FDD761616 /* misa_model.c in Sources */ = {isa = PBXBuildFile; fileRef = 1767C53B368CE2A78E7BA14B /* misa_model.c */; };
+		C21F7AED084AC1E7166BE148 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52DCA1184E276D97B02C226C /* Foundation.framework */; };
+		B99A213C11C777E0E7D59583 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A438725A3F59822B03017FC /* UIKit.framework */; };
+		AE71F94A1E5DB48D74DB20DB /* prog_arm64.o in Frameworks */ = {isa = PBXBuildFile; fileRef = 6CDDD84D9ED73F3DA06455AA /* prog_arm64.o */; };
+		EB5E3D336E698DB6F26A6700 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "../../impl/misa/aot/rt/main.m"; sourceTree = SOURCE_ROOT; };
+		F72306D94B43F606D6B827F5 /* platform_apple.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "../../impl/misa/aot/rt/platform_apple.m"; sourceTree = SOURCE_ROOT; };
+		1081D6E15D7802B8669C779D /* ui_uikit.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "../../impl/misa/aot/rt/ui_uikit.m"; sourceTree = SOURCE_ROOT; };
+		53BE42226BB8035CB277F0FC /* misa_rt.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "../../impl/misa/aot/rt/misa_rt.c"; sourceTree = SOURCE_ROOT; };
+		1767C53B368CE2A78E7BA14B /* misa_model.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "../../impl/misa/aot/rt/misa_model.c"; sourceTree = SOURCE_ROOT; };
+		B0B22CC6C699B8EE7AB374A7 /* misa_rt.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "../../impl/misa/aot/rt/misa_rt.h"; sourceTree = SOURCE_ROOT; };
+		B86E4E7C0A783CA1F8A5209A /* misa_ui.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "../../impl/misa/aot/rt/misa_ui.h"; sourceTree = SOURCE_ROOT; };
+		863F6FB5483BD9D03F6D29D6 /* misa_platform.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "../../impl/misa/aot/rt/misa_platform.h"; sourceTree = SOURCE_ROOT; };
+		6CDDD84D9ED73F3DA06455AA /* prog_arm64.o */ = {isa = PBXFileReference; lastKnownFileType = compiled.mach-o.objfile; path = "program/prog_arm64.o"; sourceTree = SOURCE_ROOT; };
+		0D0F0622355761369C7461F5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		52DCA1184E276D97B02C226C /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = System/Library/Frameworks/Foundation.framework; sourceTree = SDKROOT; };
+		2A438725A3F59822B03017FC /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		14389818311E9EFFC95493EC /* MisaApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MisaApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0B0EAC1C67A2F2EB9E6EB6F7 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (
+			C21F7AED084AC1E7166BE148 /* Foundation.framework in Frameworks */,
+			B99A213C11C777E0E7D59583 /* UIKit.framework in Frameworks */,
+			AE71F94A1E5DB48D74DB20DB /* prog_arm64.o in Frameworks */,
+		); runOnlyForDeploymentPostprocessing = 0; };
+		B04831CC372489EBF0287850 /* Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		9261F04E014268C1FB6C1C5E /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (
+			419E96B8B822D450ADB21EF6 /* main.m in Sources */,
+			52542E03311E7ECC96104DCF /* platform_apple.m in Sources */,
+			661C4F0AFAB0FC81FE6DECBD /* ui_uikit.m in Sources */,
+			D7497D3F70CDA90CEA3CAC3F /* misa_rt.c in Sources */,
+			389A41E7BB553E0FDD761616 /* misa_model.c in Sources */,
+		); runOnlyForDeploymentPostprocessing = 0; };
+		AA0596BBDB4DCC95D5D4F10C = {isa = PBXGroup; children = (9F73E21E9318E16563416867, 268FFCB220060D98B3A51DB4, 99B2612622859F92D7197CBF, 0D0F0622355761369C7461F5, 6F7199ED7B63CDA338A0FB82); sourceTree = "<group>"; };
+		9F73E21E9318E16563416867 /* Runtime */ = {isa = PBXGroup; children = (B0B22CC6C699B8EE7AB374A7, B86E4E7C0A783CA1F8A5209A, 863F6FB5483BD9D03F6D29D6, EB5E3D336E698DB6F26A6700, F72306D94B43F606D6B827F5, 1081D6E15D7802B8669C779D, 53BE42226BB8035CB277F0FC, 1767C53B368CE2A78E7BA14B); name = Runtime; sourceTree = "<group>"; };
+		268FFCB220060D98B3A51DB4 /* Program */ = {isa = PBXGroup; children = (6CDDD84D9ED73F3DA06455AA); name = Program; path = program; sourceTree = "<group>"; };
+		99B2612622859F92D7197CBF /* Frameworks */ = {isa = PBXGroup; children = (52DCA1184E276D97B02C226C, 2A438725A3F59822B03017FC); name = Frameworks; sourceTree = "<group>"; };
+		6F7199ED7B63CDA338A0FB82 /* Products */ = {isa = PBXGroup; children = (14389818311E9EFFC95493EC); name = Products; sourceTree = "<group>"; };
+		34A04005BCAF206EEC990BD9 /* MisaApp */ = {isa = PBXNativeTarget; buildConfigurationList = 31107D0D11ECF16E15FA6E65 /* Build configuration list for PBXNativeTarget "MisaApp" */; buildPhases = (
+			B04831CC372489EBF0287850 /* Resources */,
+			9261F04E014268C1FB6C1C5E /* Sources */,
+			0B0EAC1C67A2F2EB9E6EB6F7 /* Frameworks */,
+		); buildRules = (); dependencies = (); name = MisaApp; productName = MisaApp; productReference = 14389818311E9EFFC95493EC /* MisaApp.app */; productType = "com.apple.product-type.application"; };
+		244210E48437B6556980A702 /* Project object */ = {isa = PBXProject; attributes = { LastUpgradeCheck = 1500; TargetAttributes = { 34A04005BCAF206EEC990BD9 = { CreatedOnToolsVersion = 15.0; }; }; }; buildConfigurationList = 9F6B1A7BCFF26D263B843F95 /* Build configuration list for PBXProject "MisaApp" */; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en); mainGroup = AA0596BBDB4DCC95D5D4F10C; productRefGroup = 6F7199ED7B63CDA338A0FB82 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (34A04005BCAF206EEC990BD9 /* MisaApp */,); };
+		E87470A35532DF137FCC84E4 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_STRICT_OBJC_MSGSEND = YES; GCC_C_LANGUAGE_STANDARD = gnu11; IPHONEOS_DEPLOYMENT_TARGET = 15.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; }; name = Debug; };
+		50254531CF3328ED67BC154F /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_OBJC_ARC = YES; COPY_PHASE_STRIP = NO; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_STRICT_OBJC_MSGSEND = YES; GCC_C_LANGUAGE_STANDARD = gnu11; IPHONEOS_DEPLOYMENT_TARGET = 15.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = iphoneos; }; name = Release; };
+		881074604D78585420287CAE /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { ARCHS = arm64; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GCC_OPTIMIZATION_LEVEL = 0; INFOPLIST_FILE = "$(SRCROOT)/Info.plist"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); PRODUCT_BUNDLE_IDENTIFIER = com.misa.misaapp; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		DF63494407538A60CE4B0AAE /* Release */ = {isa = XCBuildConfiguration; buildSettings = { ARCHS = arm64; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; INFOPLIST_FILE = "$(SRCROOT)/Info.plist"; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks"); PRODUCT_BUNDLE_IDENTIFIER = com.misa.misaapp; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		9F6B1A7BCFF26D263B843F95 /* Build configuration list for PBXProject "MisaApp" */ = {isa = XCConfigurationList; buildConfigurations = (E87470A35532DF137FCC84E4 /* Debug */, 50254531CF3328ED67BC154F /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		31107D0D11ECF16E15FA6E65 /* Build configuration list for PBXNativeTarget "MisaApp" */ = {isa = XCConfigurationList; buildConfigurations = (881074604D78585420287CAE /* Debug */, DF63494407538A60CE4B0AAE /* Release */,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+	};
+	rootObject = 244210E48437B6556980A702 /* Project object */;
+}
