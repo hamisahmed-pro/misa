@@ -25,7 +25,7 @@ provider openai {
 }
 
 models {
-    diag: openai("DeepSeek-V4.1-Flash"),
+    diag: openai("DeepSeek-V4-Pro"),
 }
 
 type Diagnosis {
