@@ -104,6 +104,14 @@ public class MisaWidgets {
 
         root = new FrameLayout(activity);
         root.setBackgroundColor(C_BG);
+        // Edge-to-edge is enforced on targetSdk 35+: the window draws
+        // behind the status/navigation bars, so pad the root by the
+        // system insets or the first/last screen content is clipped.
+        root.setOnApplyWindowInsetsListener((v, insets) -> {
+            v.setPadding(0, insets.getSystemWindowInsetTop(), 0,
+                    insets.getSystemWindowInsetBottom());
+            return insets;
+        });
         scroll = new ScrollView(activity);
         container = new LinearLayout(activity);
         container.setOrientation(LinearLayout.VERTICAL);

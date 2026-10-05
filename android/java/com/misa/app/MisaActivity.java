@@ -42,6 +42,11 @@ public class MisaActivity extends Activity {
         misaThread.start();
         misaHandler = new Handler(misaThread.getLooper());
 
+        // No system action bar: Misa screens draw their own headings.
+        // (Without this, the bar overlaps the first screen's top.)
+        android.app.ActionBar ab = getActionBar();
+        if (ab != null) ab.hide();
+
         widgets = new MisaWidgets(this, misaHandler);
         setContentView(widgets.rootView());
 
