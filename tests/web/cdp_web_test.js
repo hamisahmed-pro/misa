@@ -11,6 +11,10 @@
 // Exit 0 = all pass; nonzero = failure (prints diagnostics).
 'use strict';
 
+// Node <22 has no global WebSocket (CI runs Node 20); fall back to the
+// `ws` package installed alongside these tests (npm install ws).
+const WebSocket = globalThis.WebSocket ?? require('ws');
+
 const BASE = process.argv[2] || 'http://localhost:8471';
 const CDP = 'http://localhost:9222';
 

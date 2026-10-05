@@ -7,6 +7,10 @@
 // Usage: MISA_LIVE_API_KEY=sk-... node cdp_web_live_test.js
 'use strict';
 
+// Node <22 has no global WebSocket (CI runs Node 20); fall back to the
+// `ws` package installed alongside these tests (npm install ws).
+const WebSocket = globalThis.WebSocket ?? require('ws');
+
 const BASE = process.env.MISA_WEB_BASE || 'file:///home/hatch/workspace/misa/web';
 const CDP = 'http://localhost:9222';
 const KEY = process.env.MISA_LIVE_API_KEY;
