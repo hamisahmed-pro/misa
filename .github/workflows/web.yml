@@ -24,6 +24,7 @@ jobs:
           cd /tmp/emsdk && ./emsdk install 4.0.10 && ./emsdk activate 4.0.10
       - name: Build web apps
         run: |
+          chmod +x impl/bin/misa
           source /tmp/emsdk/emsdk_env.sh
           ./impl/bin/misa build examples/webslice.misa --target wasm32-unknown-emscripten -o web/misa.js
           ./impl/bin/misa build examples/webmodel.misa --target wasm32-unknown-emscripten -o web/webmodel.js

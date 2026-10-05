@@ -38,6 +38,14 @@ jobs:
           cd $GITHUB_WORKSPACE
           python3 scripts/build_apk.py --misa examples/android.misa --abis x64 --out /tmp/misa.apk
           ls -la /tmp/misa.apk
+      - name: Free disk for the emulator
+        # The emulator needs ~7.4GB free for its userdata partition.
+        # The NDK (~4GB) and our SDK copy (~1GB) are no longer needed
+        # after the APK is built; the emulator action installs its own
+        # SDK pieces separately.
+        run: |
+          rm -rf ~/workspace/android-ndk ~/workspace/android-sdk
+          df -h / | tail -1
       - name: Boot app on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
