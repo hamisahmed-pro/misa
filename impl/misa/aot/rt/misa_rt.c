@@ -521,6 +521,14 @@ static int64_t wrap_mul(int64_t a, int64_t b) {
 MVal *misa_add(MVal *a, MVal *b, int line, int col) {
     if (a->tag == M_TAG_TEXT || b->tag == M_TAG_TEXT)
         return misa_text_concat(a, b);
+    if (a->tag == M_TAG_LIST && b->tag == M_TAG_LIST) {
+        MVal *out = misa_list_new();
+        for (size_t i = 0; i < a->u.list.len; i++)
+            misa_list_push(out, a->u.list.items[i]);
+        for (size_t i = 0; i < b->u.list.len; i++)
+            misa_list_push(out, b->u.list.items[i]);
+        return out;
+    }
     if (both_int(a, b)) return misa_int(wrap_add(a->u.i, b->u.i));
     if (both_num(a, b)) return misa_float(to_f(a) + to_f(b));
     misa_raise("E200", "cannot add these values", line, col);

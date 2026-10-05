@@ -1,0 +1,20 @@
+import "std/lists"
+
+assert(range(4) == [0, 1, 2, 3], "range basic")
+assert(range(0) == [], "range zero")
+assert(range(1) == [0], "range one")
+assert(len(range(100)) == 100, "range length")
+
+assert(any([false, true]), "any yes")
+assert(not any([false, false]), "any no")
+assert(not any([]), "any empty")
+
+assert(all([true, true]), "all yes")
+assert(not all([true, false]), "all no")
+assert(all([]), "all empty vacuous")
+
+assert(sum([1, 2, 3]) == 6, "sum basic")
+assert(sum([]) == 0, "sum empty")
+assert(sum([-1, 1]) == 0, "sum negative")
+
+print("test_lists: ok")

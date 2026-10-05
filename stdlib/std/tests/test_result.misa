@@ -1,0 +1,14 @@
+import "std/result"
+
+var code = ""
+var message = ""
+try {
+    throw_err("E404", "not found")
+} catch e {
+    code = e.code
+    message = e.message
+}
+assert(code == "E404", "throw_err code")
+assert(message == "not found", "throw_err message")
+
+print("test_result: ok")

@@ -1,0 +1,13 @@
+import "std/json"
+
+assert(escape("plain") == "plain", "escape plain")
+assert(escape("say \"hi\"") == "say \\\"hi\\\"", "escape quotes")
+assert(escape("a\\b") == "a\\\\b", "escape backslash")
+assert(escape("x\ny") == "x\\ny", "escape newline")
+assert(escape("x\ty") == "x\\ty", "escape tab")
+assert(escape("x\ry") == "x\\ry", "escape cr")
+
+assert(quoted("hi") == "\"hi\"", "quoted basic")
+assert(quoted("a\"b") == "\"a\\\"b\"", "quoted with quote")
+
+print("test_json: ok")

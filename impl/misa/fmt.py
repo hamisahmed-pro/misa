@@ -391,7 +391,8 @@ class Formatter:
 
     def quote(self, s: str) -> str:
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') \
-                       .replace("\n", "\\n").replace("\t", "\\t") + '"'
+                       .replace("\n", "\\n").replace("\t", "\\t") \
+                       .replace("\r", "\\r") + '"'
 
     def fmt_lambda(self, e: ast.Lambda) -> str:
         params = ", ".join(e.params)

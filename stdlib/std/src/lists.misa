@@ -1,0 +1,39 @@
+/// Returns `[0, 1, ..., n-1]`. Empty for `n <= 0`.
+fn range(n: Int) -> [Int] {
+    var out: [Int] = []
+    var i = 0
+    while i < n {
+        out = out + [i]
+        i = i + 1
+    }
+    return out
+}
+
+/// True if any element is true. False for `[]`.
+fn any(xs: [Bool]) -> Bool {
+    for x in xs {
+        if x {
+            return true
+        }
+    }
+    return false
+}
+
+/// True if every element is true. Vacuously true for `[]`.
+fn all(xs: [Bool]) -> Bool {
+    for x in xs {
+        if not x {
+            return false
+        }
+    }
+    return true
+}
+
+/// The sum of the elements. `0` for `[]`.
+fn sum(xs: [Int]) -> Int {
+    var total = 0
+    for x in xs {
+        total = total + x
+    }
+    return total
+}

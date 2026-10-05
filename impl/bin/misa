@@ -10,6 +10,7 @@ Usage:
   misa build --list-targets
   misa serve <file.misa> [--port PORT] [--key KEY] [--key-env VAR] [--base-url URL]
   misa lsp
+  misa pkg <init|add|install|list|remove> [...]
 """
 import json
 import os
@@ -273,6 +274,9 @@ def main(argv):
     if cmd == "lsp" and len(args) == 0:
         from misa.lsp import main as lsp_main
         return lsp_main()
+    if cmd == "pkg":
+        from misa.pkg import cmd_pkg
+        return cmd_pkg(args)
     die(f"unknown command: {' '.join(argv[1:])}\n{__doc__}")
 
 

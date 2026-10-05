@@ -1,0 +1,15 @@
+import "std/http"
+import "std/result"
+import "std/strings"
+
+// Offline-safe: an unroutable URL must throw, and the error must name
+// the URL (that is the whole point of get_text over http.get).
+var saw_url = false
+try {
+    get_text("http://127.0.0.1:9/nope")
+} catch e {
+    saw_url = contains(e.message, "http://127.0.0.1:9/nope")
+}
+assert(saw_url, "get_text error names the URL")
+
+print("test_http: ok")

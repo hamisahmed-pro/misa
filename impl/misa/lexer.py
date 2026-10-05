@@ -236,7 +236,8 @@ class Lexer:
             if ch == "\\":
                 self.advance()
                 e = self.peek()
-                mapping = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+                mapping = {"n": "\n", "t": "\t", "r": "\r",
+                           '"': '"', "\\": "\\"}
                 if e in mapping:
                     buf += mapping[e]
                     self.advance()
@@ -263,7 +264,8 @@ class Lexer:
             if self.peek() == "\\":
                 self.advance()
                 e = self.peek()
-                mapping = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
+                mapping = {"n": "\n", "t": "\t", "r": "\r",
+                           '"': '"', "\\": "\\"}
                 if e in mapping:
                     buf += mapping[e]
                     self.advance()

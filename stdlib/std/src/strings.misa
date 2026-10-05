@@ -1,0 +1,125 @@
+/// True for the four ASCII whitespace characters: space, tab,
+/// newline, carriage return.
+fn is_space(ch: Text) -> Bool {
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+/// True if `sub` occurs in `s` starting exactly at index `i`.
+fn starts_at(s: Text, i: Int, sub: Text) -> Bool {
+    if i < 0 or i + len(sub) > len(s) {
+        return false
+    }
+    var j = 0
+    while j < len(sub) {
+        if s[i + j] != sub[j] {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+/// Returns `s` with leading and trailing whitespace removed.
+/// Interior whitespace is kept exactly as-is.
+fn trim(s: Text) -> Text {
+    var out = ""
+    var gap = ""
+    var seen = false
+    for ch in s {
+        if is_space(ch) {
+            if seen {
+                gap = gap + ch
+            }
+        } else {
+            seen = true
+            out = out + gap + ch
+            gap = ""
+        }
+    }
+    return out
+}
+
+/// Splits `s` on every occurrence of `sep`. An empty `sep` returns `[s]`.
+fn split(s: Text, sep: Text) -> [Text] {
+    var parts: [Text] = []
+    var cur = ""
+    var i = 0
+    while i < len(s) {
+        if len(sep) > 0 and starts_at(s, i, sep) {
+            parts = parts + [cur]
+            cur = ""
+            i = i + len(sep)
+        } else {
+            cur = cur + s[i]
+            i = i + 1
+        }
+    }
+    parts = parts + [cur]
+    return parts
+}
+
+/// Joins `parts` with `sep` between them. `[]` gives `""`.
+fn join(parts: [Text], sep: Text) -> Text {
+    var out = ""
+    var i = 0
+    for p in parts {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + p
+        i = i + 1
+    }
+    return out
+}
+
+/// True if `s` starts with `prefix`.
+fn starts_with(s: Text, prefix: Text) -> Bool {
+    return starts_at(s, 0, prefix)
+}
+
+/// True if `s` ends with `suffix`.
+fn ends_with(s: Text, suffix: Text) -> Bool {
+    return starts_at(s, len(s) - len(suffix), suffix)
+}
+
+/// True if `sub` occurs anywhere in `s`. An empty `sub` is always found.
+fn contains(s: Text, sub: Text) -> Bool {
+    var i = 0
+    while i <= len(s) {
+        if starts_at(s, i, sub) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// Returns `s` repeated `n` times. `n <= 0` gives `""`.
+fn repeat(s: Text, n: Int) -> Text {
+    var out = ""
+    var i = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
+}
+
+/// Returns `s` left-padded with `pad` to `width` characters.
+/// `pad` should be one character; longer pads may overshoot the width.
+/// A `s` already `width` or wider is returned as-is.
+fn pad_left(s: Text, width: Int, pad: Text) -> Text {
+    if len(s) >= width or pad == "" {
+        return s
+    }
+    return repeat(pad, width - len(s)) + s
+}
+
+/// Returns `s` right-padded with `pad` to `width` characters.
+/// See `pad_left` for the padding rules.
+fn pad_right(s: Text, width: Int, pad: Text) -> Text {
+    if len(s) >= width or pad == "" {
+        return s
+    }
+    return s + repeat(pad, width - len(s))
+}

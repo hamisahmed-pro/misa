@@ -1,0 +1,46 @@
+import "std/strings"
+
+// trim
+assert(trim("  hi  ") == "hi", "trim both sides")
+assert(trim("\t\nhi\r\n ") == "hi", "trim all whitespace kinds")
+assert(trim("hi") == "hi", "trim nothing to do")
+assert(trim("") == "", "trim empty")
+assert(trim("   ") == "", "trim all whitespace")
+assert(trim("a b") == "a b", "trim keeps interior space")
+assert(trim("a\tb") == "a\tb", "trim keeps interior tab")
+assert(trim("a\r\nb") == "a\r\nb", "trim keeps interior crlf")
+
+// split
+assert(split("a,b,c", ",") == ["a", "b", "c"], "split basic")
+assert(split("abc", ",") == ["abc"], "split no sep")
+assert(split("", ",") == [""], "split empty string")
+assert(split("a,b,", ",") == ["a", "b", ""], "split trailing sep")
+assert(split(",a", ",") == ["", "a"], "split leading sep")
+assert(split("a::b", "::") == ["a", "b"], "split multi-char sep")
+assert(split("abc", "") == ["abc"], "split empty sep")
+
+// join
+assert(join(["a", "b", "c"], "-") == "a-b-c", "join basic")
+assert(join([], "-") == "", "join empty")
+assert(join(["x"], "-") == "x", "join single")
+
+// starts_with / ends_with / contains
+assert(starts_with("hello", "he"), "starts_with yes")
+assert(not starts_with("hello", "lo"), "starts_with no")
+assert(starts_with("hello", ""), "starts_with empty")
+assert(ends_with("hello", "lo"), "ends_with yes")
+assert(not ends_with("hello", "he"), "ends_with no")
+assert(ends_with("hi", "hello") == false, "ends_with longer")
+assert(contains("hello", "ell"), "contains yes")
+assert(not contains("hello", "z"), "contains no")
+assert(contains("hello", ""), "contains empty")
+
+// repeat / pad
+assert(repeat("ab", 3) == "ababab", "repeat")
+assert(repeat("ab", 0) == "", "repeat zero")
+assert(pad_left("7", 3, "0") == "007", "pad_left")
+assert(pad_left("hello", 3, "0") == "hello", "pad_left no-op")
+assert(pad_right("7", 3, "0") == "700", "pad_right")
+assert(pad_right("hello", 3, "0") == "hello", "pad_right no-op")
+
+print("test_strings: ok")

@@ -1,0 +1,12 @@
+/// GETs `url` and returns the response body as text.
+/// On failure throws an Error naming the URL and the cause, e.g.
+/// `GET https://example.com/x: E304: http.get failed: ...`.
+fn get_text(url: Text) -> Text {
+    var body = ""
+    try {
+        body = http.get(url)
+    } catch e {
+        throw { code: e.code, message: "GET " + url + ": " + e.message }
+    }
+    return body
+}

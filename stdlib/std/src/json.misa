@@ -1,0 +1,35 @@
+/// Returns `s` with JSON string escaping applied: double quotes,
+/// backslashes, newlines, tabs, and carriage returns are escaped.
+/// Use it to safely embed text inside a JSON string value.
+fn escape(s: Text) -> Text {
+    var out = ""
+    for ch in s {
+        if ch == "\"" {
+            out = out + "\\\""
+        } else {
+            if ch == "\\" {
+                out = out + "\\\\"
+            } else {
+                if ch == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if ch == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        if ch == "\r" {
+                            out = out + "\\r"
+                        } else {
+                            out = out + ch
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out
+}
+
+/// Returns `s` as a JSON string literal, surrounding quotes included.
+fn quoted(s: Text) -> Text {
+    return "\"" + escape(s) + "\""
+}

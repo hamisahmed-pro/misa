@@ -2,7 +2,10 @@
 
 load(main_path) -> (merged_program, errors, file_order)
 
-- Imports resolve relative to the importing file; must end in `.misa`.
+- `import "file.misa"` / `./x.misa` / `../x.misa`: relative file (v0.2).
+- `import "pkg"` / `import "pkg/sub/mod"`: package import, resolved via
+  misa.pkg manifests (see misa/pkg.py): walk-up misa_pkgs/, ~/.misa/pkgs/,
+  then the bundled stdlib. Bad manifest -> E113.
 - Depth-first, post-order: dependencies' items come before the importer's.
 - Duplicate files are included once. Cycles -> E111, missing -> E112.
 """
@@ -13,6 +16,7 @@ from typing import Dict, List, Tuple
 from . import ast
 from .parser import parse_source, ParseError
 from .lexer import LexError
+from .pkg import resolve_package, PkgResolveError
 
 
 def _err(code, message, line=0, col=0, hint=""):
@@ -53,13 +57,27 @@ def load(main_path: str):
         for item in prog.items:
             if isinstance(item, ast.ImportDecl):
                 rel = item.path
-                if not rel.endswith(".misa"):
-                    errors.append(_err(
-                        "E112", f"import path must end in .misa: '{rel}'",
-                        item.line, item.col))
-                    continue
-                ipath = os.path.normpath(
-                    os.path.join(os.path.dirname(ap), rel))
+                if rel.endswith(".misa") or rel.startswith(
+                        ("./", "../", "/")):
+                    # Relative file import (v0.2 behavior).
+                    if not rel.endswith(".misa"):
+                        errors.append(_err(
+                            "E112",
+                            f"import path must end in .misa: '{rel}'",
+                            item.line, item.col))
+                        continue
+                    ipath = os.path.normpath(
+                        os.path.join(os.path.dirname(ap), rel))
+                else:
+                    # Package import: `import "pkg"` / `import "pkg/mod"`.
+                    try:
+                        ipath = resolve_package(
+                            rel, os.path.dirname(ap))
+                    except PkgResolveError as e:
+                        errors.append(_err(
+                            e.code, e.message,
+                            item.line, item.col, hint=e.hint))
+                        continue
                 item.resolved = ipath
                 visit(ipath)
         stack.pop()

@@ -790,6 +790,11 @@ class Checker:
             return True
         if want.endswith("?") and got == want[:-1]:
             return True
+        # An empty list literal has no element type to infer; it coerces
+        # to any list type (so `var xs: [Int] = []` checks).
+        if (got == "[unknown]" and want.startswith("[")
+                and want.endswith("]")):
+            return True
         return False
 
 
