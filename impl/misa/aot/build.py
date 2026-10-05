@@ -502,7 +502,23 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
                        for e in errors]
 
     from misa.aot.emit import Emitter, AOTError
+    from misa.ast import ProviderDecl
     eff_target = canonical_target(target or host_triple())
+
+    # --- on-device models: interpreter-only in M1 --------------------
+    # The AOT runtime has no local-inference transport yet (milestone
+    # M2), so compiling a program with an on-device provider fails here
+    # with E504 instead of breaking on the device.
+    for item in merged.items:
+        if isinstance(item, ProviderDecl) and item.model_file:
+            return False, [{
+                "code": "E504",
+                "message": f"on-device model '{item.model_file}' cannot "
+                           f"be compiled for target '{eff_target}' "
+                           f"(interpreter only in M1; AOT on-device "
+                           f"support is milestone M2)",
+                "line": item.line, "col": item.col, "hint": ""}]
+
     entry = _table_row(eff_target).get("entry", "main")
     try:
         em = Emitter(merged, entry=entry)

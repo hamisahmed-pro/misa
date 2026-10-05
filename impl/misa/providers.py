@@ -17,7 +17,9 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Tuple
 
-from .errors import (ModelError, ProviderConfigError, StreamingUnsupported)
+from .errors import (ModelError, ProviderConfigError, StreamingUnsupported,
+                    OnDeviceShapeError, OnDeviceSignatureError,
+                    OnDeviceRuntimeUnavailable)
 
 
 @dataclass
@@ -287,6 +289,202 @@ class GeminiProvider(Provider):
                       output_tokens=u.get("candidatesTokenCount", 0),
                       latency_ms=int((time.monotonic() - t0) * 1000))
         return Completion(text=text or "", usage=usage)
+
+
+ONDEVICE_EXTENSIONS = {
+    ".onnx": "onnx",
+    ".mlpackage": "coreml",
+    ".mlmodelc": "coreml",
+    ".tflite": "tflite",
+}
+
+
+def ondevice_runtime(model_path: str) -> str:
+    """Runtime key for an on-device model file, by extension.
+
+    Raises ProviderConfigError for unknown extensions.
+    """
+    ext = os.path.splitext(model_path)[1].lower()
+    try:
+        return ONDEVICE_EXTENSIONS[ext]
+    except KeyError:
+        raise ProviderConfigError(
+            f"unknown on-device model extension '{ext or '(none)'}' "
+            f"(want one of: {', '.join(sorted(ONDEVICE_EXTENSIONS))})")
+
+
+# onnxruntime sessions, keyed by resolved model path (lazy, per process)
+_ONNX_SESSIONS: dict = {}
+
+
+def _ort_session(model_path: str):
+    import onnxruntime as ort
+    if model_path not in _ONNX_SESSIONS:
+        _ONNX_SESSIONS[model_path] = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"])
+    return _ONNX_SESSIONS[model_path]
+
+
+def _sig_kind(te) -> Optional[str]:
+    """v1 on-device type mapping. Returns 'scalar' | 'vec' | 'text'
+    or None when the type is not supported on-device (E502)."""
+    is_list = bool(getattr(te, "is_list", False))
+    is_map = bool(getattr(te, "is_map", False))
+    optional = bool(getattr(te, "optional", False))
+    name = getattr(te, "name", "")
+    if is_map or optional:
+        return None
+    if name == "Float" and not is_list:
+        return "scalar"
+    if name == "Float" and is_list:
+        return "vec"
+    if name == "Text" and not is_list:
+        return "text"
+    return None
+
+
+class OnDeviceProvider(Provider):
+    """Runs a local model file with zero network traffic.
+
+    v1: ONNX Runtime only (.onnx). CoreML (.mlpackage/.mlmodelc) and
+    TFLite (.tflite) raise E503 until their milestones land.
+    """
+    kind = "ondevice"
+
+    def __init__(self, model_path: str):
+        if not model_path:
+            raise ProviderConfigError(
+                "on-device provider needs `model: file(\"...\")` "
+                "in its provider block")
+        if not os.path.exists(model_path):
+            raise ProviderConfigError(
+                f"on-device model file not found: '{model_path}'")
+        self.model_path = os.path.abspath(model_path)
+        self.runtime = ondevice_runtime(self.model_path)
+        if self.runtime == "coreml":
+            raise OnDeviceRuntimeUnavailable(
+                "CoreML models (.mlpackage/.mlmodelc) need Apple "
+                "hardware - milestone M3")
+        if self.runtime == "tflite":
+            raise OnDeviceRuntimeUnavailable(
+                "TFLite models (.tflite) need Android - milestone M4")
+
+    def _session(self):
+        return _ort_session(self.model_path)
+
+    def _to_input(self, value, kind: str, pname: str, meta):
+        import numpy as np
+        exp_shape = list(meta.shape)
+        exp_type = meta.type
+        if kind == "text":
+            if not isinstance(value, str):
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': Text value required, "
+                    f"got {type(value).__name__}")
+            if "string" not in exp_type:
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': model input '{meta.name}' is "
+                    f"{exp_type}, not a string tensor")
+            return np.array(value, dtype=object)
+        # numeric kinds need float tensors
+        if "float" not in exp_type:
+            raise OnDeviceSignatureError(
+                f"param '{pname}': model input '{meta.name}' is "
+                f"{exp_type}, v1 supports float tensors only")
+        if kind == "scalar":
+            if isinstance(value, bool) or \
+                    not isinstance(value, (int, float)):
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': Float value required, "
+                    f"got {type(value).__name__}")
+            arr = np.asarray(float(value), dtype=np.float32)
+            if exp_shape == []:
+                pass
+            elif exp_shape == [1]:
+                arr = arr.reshape(1)
+            else:
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': model input '{meta.name}' has "
+                    f"shape {exp_shape}, v1 supports scalar/1-D inputs only")
+            return arr
+        if kind == "vec":
+            if not isinstance(value, list) or any(
+                    isinstance(x, bool) or not isinstance(x, (int, float))
+                    for x in value):
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': [Float] value required")
+            if len(exp_shape) != 1:
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': model input '{meta.name}' has "
+                    f"shape {exp_shape}, v1 supports 1-D inputs only")
+            dim = exp_shape[0]
+            if isinstance(dim, int) and dim != len(value):
+                raise OnDeviceShapeError(
+                    f"param '{pname}': model input '{meta.name}' "
+                    f"expects {dim} values, got {len(value)}")
+            return np.asarray(
+                [float(x) for x in value], dtype=np.float32)
+        raise OnDeviceSignatureError(  # pragma: no cover
+            f"param '{pname}': unsupported")  # guarded by _sig_kind
+
+    @staticmethod
+    def _from_output(raw, kind: Optional[str]):
+        import numpy as np
+        arr = np.asarray(raw)
+        if arr.dtype.kind in ("S", "U", "O"):
+            dec = [x.decode("utf-8") if isinstance(x, bytes) else str(x)
+                   for x in arr.flat]
+            if kind == "text" or arr.shape == ():
+                return dec[0] if dec else ""
+            return dec
+        flat = [float(x) for x in arr.flat]
+        if kind == "scalar" or arr.shape == ():
+            return flat[0] if flat else 0.0
+        return flat
+
+    def complete(self, *, model_id: str, prompt: str,
+                 images: List[Tuple[str, str]],
+                 timeout_s: float, args=None,
+                 params=(), ret=None) -> Completion:
+        """Run inference. `args` are the raw call values, `params` the
+        declared (name, TypeExpr) pairs, `ret` the declared return
+        TypeExpr. Returns the first model output as JSON text so the
+        interpreter's existing validation applies."""
+        t0 = time.monotonic()
+        sess = self._session()
+        in_metas = sess.get_inputs()
+        if args is None:
+            args = []
+        params = list(params)
+        if len(args) != len(in_metas):
+            raise OnDeviceSignatureError(
+                f"model takes {len(in_metas)} input(s), "
+                f"called with {len(args)} arg(s)")
+        if len(args) != len(params):
+            raise OnDeviceSignatureError("internal: args/params mismatch")
+        ret_kind = _sig_kind(ret) if ret is not None else None
+        if ret is not None and ret_kind is None:
+            raise OnDeviceSignatureError(
+                f"return type '{ret.name}'"
+                f"{'[]' if getattr(ret, 'is_list', False) else ''} is not "
+                f"supported on-device in v1 (Float, [Float], Text)")
+        feed = {}
+        for (pname, te), value, meta in zip(params, args, in_metas):
+            kind = _sig_kind(te)
+            if kind is None:
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': type '{te.name}'"
+                    f"{'[]' if te.is_list else ''} is not supported "
+                    f"on-device in v1 (Float, [Float], Text)")
+            feed[meta.name] = self._to_input(value, kind, pname, meta)
+        out_metas = sess.get_outputs()
+        if not out_metas:
+            raise OnDeviceSignatureError("model has no outputs")
+        raw = sess.run([out_metas[0].name], feed)[0]
+        value = self._from_output(raw, ret_kind)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return Completion(text=json.dumps(value),
+                          usage=Usage(latency_ms=latency_ms))
 
 
 def make_provider(kind: str, key_env: str,

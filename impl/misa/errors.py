@@ -50,6 +50,22 @@ class StreamingUnsupported(ModelError):
     code = "E402"
 
 
+class OnDeviceShapeError(ModelError):
+    code = "E501"
+
+
+class OnDeviceSignatureError(ModelError):
+    code = "E502"
+
+
+class OnDeviceRuntimeUnavailable(ModelError):
+    code = "E503"
+
+
+class OnDeviceTargetIncompatible(MisaError):
+    code = "E504"
+
+
 class SchemaValidationError(ModelError):
     code = "E400"
 

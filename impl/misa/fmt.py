@@ -57,7 +57,10 @@ class Formatter:
         elif isinstance(item, ast.ProviderDecl):
             self.w(f"provider {item.name} {{")
             self.ind += 1
-            self.w(f'key: env("{item.key_env}"),')
+            if item.key_env:
+                self.w(f'key: env("{item.key_env}"),')
+            if item.model_file:
+                self.w(f'model: file("{item.model_file}"),')
             self.ind -= 1
             self.w("}")
         elif isinstance(item, ast.ModelsDecl):

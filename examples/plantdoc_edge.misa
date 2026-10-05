@@ -1,0 +1,51 @@
+// PlantDoc Edge: the PlantDoc demo, fully offline.
+// A tiny ONNX classifier maps 4 leaf-symptom features to 3 condition
+// probabilities — no network, no API keys, no cloud.
+//
+// Run:  misa run examples/plantdoc_edge.misa
+// (from the repo root; the model path resolves against this file)
+
+app PlantDocEdge {
+    title: "PlantDoc Edge",
+    version: "0.1.0",
+}
+
+provider edge {
+    model: file("./models/tiny_classifier.onnx")
+}
+
+models {
+    clf: edge("tiny"),
+}
+
+// features: [yellow_spots, wilting, brown_edges, curling], each 0..1
+model classify_symptoms(features: [Float]) -> [Float]
+    with edge.clf
+    budget { latency: 5s }
+    prompt v1 "classify leaf symptoms"
+
+fn label(probs: [Float]) -> Text {
+    var best = probs[0]
+    var bi = 0
+    var i = 0
+    for p in probs {
+        if p > best {
+            best = p
+            bi = i
+        }
+        i = i + 1
+    }
+    if bi == 0 {
+        return "healthy"
+    }
+    if bi == 1 {
+        return "early blight"
+    }
+    return "nutrient deficiency"
+}
+
+let features = [0.9, 0.2, 0.7, 0.1]
+let probs = classify_symptoms(features)
+print("features: [yellow_spots, wilting, brown_edges, curling]")
+print("probabilities: " + str(probs))
+print("diagnosis: " + label(probs))

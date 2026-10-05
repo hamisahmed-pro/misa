@@ -56,7 +56,8 @@ appDecl     := "app" IDENT "{" appField* "}"
 appField    := IDENT ":" literal ","?
 
 providerDecl:= "provider" IDENT "{" providerField* "}"
-providerField := "key" ":" "env" "(" STRING ")" ","?
+providerField := ( "key" ":" "env" "(" STRING ")"
+                 | "model" ":" "file" "(" STRING ")" ) ","?
 
 modelsDecl  := "models" "{" modelsField* "}"
 modelsField := IDENT ":" IDENT "(" STRING ")" ","?
@@ -191,10 +192,20 @@ the tree; native rendering is Phase 4.
 ## 9. Errors
 
 Every diagnostic has a code: `E001` (syntax) … `E1xx` (name resolution),
-`E2xx` (types), `E3xx` (runtime), `E4xx` (model/provider), `E5xx` (budget).
-`misa check --json` emits `[{code, message, line, col, hint}]`.
+`E2xx` (types), `E3xx` (runtime), `E4xx` (model/provider), `E5xx`
+(budget, on-device inference). `misa check --json` emits
+`[{code, message, line, col, hint}]`.
 
 New in v0.2: `E110` duplicate top-level name across imports, `E111`
 circular import, `E112` missing/unreadable import, `E211` function
 return/argument typing, `E212` `throw` of a non-`Error`, `E303` I/O
 failure, `E304` HTTP failure, `E305` missing map key.
+
+A provider block may name a local model file instead of a key:
+`provider edge { model: file("./tiny.onnx") }`. The extension selects
+the runtime (`.onnx` → ONNX Runtime, `.mlpackage`/`.mlmodelc` →
+CoreML, `.tflite` → TFLite); the `model` call syntax is unchanged.
+On-device errors: `E501` tensor shape mismatch, `E502` unsupported
+on-device signature, `E503` runtime unavailable on this platform,
+`E504` on-device model rejected by `misa build` (interpreter-only in
+M1). Full design: `spec/ONDEVICE.md`.

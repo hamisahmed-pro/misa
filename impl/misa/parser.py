@@ -113,23 +113,45 @@ class Parser:
         name = self.expect_ident("provider name").value
         self.expect("{", "'{'")
         key_env = ""
+        model_file = ""
         self.skip_semis()
         while not self.at("}"):
-            fk = self.expect_ident("field name")
-            if fk.value != "key":
-                raise ParseError(f"unknown provider field '{fk.value}'",
-                                 fk.line, fk.col)
+            fk_tok = self.peek()
+            if fk_tok.kind == "IDENT":
+                fname = fk_tok.value
+                self.advance()
+            elif fk_tok.kind == "model":
+                # 'model' is a keyword, but it names a provider field here
+                fname = "model"
+                self.advance()
+            else:
+                raise ParseError(
+                    f"expected field name, found {fk_tok.kind} "
+                    f"({fk_tok.value!r})", fk_tok.line, fk_tok.col)
+            fk_line, fk_col = fk_tok.line, fk_tok.col
             self.expect(":", "':'")
-            self.expect("env", "'env'")
-            self.expect("(", "'('")
-            var = self.expect("STRING", "string").value
-            self.expect(")", "')'")
-            key_env = var
+            if fname == "key":
+                self.expect("env", "'env'")
+                self.expect("(", "'('")
+                key_env = self.expect("STRING", "string").value
+                self.expect(")", "')'")
+            elif fname == "model":
+                ftok = self.expect("IDENT", "'file'")
+                if ftok.value != "file":
+                    raise ParseError(f"expected 'file', found "
+                                     f"{ftok.value!r}", ftok.line, ftok.col)
+                self.expect("(", "'('")
+                model_file = self.expect("STRING", "string").value
+                self.expect(")", "')'")
+            else:
+                raise ParseError(f"unknown provider field '{fname}'",
+                                 fk_line, fk_col)
             if self.at(","):
                 self.advance()
             self.skip_semis()
         self.expect("}", "'}'")
         return ast.ProviderDecl(name=name, key_env=key_env,
+                                model_file=model_file,
                                 line=t.line, col=t.col)
 
     def parse_models(self) -> ast.ModelsDecl:

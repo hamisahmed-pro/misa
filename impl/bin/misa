@@ -97,7 +97,9 @@ def cmd_run(path, mock_path, as_json):
     if errors:
         emit_errors(errors, as_json)
         return 1
-    interp = Interpreter(mock_scripts=mock_scripts)
+    interp = Interpreter(mock_scripts=mock_scripts,
+                         main_dir=os.path.dirname(os.path.abspath(path)))
+    interp.file_of = _file_of
     try:
         interp.run(merged)
     except MisaError as e:
@@ -116,7 +118,9 @@ def cmd_test(path, mock_path, as_json):
     if errors:
         emit_errors(errors, as_json)
         return 1
-    interp = Interpreter(mock_scripts=mock_scripts)
+    interp = Interpreter(mock_scripts=mock_scripts,
+                         main_dir=os.path.dirname(os.path.abspath(path)))
+    interp.file_of = _file_of
     interp.load(merged)
     results = []
     failed = 0

@@ -41,7 +41,8 @@ class AppDecl(Node):
 @dataclass
 class ProviderDecl(Node):
     name: str = ""
-    key_env: str = ""  # environment variable holding the key
+    key_env: str = ""      # environment variable holding the key
+    model_file: str = ""   # on-device model path from `model: file("...")`
 
 
 @dataclass

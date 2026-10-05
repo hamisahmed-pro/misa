@@ -177,11 +177,23 @@ class Checker:
             self.error("E209", f"unknown provider '{m.provider}'",
                        m.line, m.col,
                        hint="declare it in a 'provider' block")
-        elif m.provider not in ("mock", "openai", "gemini"):
-            self.error("E209",
-                       f"unknown provider kind '{m.provider}'",
-                       m.line, m.col,
-                       hint="v0.1 providers: mock, openai, gemini")
+        else:
+            pdecl = self.providers[m.provider]
+            if pdecl.model_file:
+                from .providers import ondevice_runtime
+                try:
+                    ondevice_runtime(pdecl.model_file)
+                except Exception as e:
+                    self.error("E209",
+                               f"provider '{m.provider}': {e}",
+                               m.line, m.col,
+                               hint="on-device model files end in .onnx, "
+                                    ".mlpackage, .mlmodelc, or .tflite")
+            elif m.provider not in ("mock", "openai", "gemini"):
+                self.error("E209",
+                           f"unknown provider kind '{m.provider}'",
+                           m.line, m.col,
+                           hint="v0.1 providers: mock, openai, gemini")
         if m.alias not in self.aliases:
             self.error("E209", f"unknown model alias '{m.alias}'",
                        m.line, m.col,

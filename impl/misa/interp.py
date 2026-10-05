@@ -13,9 +13,9 @@ from . import ast
 from .errors import (MisaError, RuntimeError_, UndefinedName,
                      ImmutableAssign, AssertFailed, ModelError,
                      SchemaValidationError, BudgetExceeded, ThrownError,
-                     IOError_, HTTPError_, MapKeyError)
+                     IOError_, HTTPError_, MapKeyError, ProviderConfigError)
 from .providers import (Provider, Usage, make_provider, guess_mime,
-                        estimate_cost_usd)
+                        estimate_cost_usd, OnDeviceProvider)
 
 
 # ---------------------------------------------------------------- values
@@ -121,9 +121,12 @@ DEFAULT_TIMEOUT_S = 120.0
 
 class Interpreter:
     def __init__(self, *, mock_scripts: Optional[dict] = None,
-                 out=None):
+                 out=None, main_dir: Optional[str] = None):
         self.mock_scripts = mock_scripts or {}
         self.out = out if out is not None else sys.stdout
+        self.main_dir = main_dir  # dir of the entry .misa file, if known
+        self.file_of: Dict[int, str] = {}  # id(item) -> source file
+        self._tokens_warned: set = set()
         self.reset()
 
     def reset(self):
@@ -569,13 +572,41 @@ class Interpreter:
         prov_name, model_id = self.aliases[decl.alias]
         if prov_name not in self.providers:
             raise ModelError(f"unknown provider '{prov_name}'")
+        pdecl = self.providers[prov_name]
+        if pdecl.model_file:
+            # on-device: the file (not the name) selects the runtime
+            mpath = self._resolve_model_file(pdecl)
+            key = (prov_name, decl.alias, mpath)
+            if key not in self.provider_cache:
+                self.provider_cache[key] = OnDeviceProvider(mpath)
+            return self.provider_cache[key], model_id
         key = (prov_name, decl.alias)
         if key not in self.provider_cache:
-            key_env = self.providers[prov_name].key_env
+            key_env = pdecl.key_env
             self.provider_cache[key] = make_provider(
                 prov_name, key_env,
                 mock_scripts=self.mock_scripts, mock_alias=decl.alias)
         return self.provider_cache[key], model_id
+
+    def _resolve_model_file(self, pdecl: ast.ProviderDecl) -> str:
+        """Resolve a provider's `model: file("...")` against (in order):
+        the path as given, the provider block's own file, the entry
+        file's directory. Raises E401 when nothing matches."""
+        rel = pdecl.model_file
+        cands = [os.path.abspath(rel)]
+        decl_file = self.file_of.get(id(pdecl))
+        if decl_file:
+            cands.append(os.path.normpath(
+                os.path.join(os.path.dirname(decl_file), rel)))
+        if self.main_dir:
+            cands.append(os.path.normpath(
+                os.path.join(self.main_dir, rel)))
+        for c in cands:
+            if os.path.exists(c):
+                return c
+        raise ProviderConfigError(
+            f"on-device model file not found: '{rel}'",
+            hint="checked: " + ", ".join(cands))
 
     def render_prompt(self, decl: ast.ModelDecl,
                       arg_values: list) -> tuple:
@@ -611,6 +642,8 @@ class Interpreter:
                 f"model '{decl.name}' takes {len(decl.params)} args, "
                 f"got {len(arg_values)}")
         provider, model_id = self.get_provider(decl)
+        if isinstance(provider, OnDeviceProvider):
+            return self.call_ondevice(provider, decl, model_id, arg_values)
         prompt_text, images = self.render_prompt(decl, arg_values)
         timeout_s = DEFAULT_TIMEOUT_S
         if decl.budget and decl.budget.latency_ms:
@@ -646,6 +679,42 @@ class Interpreter:
                 validation_errors=errors)
         latency_ms = int((time.monotonic() - t0) * 1000)
         self.check_budget(decl, usage, latency_ms, model_id)
+        return value
+
+    def call_ondevice(self, provider: OnDeviceProvider,
+                      decl: ast.ModelDecl, model_id: str,
+                      arg_values: list) -> Any:
+        """Single-shot local inference: no prompt rendering, no repair
+        retries. The provider returns the first model output as JSON;
+        the declared return type is validated as usual."""
+        if decl.budget and decl.budget.tokens is not None:
+            warn_key = (provider.model_path, decl.alias)
+            if warn_key not in self._tokens_warned:
+                print(f"warning: token budget ignored for on-device "
+                      f"model '{decl.name}' (local inference uses no "
+                      f"tokens)", file=sys.stderr)
+                self._tokens_warned.add(warn_key)
+        timeout_s = DEFAULT_TIMEOUT_S
+        if decl.budget and decl.budget.latency_ms:
+            timeout_s = min(timeout_s, decl.budget.latency_ms / 1000.0)
+        t0 = time.monotonic()
+        comp = provider.complete(model_id=model_id, prompt="", images=[],
+                                 timeout_s=timeout_s, args=arg_values,
+                                 params=decl.params, ret=decl.ret)
+        try:
+            data = json.loads(comp.text)
+        except json.JSONDecodeError:
+            raise SchemaValidationError(
+                f"on-device model '{decl.name}' returned invalid data")
+        value, errors = self.validate(data, decl.ret, "$")
+        if errors:
+            raise SchemaValidationError(
+                f"on-device model '{decl.name}' returned invalid data",
+                validation_errors=errors,
+                hint="check the return type declaration")
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        # token/cost budgets are vacuous (usage is zero); latency is real
+        self.check_budget(decl, comp.usage, latency_ms, model_id)
         return value
 
     def _repair_prompt(self, prompt_text: str, errors: list) -> str:
