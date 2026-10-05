@@ -44,10 +44,11 @@ jobs:
 
       - name: Simulator smoke test (launch, no crash)
         run: |
+          set +e  # full manual control; every failure must print diagnostics
           APP=$(find ios/MisaApp/build ~/Library/Developer/Xcode/DerivedData \
             -name "MisaApp.app" -type d 2>/dev/null | head -1)
           echo "app: $APP"
-          test -n "$APP"
+          test -n "$APP" || { echo "FATAL: MisaApp.app not found"; exit 1; }
           UDID=$(xcrun simctl list devices available -j | python3 -c "
           import json,sys
           ds = json.load(sys.stdin)['devices']
@@ -57,10 +58,39 @@ jobs:
                       print(d['udid']); sys.exit()
           ")
           echo "simulator: $UDID"
-          xcrun simctl boot "$UDID"
-          xcrun simctl install "$UDID" "$APP"
-          xcrun simctl launch "$UDID" com.misa.misaapp
+          xcrun simctl boot "$UDID" >/dev/null 2>&1
+          echo "boot exit: $?"
+          xcrun simctl install "$UDID" "$APP" >/dev/null 2>&1
+          echo "install exit: $?"
+          LAUNCH=$(xcrun simctl launch "$UDID" com.misa.misaapp 2>&1)
+          echo "launch: $LAUNCH"
+          PID=$(echo "$LAUNCH" | awk -F': ' '{print $2}')
           sleep 10
-          # still alive and no crash log?
-          xcrun simctl spawn "$UDID" launchctl list | grep -i misa
-          echo "smoke test OK: app launched and running"
+          # Aliveness check 1: launchctl list
+          LC_OUT=$(xcrun simctl spawn "$UDID" launchctl list 2>&1)
+          echo "launchctl spawn exit: $?"
+          echo "$LC_OUT" | grep -i misa || echo "(misa not in launchctl list)"
+          # Aliveness check 2: fresh crash reports on the host
+          echo "--- recent crash reports ---"
+          ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -6
+          NEWEST=$(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -1)
+          if [ -n "$NEWEST" ] && [ $(($(date +%s) - $(stat -f %m "$NEWEST"))) -lt 600 ]; then
+            echo "--- newest crash report (last 10 min): $NEWEST ---"
+            python3 - "$NEWEST" <<'PYEOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print("app:", d.get("bundleID"), d.get("app_version"))
+          print("termination:", json.dumps(d.get("termination"), indent=1)[:800])
+          print("exception:", json.dumps(d.get("exception"), indent=1)[:800])
+          for t in d.get("threads", [])[:1]:
+              for f in t.get("frames", [])[:8]:
+                  print("frame:", f.get("image", "?"), "::", f.get("symbol", "?"))
+          PYEOF
+          fi
+          if echo "$LC_OUT" | grep -qi misa; then
+            echo "smoke test OK: app launched and running"
+            exit 0
+          else
+            echo "SMOKE TEST FAILED: app not alive 10s after launch"
+            exit 1
+          fi
