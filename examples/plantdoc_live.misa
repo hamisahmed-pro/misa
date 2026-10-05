@@ -1,0 +1,80 @@
+// PlantDoc Live: the real-AI edition of the demo.
+// Same app, same screens — but diagnose() calls a live model through
+// the OpenAI-compatible hcnsec proxy instead of the scripted mock.
+//
+// Key + base URL are supplied by the Android app at first launch
+// (MisaActivity key dialog -> SharedPreferences -> nativeSetConfig
+// before boot). Nothing is baked into the binary.
+//
+// NOTE (2026-10-05): vision uploads through this proxy are unreliable,
+// so the live model reasons over the symptom description; the photo is
+// captured and displayed but not sent. Flip back to the Photo param
+// when a vision-capable channel is verified.
+//
+// Host:   MISA_MODEL_KEY=... MISA_OPENAI_BASE_URL=https://api.hcnsec.cn/v1 \
+//             misa run examples/plantdoc_live.misa
+// APK:    python3 scripts/build_apk.py --misa examples/plantdoc_live.misa --no-assets
+
+app PlantDoc {
+    title: "PlantDoc Live",
+    version: "1.0.0",
+}
+
+provider openai {
+    key: env("MISA_MODEL_KEY"),
+}
+
+models {
+    diag: openai("DeepSeek-V4.1-Flash"),
+}
+
+type Diagnosis {
+    condition: Text,
+    confidence: Float,
+    treatment: [Text],
+    urgent: Bool,
+}
+
+model diagnose(notes: Text) -> Diagnosis
+    with openai.diag
+    budget { tokens: 4000, latency: 30s, cost: $0.05 }
+    prompt v1 """
+    You are a botanist diagnosing a houseplant from the owner's
+    description. Symptoms: {notes}.
+    Respond with structured data only as JSON with exactly these keys:
+    condition (string), confidence (0.0-1.0), treatment (array of
+    2-4 short strings), urgent (boolean).
+    """
+
+screen Home {
+    Column {
+        Heading(text: "PlantDoc Live")
+        Text(text: "Real AI diagnosis. Describe the symptoms, snap a leaf.")
+        TextInput(id: notes, hint: "Yellow spots, wilting edges...")
+        CameraButton(onCapture: |photo| {
+            let d = diagnose(notes.text)
+            navigate(Result(d, photo))
+        })
+        Text(text: "Powered by DeepSeek via your own API key. Each call carries a token, latency and cost budget.")
+    }
+}
+
+screen Result(d: Diagnosis, photo: Photo) {
+    Column {
+        Image(photo: photo)
+        Heading(text: "Diagnosis: {d.condition}")
+        Text(text: "Confidence: {d.confidence}")
+        if d.urgent {
+            Banner(text: "Needs attention today", style: "warning")
+        } else {
+            Banner(text: "Looks manageable", style: "info")
+        }
+        Heading(text: "Treatment")
+        List(items: d.treatment)
+        Button(label: "Diagnose another", onTap: || {
+            navigate(Home())
+        })
+    }
+}
+
+navigate(Home())

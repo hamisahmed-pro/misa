@@ -172,7 +172,8 @@ def _package(workdir: str) -> str:
     cmd = [_tool("aapt"), "package", "-f",
            "-M", staged, "-I", ANDROID_JAR, "-F", unsigned]
     assets = os.path.join(MISA_DIR, "android", "assets")
-    if os.path.isdir(assets) and os.listdir(assets):
+    if (not getattr(args, "no_assets", False)
+            and os.path.isdir(assets) and os.listdir(assets)):
         # Raw assets (e.g. *.mock.json for demo model scripts) ship
         # inside the APK; MisaActivity stages them into filesDir.
         cmd += ["-A", assets]
@@ -188,6 +189,9 @@ def main() -> int:
                     help="output APK path")
     ap.add_argument("--abis", default="arm64,armv7",
                     help="comma-separated: arm64, armv7")
+    ap.add_argument("--no-assets", action="store_true",
+                    help="do not bundle android/assets (live-model builds: "
+                         "no mock scripts, so the app asks for an API key)")
     args = ap.parse_args()
 
     _check_sdk()

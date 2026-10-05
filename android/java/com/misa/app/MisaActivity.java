@@ -1,13 +1,16 @@
 package com.misa.app;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.provider.MediaStore;
+import android.widget.EditText;
 
 /** Host Activity for a Misa Android app (Phase 4, M6).
  *
@@ -47,7 +50,13 @@ public class MisaActivity extends Activity {
         final String filesDir =
                 getFilesDir().getAbsolutePath();
         misaHandler.post(() -> {
-            installMockAssets(filesDir);
+            boolean hasMock = installMockAssets(filesDir);
+            if (!hasMock) {
+                // Live-model build: need the user's API key before boot.
+                // Stored in SharedPreferences on first launch; the key
+                // never leaves this phone and is never baked into the APK.
+                awaitModelKey();
+            }
             if (extras != null) {
                 for (String k : extras.keySet()) {
                     Object v = extras.get(k);
@@ -63,11 +72,12 @@ public class MisaActivity extends Activity {
 
     /** Stage bundled *.mock.json assets into filesDir and point
      * MISA_MOCK_FILE at the first one, so demo apps with scripted
-     * model responses work with no keys and no network. */
-    private void installMockAssets(String filesDir) {
+     * model responses work with no keys and no network.
+     * Returns true when a mock asset was staged. */
+    private boolean installMockAssets(String filesDir) {
         try {
             String[] names = getAssets().list("");
-            if (names == null) return;
+            if (names == null) return false;
             for (String name : names) {
                 if (!name.endsWith(".mock.json")) continue;
                 java.io.File out = new java.io.File(filesDir, name);
@@ -82,12 +92,61 @@ public class MisaActivity extends Activity {
                         out.getAbsolutePath());
                 android.util.Log.i("MISA",
                         "staged mock assets: " + name);
-                return; // first mock wins
+                return true; // first mock wins
             }
         } catch (java.io.IOException e) {
             android.util.Log.w("MISA",
                     "mock asset staging failed: " + e.getMessage());
         }
+        return false;
+    }
+
+    /** Live-model builds only: ensure a model API key exists, asking
+     * once on first launch. Runs on the Misa thread; the dialog itself
+     * shows on the UI thread and this method blocks until answered. */
+    private void awaitModelKey() {
+        SharedPreferences prefs =
+                getSharedPreferences("misa", MODE_PRIVATE);
+        String saved = prefs.getString("MISA_MODEL_KEY", null);
+        if (saved != null && !saved.isEmpty()) {
+            applyModelKey(saved);
+            return;
+        }
+        final java.util.concurrent.CountDownLatch latch =
+                new java.util.concurrent.CountDownLatch(1);
+        final String[] out = new String[1];
+        runOnUiThread(() -> {
+            final EditText input = new EditText(MisaActivity.this);
+            input.setHint("paste API key");
+            input.setSingleLine(true);
+            new AlertDialog.Builder(MisaActivity.this)
+                    .setTitle("Model API key")
+                    .setMessage("PlantDoc Live calls a real AI model. " +
+                            "Paste your hcnsec API key — it is stored " +
+                            "only on this phone, never sent anywhere " +
+                            "except the model API.")
+                    .setView(input)
+                    .setPositiveButton("Save", (d, w) -> {
+                        out[0] = input.getText().toString().trim();
+                        latch.countDown();
+                    })
+                    .setCancelable(false)
+                    .show();
+        });
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        String key = out[0] != null ? out[0] : "";
+        prefs.edit().putString("MISA_MODEL_KEY", key).apply();
+        applyModelKey(key);
+    }
+
+    private void applyModelKey(String key) {
+        MisaNative.nativeSetConfig("MISA_MODEL_KEY", key);
+        MisaNative.nativeSetConfig("MISA_OPENAI_BASE_URL",
+                "https://api.hcnsec.cn/v1");
     }
 
     /** CameraButton: capture into the MediaStore, hand the content://
