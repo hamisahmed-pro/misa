@@ -1,0 +1,72 @@
+// PlantDoc: the Misa demo app — one codebase, web + Android.
+// An AI plant doctor: describe the symptoms, snap a leaf, get a
+// structured diagnosis from a typed model call with budgets.
+//
+// v1 ships on the mock provider (deterministic, no keys). Swap
+// `mock.diag` for a real provider + key when demoing live AI.
+//
+// Host:   misa run examples/plantdoc.misa --mock examples/plantdoc.mock.json
+// Web:    misa build examples/plantdoc.misa --target wasm32-unknown-emscripten
+//             -o web/plantdoc.js --preload-file examples/plantdoc.mock.json@/mock.json
+// APK:    python3 scripts/build_apk.py --misa examples/plantdoc.misa
+
+app PlantDoc {
+    title: "PlantDoc",
+    version: "1.0.0",
+}
+
+provider mock {
+    key: env("UNUSED"),
+}
+
+models {
+    diag: mock("plantdoc_diag"),
+}
+
+type Diagnosis {
+    condition: Text,
+    confidence: Float,
+    treatment: [Text],
+    urgent: Bool,
+}
+
+model diagnose(plant: Photo, notes: Text) -> Diagnosis
+    with mock.diag
+    budget { tokens: 2000, latency: 10s, cost: $0.05 }
+    prompt v1 """
+    You are a botanist. Photo: {plant}. Notes: {notes}.
+    Respond with structured data only.
+    """
+
+screen Home {
+    Column {
+        Heading(text: "PlantDoc")
+        Text(text: "Describe the symptoms, snap a leaf, get a diagnosis.")
+        TextInput(id: notes, hint: "Yellow spots, wilting edges...")
+        CameraButton(onCapture: |photo| {
+            let d = diagnose(photo, notes.text)
+            navigate(Result(d, photo))
+        })
+        Text(text: "The photo stays on your device. Every diagnosis call carries a token, latency and cost budget.")
+    }
+}
+
+screen Result(d: Diagnosis, photo: Photo) {
+    Column {
+        Image(photo: photo)
+        Heading(text: "Diagnosis: {d.condition}")
+        Text(text: "Confidence: {d.confidence}")
+        if d.urgent {
+            Banner(text: "Needs attention today", style: "warning")
+        } else {
+            Banner(text: "Looks manageable", style: "info")
+        }
+        Heading(text: "Treatment")
+        List(items: d.treatment)
+        Button(label: "Diagnose another", onTap: || {
+            navigate(Home())
+        })
+    }
+}
+
+navigate(Home())

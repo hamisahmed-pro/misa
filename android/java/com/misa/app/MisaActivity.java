@@ -47,6 +47,7 @@ public class MisaActivity extends Activity {
         final String filesDir =
                 getFilesDir().getAbsolutePath();
         misaHandler.post(() -> {
+            installMockAssets(filesDir);
             if (extras != null) {
                 for (String k : extras.keySet()) {
                     Object v = extras.get(k);
@@ -58,6 +59,35 @@ public class MisaActivity extends Activity {
             }
             MisaNative.nativeBoot(widgets, filesDir);
         });
+    }
+
+    /** Stage bundled *.mock.json assets into filesDir and point
+     * MISA_MOCK_FILE at the first one, so demo apps with scripted
+     * model responses work with no keys and no network. */
+    private void installMockAssets(String filesDir) {
+        try {
+            String[] names = getAssets().list("");
+            if (names == null) return;
+            for (String name : names) {
+                if (!name.endsWith(".mock.json")) continue;
+                java.io.File out = new java.io.File(filesDir, name);
+                try (java.io.InputStream in = getAssets().open(name);
+                     java.io.OutputStream os =
+                             new java.io.FileOutputStream(out)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                }
+                MisaNative.nativeSetConfig("MISA_MOCK_FILE",
+                        out.getAbsolutePath());
+                android.util.Log.i("MISA",
+                        "staged mock assets: " + name);
+                return; // first mock wins
+            }
+        } catch (java.io.IOException e) {
+            android.util.Log.w("MISA",
+                    "mock asset staging failed: " + e.getMessage());
+        }
     }
 
     /** CameraButton: capture into the MediaStore, hand the content://

@@ -169,8 +169,14 @@ def _package(workdir: str) -> str:
     with open(staged, "w") as f:
         f.write(src)
     unsigned = os.path.join(workdir, "unsigned.apk")
-    _run([_tool("aapt"), "package", "-f",
-          "-M", staged, "-I", ANDROID_JAR, "-F", unsigned])
+    cmd = [_tool("aapt"), "package", "-f",
+           "-M", staged, "-I", ANDROID_JAR, "-F", unsigned]
+    assets = os.path.join(MISA_DIR, "android", "assets")
+    if os.path.isdir(assets) and os.listdir(assets):
+        # Raw assets (e.g. *.mock.json for demo model scripts) ship
+        # inside the APK; MisaActivity stages them into filesDir.
+        cmd += ["-A", assets]
+    _run(cmd)
     return unsigned
 
 

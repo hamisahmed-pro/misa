@@ -29,7 +29,8 @@ jobs:
           ./impl/bin/misa build examples/webslice.misa --target wasm32-unknown-emscripten -o web/misa.js --preload-file examples/webslice.mock.json@/mock.json
           ./impl/bin/misa build examples/webmodel.misa --target wasm32-unknown-emscripten -o web/webmodel.js
           ./impl/bin/misa build examples/webmodel_live.misa --target wasm32-unknown-emscripten -o web/webmodel_live.js
-          ls -la web/misa.wasm web/webmodel.wasm
+          ./impl/bin/misa build examples/plantdoc.misa --target wasm32-unknown-emscripten -o web/plantdoc.js --preload-file examples/plantdoc.mock.json@/mock.json
+          ls -la web/misa.wasm web/webmodel.wasm web/plantdoc.wasm
       - name: Install test deps
         run: cd tests/web && npm install --no-audit --no-fund ws
       - name: Start stub server and Chrome
@@ -53,6 +54,11 @@ jobs:
           export MISA_ROOT="$GITHUB_WORKSPACE"
           node cdp_web_test.js "$MISA_WEB_BASE"
           node cdp_web_m5_test.js
+      - name: PlantDoc demo checks
+        run: |
+          cd $GITHUB_WORKSPACE/tests/web
+          export MISA_WEB_BASE="http://localhost:8471"
+          node cdp_plantdoc_test.js "$MISA_WEB_BASE"
       - name: Live provider check (optional, needs MISA_LIVE_API_KEY secret)
         # NOTE: `secrets` may not be used in a step-level `if:` (GitHub
         # rejects the whole workflow). Gate on the env var in shell instead.
