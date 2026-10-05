@@ -37,7 +37,15 @@ jobs:
           cd $GITHUB_WORKSPACE/tests/web
           MISA_WEB_DIR=$GITHUB_WORKSPACE/web nohup python3 stub_server.py 8471 > /tmp/stub.log 2>&1 &
           google-chrome --headless --no-sandbox --disable-gpu --remote-debugging-port=9222 --allow-file-access-from-files about:blank > /tmp/chrome.log 2>&1 &
-          sleep 6
+          # Wait for Chrome's DevTools port instead of a blind sleep:
+          # on a loaded runner Chrome can take longer than 6s to listen.
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9222/json/version > /dev/null 2>&1; then
+              echo "chrome DevTools up after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:9222/json/version > /dev/null 2>&1 || { echo "chrome never listened:"; cat /tmp/chrome.log; exit 1; }
       - name: Web checks (stub layer)
         run: |
           cd $GITHUB_WORKSPACE/tests/web
