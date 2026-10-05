@@ -26,7 +26,7 @@ jobs:
         run: |
           chmod +x impl/bin/misa
           source /tmp/emsdk/emsdk_env.sh
-          ./impl/bin/misa build examples/webslice.misa --target wasm32-unknown-emscripten -o web/misa.js
+          ./impl/bin/misa build examples/webslice.misa --target wasm32-unknown-emscripten -o web/misa.js --preload-file examples/webslice.mock.json@/mock.json
           ./impl/bin/misa build examples/webmodel.misa --target wasm32-unknown-emscripten -o web/webmodel.js
           ./impl/bin/misa build examples/webmodel_live.misa --target wasm32-unknown-emscripten -o web/webmodel_live.js
           ls -la web/misa.wasm web/webmodel.wasm
