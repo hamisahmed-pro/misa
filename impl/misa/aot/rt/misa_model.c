@@ -891,9 +891,13 @@ static int provider_complete(const MModelMeta *meta, const char *prompt,
         return PC_CONFIG_ERR;
     }
 
-    const char *hdrs[1];
+    /* Always send Content-Type: without it, OpenAI-compatible
+     * gateways don't parse the JSON body and the model field arrives
+     * empty (seen live: hcnsec 403 "no access to model "). */
+    const char *hdrs[2];
     int nhdrs = 0;
-    if (auth_hdr) { hdrs[0] = auth_hdr; nhdrs = 1; }
+    hdrs[nhdrs++] = "Content-Type: application/json";
+    if (auth_hdr) hdrs[nhdrs++] = auth_hdr;
     /* Phase 4 (M2): the transport is the platform layer. The curl
      * backend lives in rt/platform_linux.c when built with
      * -DMISA_USE_CURL; the JNI HttpURLConnection backend lives in
