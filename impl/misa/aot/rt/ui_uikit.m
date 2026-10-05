@@ -116,8 +116,7 @@ static UIViewController *ui_host_vc(MisaUI *ui) {
 MisaUI *misa_ui_create(void) {
     MisaUI *ui = (MisaUI *)calloc(1, sizeof(MisaUI));
     if (!ui) misa_platform_fatal("E300", "out of memory");
-    ui->views = (NSMutableArray *)CFRetain(
-        [NSMutableArray arrayWithObject:[NSNull null]]);
+    ui->views = [[NSMutableArray alloc] initWithObjects:[NSNull null], nil];
     ui->nw = 0;
     ui->wcap = 0;
     return ui;
