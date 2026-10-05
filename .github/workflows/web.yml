@@ -45,10 +45,15 @@ jobs:
           node cdp_web_test.js "$MISA_WEB_BASE"
           node cdp_web_m5_test.js
       - name: Live provider check (optional, needs MISA_LIVE_API_KEY secret)
-        if: ${{ secrets.MISA_LIVE_API_KEY != '' }}
+        # NOTE: `secrets` may not be used in a step-level `if:` (GitHub
+        # rejects the whole workflow). Gate on the env var in shell instead.
+        env:
+          MISA_LIVE_API_KEY: ${{ secrets.MISA_LIVE_API_KEY }}
         run: |
+          if [ -z "$MISA_LIVE_API_KEY" ]; then
+            echo "No MISA_LIVE_API_KEY secret configured; skipping live provider check."
+            exit 0
+          fi
           cd $GITHUB_WORKSPACE/tests/web
           export MISA_WEB_BASE="file://$GITHUB_WORKSPACE/web"
           node cdp_web_live_test.js
-        env:
-          MISA_LIVE_API_KEY: ${{ secrets.MISA_LIVE_API_KEY }}
