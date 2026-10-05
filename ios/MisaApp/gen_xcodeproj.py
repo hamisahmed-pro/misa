@@ -49,9 +49,11 @@ ids.update({
     "ref:Foundation": uid("ref:Foundation"),
     "ref:UIKit": uid("ref:UIKit"),
     "ref:CoreML": uid("ref:CoreML"),
+    "ref:CoreGraphics": uid("ref:CoreGraphics"),
     "build:Foundation": uid("build:Foundation"),
     "build:UIKit": uid("build:UIKit"),
     "build:CoreML": uid("build:CoreML"),
+    "build:CoreGraphics": uid("build:CoreGraphics"),
     "group:main": uid("group:main"),
     "group:rt": uid("group:rt"),
     "group:program": uid("group:program"),
@@ -70,6 +72,8 @@ ids.update({
     "config:target:release": uid("config:target:release"),
     "productref": uid("productref"),
 })
+
+FRAMEWORKS = ("Foundation", "UIKit", "CoreML", "CoreGraphics")
 
 
 def q(s: str) -> str:
@@ -91,7 +95,7 @@ W("\tobjects = {")
 for fname, _, _ in SOURCES:
     W("\t\t%s /* %s in Sources */ = {isa = PBXBuildFile; fileRef = %s /* %s */; };"
       % (ids["build:" + fname], fname, ids["ref:" + fname], fname))
-for fw in ("Foundation", "UIKit", "CoreML"):
+for fw in FRAMEWORKS:
     W("\t\t%s /* %s.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = %s /* %s.framework */; };"
       % (ids["build:" + fw], fw, ids["ref:" + fw], fw))
 W("\t\t%s /* prog_arm64.o in Frameworks */ = {isa = PBXBuildFile; fileRef = %s /* prog_arm64.o */; };"
@@ -114,13 +118,17 @@ W("\t\t%s /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = w
   % ids["ref:UIKit"])
 W("\t\t%s /* CoreML.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreML.framework; path = System/Library/Frameworks/CoreML.framework; sourceTree = SDKROOT; };"
   % ids["ref:CoreML"])
+for fw in FRAMEWORKS:
+    if fw not in ("Foundation", "UIKit", "CoreML"):
+        W("\t\t%s /* %s.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = %s.framework; path = System/Library/Frameworks/%s.framework; sourceTree = SDKROOT; };"
+          % (ids["ref:" + fw], fw, fw, fw))
 W("\t\t%s /* MisaApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MisaApp.app; sourceTree = BUILT_PRODUCTS_DIR; };"
   % ids["productref"])
 
 # ---- PBXFrameworksBuildPhase / Resources / Sources ----
 W("\t\t%s /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = ("
   % ids["phase:frameworks"])
-for fw in ("Foundation", "UIKit", "CoreML"):
+for fw in FRAMEWORKS:
     W("\t\t\t%s /* %s.framework in Frameworks */," % (ids["build:" + fw], fw))
 W("\t\t\t%s /* prog_arm64.o in Frameworks */," % ids["build:prog_arm64.o"])
 W("\t\t); runOnlyForDeploymentPostprocessing = 0; };")
