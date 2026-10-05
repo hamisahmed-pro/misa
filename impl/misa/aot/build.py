@@ -105,12 +105,12 @@ def _ndk_clang(triple: str) -> str:
 
 # ----------------------------------------------------------------------
 # Target table (Phase 4, M1 — fixes B3/B6 structurally).
-#
 # Per-target C toolchain ("cc"), a short compiler id for the runtime
 # cache key ("cc_id"), and the program entry point ("entry": "main"
-# for every hosted target today; misa_ui_boot / JNI_OnLoad arrive
-# with M3/M6). Only the host row links in M1; every other row emits
-# an LLVM object file, with the full toolchain landing per milestone.
+# for hosted targets; "misa_ui_boot" for web; "misa_main" for Apple —
+# the iOS template's main.m owns main() and calls misa_main() itself).
+# Only the host row links in M1; every other row emits an LLVM object
+# file, with the full toolchain landing per milestone.
 # ----------------------------------------------------------------------
 TARGETS = {
     "x86_64-linux-gnu": {
@@ -158,21 +158,21 @@ TARGETS = {
     "aarch64-apple-darwin": {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-arm64",
-        "entry": "main",
+        "entry": "misa_main",
         "status": "object only (link+sign on a Mac: M7 runtime in rt/*.m, template in ios/MisaApp)",
         "desc": "Apple ARM64 (iOS/macOS)",
     },
     "aarch64-apple-ios-simulator": {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-arm64-iossim",
-        "entry": "main",
+        "entry": "misa_main",
         "status": "object only (link in Xcode for the iOS Simulator: M7 template ios/MisaApp)",
         "desc": "Apple ARM64 iOS Simulator",
     },
     "x86_64-apple-darwin": {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-x86_64",
-        "entry": "main",
+        "entry": "misa_main",
         "status": "object only (link+sign on a Mac: M7 runtime in rt/*.m, template in ios/MisaApp)",
         "desc": "Apple x86-64 (macOS Intel)",
     },

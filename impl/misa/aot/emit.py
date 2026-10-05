@@ -373,8 +373,13 @@ class Emitter:
     def emit_entry_main(self):
         # Phase 4 (M3): the web target boots via misa_ui_boot (exported
         # to JS); hosted targets keep int main().
+        # Phase 5 (M3): iOS ("misa_main" entry) emits no wrapper at all —
+        # rt/main.m defines main() -> UIApplicationMain, and the app
+        # delegate calls misa_rt_init() + misa_main() itself.
         if self.entry == "misa_ui_boot":
             self.emit_entry_boot()
+            return
+        if self.entry == "misa_main":
             return
         fty = ir.FunctionType(I32, [])
         fn = ir.Function(self.mod, fty, name="main")
