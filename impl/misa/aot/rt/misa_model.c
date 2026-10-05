@@ -660,7 +660,582 @@ typedef struct {
     char   *text;        /* raw model text (expected JSON) */
     int64_t in_tok;
     int64_t out_tok;
+    char    ecode[8];    /* set when provider_complete returns PC_ECODE */
 } Completion;
+
+/* ------------------------------------------------------------------ */
+/* on-device inference (Phase 5, M2): ONNX Runtime                      */
+/* ------------------------------------------------------------------ */
+/* Mirrors impl/misa/providers.py OnDeviceProvider: the model file's
+ * extension selects the runtime; `.onnx` runs here via the ORT C API
+ * (compiled in with -DMISA_USE_ORT). The first model output is
+ * serialized to JSON in out->text so the existing schema validation
+ * in misa_model_call applies unchanged, exactly like M1.
+ *
+ * v1 type mapping (must match _sig_kind in providers.py):
+ *   Float  -> scalar float32 tensor (shape [] or [1])
+ *   [Float] -> 1-D float32 tensor
+ *   Text   -> string tensor
+ * E501 = tensor shape mismatch, E502 = unsupported signature,
+ * E503 = runtime not available on this platform. These surface via
+ * PC_ECODE with the code in Completion.ecode. */
+
+enum { PC_OK = 0, PC_MODEL_ERR = 1, PC_CONFIG_ERR = 2, PC_ECODE = 3 };
+
+static const char *ondevice_runtime(const char *path) {
+    const char *dot = strrchr(path, '.');
+    char ext[16];
+    size_t i;
+    if (!dot) return "unknown";
+    for (i = 0; i + 1 < sizeof ext && dot[i]; i++)
+        ext[i] = (char)tolower((unsigned char)dot[i]);
+    ext[i] = '\0';
+    if (strcmp(ext, ".onnx") == 0) return "onnx";
+    if (strcmp(ext, ".mlpackage") == 0 || strcmp(ext, ".mlmodelc") == 0)
+        return "coreml";
+    if (strcmp(ext, ".tflite") == 0) return "tflite";
+    return "unknown";
+}
+
+/* Resolve the embedded model path at runtime. build.py embeds the
+ * absolute source path and stages a copy next to the binary, so try:
+ * (1) the path as embedded, (2) <exe-dir>/<basename> (shipped app),
+ * (3) ./<basename> (current directory). */
+static void ondevice_resolve_path(const char *given, char *out, size_t cap) {
+    FILE *f = fopen(given, "rb");
+    if (f) {
+        fclose(f);
+        snprintf(out, cap, "%s", given);
+        return;
+    }
+    const char *base = strrchr(given, '/');
+    base = base ? base + 1 : given;
+#ifdef __linux__
+    {
+        char exe[1024];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            char *slash = strrchr(exe, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(out, cap, "%s/%s", exe, base);
+                f = fopen(out, "rb");
+                if (f) {
+                    fclose(f);
+                    return;
+                }
+            }
+        }
+    }
+#endif
+    snprintf(out, cap, "%s", given);
+}
+
+#ifdef MISA_USE_ORT
+#include <onnxruntime_c_api.h>
+
+static const OrtApi *ort_api(void) {
+    static const OrtApi *api = NULL;
+    if (!api) api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    return api;
+}
+
+/* v1: one cached session per process (programs use a single model). */
+static char ort_cached_path[1024] = {0};
+static OrtEnv *ort_env = NULL;
+static OrtSession *ort_sess = NULL;
+
+static int ort_ensure_session(const char *path, char *errbuf, size_t errcap) {
+    const OrtApi *api = ort_api();
+    OrtStatus *st;
+    if (ort_sess && strcmp(ort_cached_path, path) == 0) return 1;
+    if (ort_sess) {
+        api->ReleaseSession(ort_sess);
+        ort_sess = NULL;
+        ort_cached_path[0] = '\0';
+    }
+    if (!ort_env) {
+        st = api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "misa", &ort_env);
+        if (st) {
+            snprintf(errbuf, errcap, "ORT env failed: %s",
+                     api->GetErrorMessage(st));
+            api->ReleaseStatus(st);
+            return 0;
+        }
+    }
+    {
+        OrtSessionOptions *opts = NULL;
+        st = api->CreateSessionOptions(&opts);
+        if (st) {
+            snprintf(errbuf, errcap, "ORT options failed: %s",
+                     api->GetErrorMessage(st));
+            api->ReleaseStatus(st);
+            return 0;
+        }
+        st = api->CreateSession(ort_env, path, opts, &ort_sess);
+        api->ReleaseSessionOptions(opts);
+        if (st) {
+            snprintf(errbuf, errcap, "cannot load on-device model '%s': %s",
+                     path, api->GetErrorMessage(st));
+            api->ReleaseStatus(st);
+            return 0;
+        }
+    }
+    snprintf(ort_cached_path, sizeof ort_cached_path, "%s", path);
+    return 1;
+}
+
+/* Declared-type -> v1 kind. Mirrors _sig_kind: only Float/[Float]/Text. */
+static const char *ort_sig_kind(const char *t) {
+    char b[32];
+    size_t n = strlen(t);
+    if (n > 0 && t[n - 1] == '?') n--;  /* optional handled by caller */
+    if (n >= sizeof b) return NULL;
+    memcpy(b, t, n);
+    b[n] = '\0';
+    if (strcmp(b, "Float") == 0) return "scalar";
+    if (strcmp(b, "[Float]") == 0) return "vec";
+    if (strcmp(b, "Text") == 0) return "text";
+    return NULL;
+}
+
+static int ort_infer(const MModelMeta *meta, MVal **args, int nargs,
+                     Completion *out, char *errbuf, size_t errcap) {
+    const OrtApi *api = ort_api();
+    OrtStatus *st;
+    OrtAllocator *alloc = NULL;
+    OrtMemoryInfo *meminfo = NULL;
+    char mpath[1024];
+    size_t i, n_in = 0, n_out = 0;
+    char **in_names = NULL, **out_names = NULL;
+    OrtValue **in_vals = NULL;
+    OrtValue *out_val = NULL;
+    float **fbufs = NULL;      /* owned float buffers, freed at done */
+    size_t nfbufs = 0;
+    int rc = PC_ECODE;         /* default: caller raises ecode */
+    Buf jb = {0};
+
+    /* OCHK: on ORT status failure, format errbuf and jump to cleanup. */
+#define OCHK(call_, ...) do { \
+        OrtStatus *_st = (call_); \
+        if (_st) { \
+            snprintf(errbuf, errcap, __VA_ARGS__); \
+            api->ReleaseStatus(_st); \
+            goto done; \
+        } \
+    } while (0)
+
+    ondevice_resolve_path(meta->model_file ? meta->model_file : "",
+                          mpath, sizeof mpath);
+    if (!ort_ensure_session(mpath, errbuf, errcap))
+        return PC_MODEL_ERR;
+    OCHK(api->GetAllocatorWithDefaultOptions(&alloc),
+         "ORT allocator failed");
+    OCHK(api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                                  &meminfo),
+         "ORT memory info failed");
+    OCHK(api->SessionGetInputCount(ort_sess, &n_in),
+         "ORT input count failed");
+    OCHK(api->SessionGetOutputCount(ort_sess, &n_out),
+         "ORT output count failed");
+    if ((int)n_in != nargs) {
+        snprintf(errbuf, errcap,
+                 "E502: model takes %zu input(s), called with %d arg(s)",
+                 n_in, nargs);
+        goto done;
+    }
+    if (n_out < 1) {
+        snprintf(errbuf, errcap, "E502: model has no outputs");
+        goto done;
+    }
+    in_names = (char **)misa_alloc(sizeof(char *) * (n_in ? n_in : 1));
+    memset(in_names, 0, sizeof(char *) * (n_in ? n_in : 1));
+    in_vals = (OrtValue **)misa_alloc(sizeof(OrtValue *) * (n_in ? n_in : 1));
+    memset(in_vals, 0, sizeof(OrtValue *) * (n_in ? n_in : 1));
+    fbufs = (float **)misa_alloc(sizeof(float *) * (n_in ? n_in : 1));
+    for (i = 0; i < n_in; i++) {
+        const char *pname = meta->params[i].name;
+        const char *ptype = meta->params[i].type;
+        const char *kind = ort_sig_kind(ptype ? ptype : "");
+        MVal *av = args[i];
+        OrtTypeInfo *ti = NULL;
+        const OrtTensorTypeAndShapeInfo *tinfo = NULL;
+        ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+        enum ONNXType ot = ONNX_TYPE_UNKNOWN;
+        size_t ndim = 0;
+        int64_t dims[8];
+        char *nm = NULL;
+
+        if (!kind) {
+            snprintf(errbuf, errcap,
+                     "E502: param '%s': type '%s' is not supported "
+                     "on-device in v1 (Float, [Float], Text)",
+                     pname, ptype ? ptype : "?");
+            goto done;
+        }
+        OCHK(api->SessionGetInputName(ort_sess, i, alloc, &nm),
+             "E502: cannot read model input %zu", i);
+        in_names[i] = nm;
+        OCHK(api->SessionGetInputTypeInfo(ort_sess, i, &ti),
+             "E502: cannot read type of model input '%s'", nm);
+        OCHK(api->GetOnnxTypeFromTypeInfo(ti, &ot),
+             "E502: cannot read type of model input '%s'", nm);
+        if (ot != ONNX_TYPE_TENSOR) {
+            snprintf(errbuf, errcap,
+                     "E502: model input '%s' is not a tensor", nm);
+            api->ReleaseTypeInfo(ti);
+            goto done;
+        }
+        OCHK(api->CastTypeInfoToTensorInfo(ti, &tinfo),
+             "E502: cannot read tensor info of model input '%s'", nm);
+        OCHK(api->GetTensorElementType(tinfo, &et),
+             "E502: cannot read element type of model input '%s'", nm);
+        OCHK(api->GetDimensionsCount(tinfo, &ndim),
+             "E502: cannot read shape of model input '%s'", nm);
+        if (ndim > 8) {
+            snprintf(errbuf, errcap,
+                     "E502: model input '%s' has %zu dims (v1: <= 8)", nm,
+                     ndim);
+            api->ReleaseTypeInfo(ti);
+            goto done;
+        }
+        OCHK(api->GetDimensions(tinfo, dims, ndim),
+             "E502: cannot read shape of model input '%s'", nm);
+
+        if (strcmp(kind, "text") == 0) {
+            const char *tz;
+            OrtValue *v = NULL;
+            const char *one[1];
+            int64_t sdim[1] = {1};
+            if (misa_tag(av) != M_TAG_TEXT) {
+                snprintf(errbuf, errcap,
+                         "E502: param '%s': Text value required", pname);
+                api->ReleaseTypeInfo(ti);
+                goto done;
+            }
+            if (et != ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
+                snprintf(errbuf, errcap,
+                         "E502: param '%s': model input '%s' is not a "
+                         "string tensor", pname, nm);
+                api->ReleaseTypeInfo(ti);
+                goto done;
+            }
+            tz = misa_text_z(av);
+            one[0] = tz ? tz : "";
+            /* NB: CreateTensorAsOrtValue takes an OrtAllocator, not a
+             * memory info (ORT >= 1.17 signature). */
+            OCHK(api->CreateTensorAsOrtValue(alloc, sdim, 1,
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING, &v),
+                 "E502: string tensor creation failed");
+            OCHK(api->FillStringTensor(v, one, 1),
+                 "E502: string tensor fill failed");
+            api->ReleaseTypeInfo(ti);
+            in_vals[i] = v;
+            continue;
+        }
+        /* numeric kinds need float tensors */
+        {
+            int is_vec = strcmp(kind, "vec") == 0;
+            size_t count = 0;
+            float *fdata = NULL;
+            OrtValue *v = NULL;
+            if (et != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                snprintf(errbuf, errcap,
+                         "E502: param '%s': model input '%s' is not a "
+                         "float tensor (v1 supports float tensors only)",
+                         pname, nm);
+                api->ReleaseTypeInfo(ti);
+                goto done;
+            }
+            if (!is_vec) {
+                double dv;
+                if (misa_tag(av) != M_TAG_FLOAT) {
+                    snprintf(errbuf, errcap,
+                             "E502: param '%s': Float value required",
+                             pname);
+                    api->ReleaseTypeInfo(ti);
+                    goto done;
+                }
+                dv = misa_as_float(av);
+                if (ndim == 0) {
+                    dims[0] = 1;
+                    ndim = 1;
+                    count = 1;
+                } else if (ndim == 1 && (dims[0] == 1 || dims[0] < 0)) {
+                    if (dims[0] < 0) dims[0] = 1;
+                    count = 1;
+                } else {
+                    snprintf(errbuf, errcap,
+                             "E502: param '%s': model input '%s' has "
+                             "unexpected shape (v1 supports scalar/1-D "
+                             "inputs only)", pname, nm);
+                    api->ReleaseTypeInfo(ti);
+                    goto done;
+                }
+                fdata = (float *)misa_alloc(sizeof(float));
+                fdata[0] = (float)dv;
+            } else {
+                int64_t k, len;
+                if (misa_tag(av) != M_TAG_LIST) {
+                    snprintf(errbuf, errcap,
+                             "E502: param '%s': [Float] value required",
+                             pname);
+                    api->ReleaseTypeInfo(ti);
+                    goto done;
+                }
+                if (ndim != 1) {
+                    snprintf(errbuf, errcap,
+                             "E502: param '%s': model input '%s' is not "
+                             "1-D (v1 supports 1-D inputs only)", pname,
+                             nm);
+                    api->ReleaseTypeInfo(ti);
+                    goto done;
+                }
+                len = misa_list_len(av);
+                if (dims[0] >= 0 && dims[0] != len) {
+                    snprintf(errbuf, errcap,
+                             "E501: param '%s': model input '%s' expects "
+                             "%lld values, got %lld", pname, nm,
+                             (long long)dims[0], (long long)len);
+                    api->ReleaseTypeInfo(ti);
+                    goto done;
+                }
+                count = (size_t)len;
+                dims[0] = len;
+                fdata = (float *)misa_alloc(sizeof(float) *
+                                           (count ? count : 1));
+                for (k = 0; k < len; k++) {
+                    MVal *e = misa_list_get(av, k);
+                    if (misa_tag(e) != M_TAG_FLOAT) {
+                        snprintf(errbuf, errcap,
+                                 "E502: param '%s': [Float] value "
+                                 "required", pname);
+                        api->ReleaseTypeInfo(ti);
+                        goto done;
+                    }
+                    fdata[k] = (float)misa_as_float(e);
+                }
+            }
+            fbufs[nfbufs++] = fdata;
+            OCHK(api->CreateTensorWithDataAsOrtValue(
+                    meminfo, fdata, count * sizeof(float),
+                    dims, ndim, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &v),
+                 "E502: tensor creation failed");
+            api->ReleaseTypeInfo(ti);
+            in_vals[i] = v;
+        }
+    }
+    /* run: first output only (mirrors M1) */
+    {
+        char *onm = NULL;
+        OCHK(api->SessionGetOutputName(ort_sess, 0, alloc, &onm),
+             "E502: cannot read model output");
+        out_names = (char **)misa_alloc(sizeof(char *));
+        out_names[0] = onm;
+        {
+            OrtStatus *rst = api->Run(
+                ort_sess, NULL, (const char *const *)in_names,
+                (const OrtValue *const *)in_vals, n_in,
+                (const char *const *)out_names, 1, &out_val);
+            if (rst) {
+                snprintf(errbuf, errcap, "model inference failed: %s",
+                         api->GetErrorMessage(rst));
+                api->ReleaseStatus(rst);
+                rc = PC_MODEL_ERR;
+                goto done;
+            }
+        }
+    }
+    /* first output -> JSON in out->text (existing validation applies) */
+    {
+        OrtTypeInfo *ti = NULL;
+        const OrtTensorTypeAndShapeInfo *tinfo = NULL;
+        ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+        enum ONNXType ot = ONNX_TYPE_UNKNOWN;
+        size_t ndim = 0, k;
+        int64_t dims[8];
+        size_t count = 1;
+        const char *ret_kind = "vec";
+        const char *schema = meta->schema ? meta->schema : "";
+        while (*schema == ' ') schema++;
+        if (strncmp(schema, "[Float]", 7) == 0) ret_kind = "vec";
+        else if (strncmp(schema, "Float", 5) == 0) ret_kind = "scalar";
+        else if (strncmp(schema, "Text", 4) == 0) ret_kind = "text";
+        else {
+            snprintf(errbuf, errcap,
+                     "E502: return type '%s' is not supported on-device "
+                     "in v1 (Float, [Float], Text)", schema);
+            goto done;
+        }
+        OCHK(api->SessionGetOutputTypeInfo(ort_sess, 0, &ti),
+             "E502: cannot read model output type");
+        OCHK(api->GetOnnxTypeFromTypeInfo(ti, &ot),
+             "E502: cannot read model output type");
+        if (ot != ONNX_TYPE_TENSOR) {
+            snprintf(errbuf, errcap,
+                     "E502: model output is not a tensor (v1)");
+            api->ReleaseTypeInfo(ti);
+            goto done;
+        }
+        OCHK(api->CastTypeInfoToTensorInfo(ti, &tinfo),
+             "E502: cannot read model output info");
+        OCHK(api->GetTensorElementType(tinfo, &et),
+             "E502: cannot read model output element type");
+        OCHK(api->GetDimensionsCount(tinfo, &ndim),
+             "E502: cannot read model output shape");
+        if (ndim > 8) {
+            snprintf(errbuf, errcap,
+                     "E502: model output has %zu dims (v1: <= 8)", ndim);
+            api->ReleaseTypeInfo(ti);
+            goto done;
+        }
+        OCHK(api->GetDimensions(tinfo, dims, ndim),
+             "E502: cannot read model output shape");
+        for (k = 0; k < ndim; k++)
+            if (dims[k] > 0) count *= (size_t)dims[k];
+        if (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            float *f = NULL;
+            OCHK(api->GetTensorMutableData(out_val, (void **)&f),
+                 "E502: cannot read model output data");
+            if (strcmp(ret_kind, "scalar") == 0) {
+                char tmp[64];
+                snprintf(tmp, sizeof tmp, "%.17g", count ? f[0] : 0.0);
+                buf_puts(&jb, tmp);
+            } else {
+                buf_putn(&jb, "[", 1);
+                for (k = 0; k < count; k++) {
+                    char tmp[64];
+                    if (k) buf_putn(&jb, ",", 1);
+                    snprintf(tmp, sizeof tmp, "%.17g", f[k]);
+                    buf_puts(&jb, tmp);
+                }
+                buf_putn(&jb, "]", 1);
+            }
+        } else if (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
+            size_t slen = 0, nstr = count, s;
+            char *sbuf;
+            size_t *offs;
+            OCHK(api->GetStringTensorDataLength(out_val, &slen),
+                 "E502: cannot read string output");
+            if (nstr == 0) {
+                buf_puts(&jb,
+                         strcmp(ret_kind, "scalar") == 0 ? "\"\"" : "[]");
+            } else {
+                sbuf = (char *)misa_alloc(slen ? slen : 1);
+                offs = (size_t *)misa_alloc(sizeof(size_t) * nstr);
+                OCHK(api->GetStringTensorContent(out_val, sbuf, slen,
+                                                offs, nstr),
+                     "E502: cannot read string output");
+                if (strcmp(ret_kind, "scalar") == 0) {
+                    size_t e0 = nstr > 1 ? offs[1] : slen;
+                    buf_putn(&jb, "\"", 1);
+                    buf_put_json_str(&jb, sbuf + offs[0], e0 - offs[0]);
+                    buf_putn(&jb, "\"", 1);
+                } else {
+                    buf_putn(&jb, "[", 1);
+                    for (s = 0; s < nstr; s++) {
+                        size_t e0 = s + 1 < nstr ? offs[s + 1] : slen;
+                        if (s) buf_putn(&jb, ",", 1);
+                        buf_putn(&jb, "\"", 1);
+                        buf_put_json_str(&jb, sbuf + offs[s],
+                                         e0 - offs[s]);
+                        buf_putn(&jb, "\"", 1);
+                    }
+                    buf_putn(&jb, "]", 1);
+                }
+            }
+        } else {
+            snprintf(errbuf, errcap,
+                     "E502: model output is not float/string (v1)");
+            api->ReleaseTypeInfo(ti);
+            goto done;
+        }
+        api->ReleaseTypeInfo(ti);
+    }
+    out->text = jb.buf ? jb.buf : (char *)misa_alloc(1);
+    if (!jb.buf) out->text[0] = '\0';
+    jb.buf = NULL;  /* ownership transferred */
+    rc = PC_OK;
+
+done:
+    if (rc == PC_ECODE) {
+        /* Every E50x site prefixes its message with the code; extract
+         * it for the raise, then strip it so misa_raise doesn't print
+         * it twice ("E501: E501: ..."). */
+        if (sscanf(errbuf, "E%3[0-9]: ", out->ecode + 1) == 1) {
+            out->ecode[0] = 'E';
+            out->ecode[4] = '\0';
+            memmove(errbuf, errbuf + 6, strlen(errbuf + 6) + 1);
+        } else if (!out->ecode[0]) {
+            memcpy(out->ecode, "E502", 5);
+        }
+    }
+    if (out_val) api->ReleaseValue(out_val);
+    if (in_vals) {
+        for (i = 0; i < n_in; i++)
+            if (in_vals[i]) api->ReleaseValue(in_vals[i]);
+    }
+    if (in_names) {
+        for (i = 0; i < n_in; i++)
+            if (in_names[i]) alloc->Free(alloc, in_names[i]);
+    }
+    if (out_names && out_names[0]) alloc->Free(alloc, out_names[0]);
+    if (meminfo) api->ReleaseMemoryInfo(meminfo);
+    if (jb.buf) misa_free(jb.buf);
+    return rc;
+#undef OCHK
+}
+
+#else
+/* No ORT linked: on-device .onnx calls fail with E503. */
+static int ort_infer(const MModelMeta *meta, MVal **args, int nargs,
+                     Completion *out, char *errbuf, size_t errcap) {
+    (void)meta;
+    (void)args;
+    (void)nargs;
+    (void)out;
+    snprintf(out->ecode, sizeof out->ecode, "E503");
+    snprintf(errbuf, errcap,
+             "ONNX Runtime is not linked into this binary "
+             "(rebuild with the vendored ORT; see spec/ONDEVICE.md)");
+    return PC_ECODE;
+}
+#endif
+
+static int provider_complete_ondevice(const MModelMeta *meta, MVal **args,
+                                      int nargs, Completion *out,
+                                      char *errbuf, size_t errcap) {
+    const char *rt;
+    const char *mfile = meta->model_file ? meta->model_file : "";
+    if (!*mfile) {
+        snprintf(errbuf, errcap,
+                 "on-device provider needs `model: file(\"...\")`");
+        return PC_CONFIG_ERR;
+    }
+    rt = ondevice_runtime(mfile);
+    if (strcmp(rt, "coreml") == 0) {
+        snprintf(out->ecode, sizeof out->ecode, "E503");
+        snprintf(errbuf, errcap,
+                 "CoreML models (.mlpackage/.mlmodelc) need Apple "
+                 "hardware (milestone M3)");
+        return PC_ECODE;
+    }
+    if (strcmp(rt, "tflite") == 0) {
+        snprintf(out->ecode, sizeof out->ecode, "E503");
+        snprintf(errbuf, errcap,
+                 "TFLite models (.tflite) need Android (milestone M4)");
+        return PC_ECODE;
+    }
+    if (strcmp(rt, "unknown") == 0) {
+        snprintf(errbuf, errcap,
+                 "unknown on-device model extension for '%s' "
+                 "(want .onnx, .mlpackage, .mlmodelc, .tflite)",
+                 mfile);
+        return PC_CONFIG_ERR;
+    }
+    return ort_infer(meta, args, nargs, out, errbuf, errcap);
+}
 
 /* Read a whole file into a Buf. Returns 1 on success. */
 static int read_file_buf(const char *path, Buf *b) {
@@ -693,13 +1268,17 @@ typedef struct {
 
 #define MAX_IMAGES 8
 
-/* result codes for provider_complete */
-enum { PC_OK = 0, PC_MODEL_ERR = 1, PC_CONFIG_ERR = 2 };
-
 static int provider_complete(const MModelMeta *meta, const char *prompt,
                              Image *images, int nimages, double timeout_s,
-                             Completion *out, char *errbuf, size_t errcap) {
+                             Completion *out, char *errbuf, size_t errcap,
+                             MVal **args, int nargs) {
     memset(out, 0, sizeof *out);
+    if (strcmp(meta->provider_kind, "ondevice") == 0) {
+        /* Local inference: no prompt/images needed; the declared
+         * params are bound positionally to the model inputs. */
+        return provider_complete_ondevice(meta, args, nargs, out,
+                                          errbuf, errcap);
+    }
     if (strcmp(meta->provider_kind, "mock") == 0) {
         const char *mp = misa_platform_getenv("MISA_MOCK_FILE");
         if (!mp || !*mp) {
@@ -1099,7 +1678,14 @@ MVal *misa_model_call(const MModelMeta *meta, MVal **args, int nargs,
         Completion comp;
         int rc = provider_complete(meta, cur_prompt, images, nimages,
                                    timeout_s, &comp,
-                                   errbuf, sizeof errbuf);
+                                   errbuf, sizeof errbuf, args, nargs);
+        if (rc == PC_ECODE) {
+            /* on-device E501/E502/E503: exact code in comp.ecode */
+            misa_raise(comp.ecode[0] ? comp.ecode : "E502", errbuf,
+                       line, col);
+            misa_free(cur_prompt);
+            return NULL;
+        }
         if (rc == PC_CONFIG_ERR) {
             misa_raise("E401", errbuf, line, col);
             misa_free(cur_prompt);
@@ -1195,7 +1781,9 @@ MVal *misa_model_call(const MModelMeta *meta, MVal **args, int nargs,
 /*   latency_ms: <int, -1 = none>                                     */
 /*   cost_usd: <float, -1 = none>                                     */
 /*   schema: <schema string>                                          */
-/*   param: <name>\t<kind>      (kind empty unless Photo)              */
+/*   model_file: <path>  (on-device only)                             */
+/*   param: <name>\t<kind>\t<type>                                    */
+/*        (kind empty unless Photo; type is the declared type string)  */
 /*   prompt: L\t<escaped literal>                                     */
 /*   prompt: V\t<param_idx>                                            */
 /*                                                                    */
@@ -1261,8 +1849,11 @@ MVal *misa_model_call_meta(const char *meta_text, MVal **args, int nargs,
             }
         } else if (strncmp(ln, "schema: ", 8) == 0) {
             meta.schema = ln + 8;
+        } else if (strncmp(ln, "model_file: ", 12) == 0) {
+            meta.model_file = ln + 12;
         } else if (strncmp(ln, "param: ", 7) == 0) {
             char *tab = strchr(ln + 7, '\t');
+            char *tab2;
             if (nparams + 1 > pcap) {
                 pcap = pcap ? pcap * 2 : 8;
                 MModelParam *np = (MModelParam *)misa_alloc(
@@ -1274,9 +1865,17 @@ MVal *misa_model_call_meta(const char *meta_text, MVal **args, int nargs,
             }
             params[nparams].name = ln + 7;
             params[nparams].kind = "";
+            params[nparams].type = "";
             if (tab) {
                 *tab = '\0';
                 params[nparams].kind = tab + 1;
+                /* v1 meta blocks append the declared type as a third
+                 * field: param: <name>\t<kind>\t<type> */
+                tab2 = strchr(tab + 1, '\t');
+                if (tab2) {
+                    *tab2 = '\0';
+                    params[nparams].type = tab2 + 1;
+                }
             }
             nparams++;
         } else if (strncmp(ln, "prompt: ", 8) == 0) {
@@ -1309,6 +1908,11 @@ MVal *misa_model_call_meta(const char *meta_text, MVal **args, int nargs,
     if (!meta.alias || !meta.provider_kind || !meta.model_id ||
         !meta.schema) {
         misa_raise("E400", "bad model metadata", line, col);
+        return NULL;
+    }
+    if (strcmp(meta.provider_kind, "ondevice") == 0 && !meta.model_file) {
+        misa_raise("E400", "bad model metadata: on-device model needs "
+                           "model_file", line, col);
         return NULL;
     }
     return misa_model_call(&meta, args, nargs, line, col);

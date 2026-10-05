@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,42 @@ CACHE_DIR = os.path.join(RT_DIR, "build")
 # Vendored native deps (built from source tarballs; see deps/README).
 DEPS_DIR = os.path.join(os.path.expanduser("~"), "workspace", "deps", "gc")
 DEPS_INCLUDE = os.path.join(DEPS_DIR, "include")
+
+# ONNX Runtime (Phase 5, M2): vendored C library for on-device .onnx
+# inference in AOT binaries. Pinned to the interpreter's version.
+ORT_VERSION = "1.21.0"
+ORT_DIRNAME = f"onnxruntime-linux-x64-{ORT_VERSION}"
+
+
+def _ort_root() -> str:
+    """Extracted ORT dir, or '' when not vendored (graceful E504)."""
+    p = os.path.join(os.path.expanduser("~"), "workspace", "deps",
+                     "ort", ORT_DIRNAME)
+    if os.path.isfile(os.path.join(p, "include", "onnxruntime_c_api.h")):
+        return p
+    return ""
+
+
+def _ondevice_runtime(path: str) -> str:
+    """Runtime key for an on-device model file, by extension."""
+    ext = os.path.splitext(path)[1].lower()
+    return {".onnx": "onnx", ".mlpackage": "coreml", ".mlmodelc": "coreml",
+            ".tflite": "tflite"}.get(ext, "unknown")
+
+
+def _resolve_model_src(model_file: str, decl_file: str):
+    """Resolve a provider's `model: file("...")` to an absolute source
+    path. Mirrors the interpreter: the path as given, then relative to
+    the provider block's own file. Returns None when not found."""
+    cands = [os.path.abspath(model_file)]
+    if decl_file:
+        cands.append(os.path.normpath(
+            os.path.join(os.path.dirname(decl_file), model_file)))
+    for c in cands:
+        # NB: .mlpackage is a directory bundle, not a file.
+        if os.path.exists(c):
+            return c
+    return None
 
 # ----------------------------------------------------------------------
 # Android NDK (Phase 4, M6). Pinned version; unpacked under
@@ -247,13 +284,17 @@ def _find_lib(name_glob: str, target: str) -> str:
     return ""
 
 
-def runtime_flags(target: str = "") -> tuple:
+def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
     """(defines, cflags, libs) for the C runtime, per target.
 
     Uses the vendored Boehm GC + curl headers when built, else system
     headers, else graceful fallbacks (malloc; http/model-net disabled).
     Non-host targets get the portable fallback set; their real
     toolchain flags land with M3/M6.
+
+    with_ort links the vendored ONNX Runtime (host only, Phase 5 M2);
+    set it only for programs that actually use on-device models so
+    ordinary binaries don't gain the .so dependency.
     """
     target = canonical_target(target or host_triple())
     defines, cflags, libs = [], [], []
@@ -304,6 +345,23 @@ def runtime_flags(target: str = "") -> tuple:
         elif _have_header("/usr/include/curl/curl.h"):
             defines.append("-DMISA_USE_CURL")
             libs.append("-lcurl")
+        # Phase 5 (M2): ONNX Runtime for on-device .onnx inference.
+        # The .so is staged next to the output binary; $ORIGIN rpath
+        # finds it there at runtime. Only when the program uses it.
+        ort_root = _ort_root() if with_ort else ""
+        if ort_root:
+            defines.append("-DMISA_USE_ORT")
+            cflags.append("-I" + os.path.join(ort_root, "include"))
+            ort_lib = None
+            for so in (f"libonnxruntime.so.{ORT_VERSION}",
+                       "libonnxruntime.so.1", "libonnxruntime.so"):
+                cand = os.path.join(ort_root, "lib", so)
+                if os.path.isfile(cand) and not os.path.islink(cand):
+                    ort_lib = cand
+                    break
+            if ort_lib:
+                libs.append(ort_lib)
+            libs.append("-Wl,-rpath,$ORIGIN")
     libs.append("-lm")
     return defines, cflags, libs
 
@@ -320,12 +378,13 @@ def _cc_id(target: str) -> str:
     return _table_row(target).get("cc_id", "unknown-cc")
 
 
-def _rt_key(target: str = "") -> str:
+def _rt_key(target: str = "", with_ort: bool = False) -> str:
     """Runtime cache key: target triple + C compiler id (fix B5) +
     flags + the full runtime source set (Phase 4 added platform_linux.c
-    and ui_text.c to the hash)."""
+    and ui_text.c to the hash). with_ort selects the ORT-linked
+    runtime variant (Phase 5, M2)."""
     target = canonical_target(target or host_triple())
-    defines, cflags, libs = runtime_flags(target)
+    defines, cflags, libs = runtime_flags(target, with_ort)
     h = hashlib.sha256()
     h.update(target.encode())
     h.update(b"\x00" + _cc_id(target).encode())
@@ -337,11 +396,12 @@ def _rt_key(target: str = "") -> str:
     return h.hexdigest()[:16]
 
 
-def ensure_runtime(target: str = "") -> list:
+def ensure_runtime(target: str = "", with_ort: bool = False) -> list:
     """Compile the C runtime if stale; return [rt.o, ...].
 
     Host builds use gcc; the web target (M3) compiles with emcc.
     Other cross targets still need their toolchain (M6/M7).
+    with_ort builds the ORT-linked variant (host only, Phase 5 M2).
     """
     target = canonical_target(target or host_triple())
     if target == "wasm32-unknown-emscripten":
@@ -355,13 +415,13 @@ def ensure_runtime(target: str = "") -> list:
             f"no C toolchain for target {target} yet "
             f"(needs: {cc}; Phase 4 M3/M6)")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _rt_key(target)
+    key = _rt_key(target, with_ort)
     stamp = os.path.join(CACHE_DIR, f"stamp-{key}")
     objs = [os.path.join(CACHE_DIR,
                          f"{src[:-2]}-{key}.o") for src in _rt_sources(target)]
     if os.path.exists(stamp) and all(os.path.exists(o) for o in objs):
         return objs
-    defines, cflags, _libs = runtime_flags(target)
+    defines, cflags, _libs = runtime_flags(target, with_ort)
     for src, out in zip(_rt_sources(target), objs):
         cmd = (["gcc", "-O2", "-c", os.path.join(RT_DIR, src),
                 "-o", out] + defines + cflags)
@@ -427,17 +487,17 @@ def _ensure_runtime_ndk(target: str) -> list:
 
 
 def _frontend(path: str):
-    """Load + check. Returns (merged_prog, errors)."""
+    """Load + check. Returns (merged_prog, errors, file_of)."""
     sys.path.insert(0, IMPL_DIR)
     from misa.loader import load as load_with_imports
     from misa.checker import Checker
     merged, load_errors, _order, file_of = load_with_imports(path)
     if merged is None:
-        return None, load_errors
+        return None, load_errors, file_of
     errors = list(load_errors) + Checker().check(merged, file_of=file_of)
     if errors:
-        return None, errors
-    return merged, []
+        return None, errors, file_of
+    return merged, [], file_of
 
 
 def _err(code: str, message: str):
@@ -496,7 +556,7 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
     FS, as "src" or "src@dst" (emcc --preload-file).
     """
     sys.path.insert(0, IMPL_DIR)
-    merged, errors = _frontend(path)
+    merged, errors, file_of = _frontend(path)
     if errors:
         return False, [e.to_dict() if hasattr(e, "to_dict") else e
                        for e in errors]
@@ -505,18 +565,51 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
     from misa.ast import ProviderDecl
     eff_target = canonical_target(target or host_triple())
 
-    # --- on-device models: interpreter-only in M1 --------------------
-    # The AOT runtime has no local-inference transport yet (milestone
-    # M2), so compiling a program with an on-device provider fails here
-    # with E504 instead of breaking on the device.
+    # --- on-device models (Phase 5, M2) ------------------------------
+    # `.onnx` on the host target runs via the vendored ONNX Runtime;
+    # every other runtime/target combination fails here with E504
+    # instead of breaking on the device.
+    staged_models = []  # absolute source paths staged next to the binary
     for item in merged.items:
         if isinstance(item, ProviderDecl) and item.model_file:
+            decl_file = file_of.get(id(item), "")
+            src = _resolve_model_src(item.model_file, decl_file)
+            if src is None:
+                return False, [{
+                    "code": "E600",
+                    "message": f"on-device model file not found: "
+                               f"'{item.model_file}' (resolved against "
+                               f"the provider block's file)",
+                    "line": item.line, "col": item.col, "hint": ""}]
+            item.model_file = src  # embed the absolute source path
+            rt = _ondevice_runtime(src)
+            if rt == "onnx" and eff_target == host_triple():
+                if not _ort_root():
+                    return False, [{
+                        "code": "E504",
+                        "message": f"on-device model '{src}' needs ONNX "
+                                   f"Runtime: download "
+                                   f"onnxruntime-linux-x64-{ORT_VERSION} "
+                                   f"into ~/workspace/deps/ort/ "
+                                   f"(see spec/ONDEVICE.md)",
+                        "line": item.line, "col": item.col, "hint": ""}]
+                staged_models.append(src)
+                continue
+            if rt == "onnx":
+                why = (f"ONNX Runtime AOT is wired for the host target "
+                       f"only in M2")
+            elif rt == "coreml":
+                why = ("CoreML models (.mlpackage/.mlmodelc) need Apple "
+                       "hardware (milestone M3)")
+            elif rt == "tflite":
+                why = "TFLite models (.tflite) need Android (milestone M4)"
+            else:
+                why = (f"unknown on-device model extension "
+                       f"(want .onnx, .mlpackage, .mlmodelc, .tflite)")
             return False, [{
                 "code": "E504",
-                "message": f"on-device model '{item.model_file}' cannot "
-                           f"be compiled for target '{eff_target}' "
-                           f"(interpreter only in M1; AOT on-device "
-                           f"support is milestone M2)",
+                "message": f"on-device model '{src}' cannot be compiled "
+                           f"for target '{eff_target}': {why}",
                 "line": item.line, "col": item.col, "hint": ""}]
 
     entry = _table_row(eff_target).get("entry", "main")
@@ -556,8 +649,9 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
         return True, []
 
     # --- host: link ----------------------------------------------------
-    _defines, _cflags, libs = runtime_flags(eff_target)
-    rt_objs = ensure_runtime(eff_target)
+    need_ort = bool(staged_models)
+    _defines, _cflags, libs = runtime_flags(eff_target, need_ort)
+    rt_objs = ensure_runtime(eff_target, need_ort)
     with tempfile.TemporaryDirectory() as td:
         prog_o = os.path.join(td, "prog.o")
         with open(prog_o, "wb") as f:
@@ -571,6 +665,29 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
             return False, _err(
                 "E600", f"link failed:\n{r.stderr}")
     os.chmod(out_path, 0o755)
+    # --- on-device: stage model files + ORT .so next to the binary ---
+    # The runtime resolves the embedded model path as-given, then
+    # <exe-dir>/<basename>, then ./<basename>, so a binary shipped
+    # with its .onnx (and libonnxruntime) in one directory just works.
+    if staged_models:
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        for src in staged_models:
+            shutil.copy2(src, os.path.join(out_dir,
+                                           os.path.basename(src)))
+        ort_root = _ort_root()
+        if ort_root:
+            lib_dir = os.path.join(ort_root, "lib")
+            for so in sorted(os.listdir(lib_dir)):
+                if not so.startswith("libonnxruntime.so"):
+                    continue
+                sp, dp = os.path.join(lib_dir, so), \
+                    os.path.join(out_dir, so)
+                if os.path.islink(sp):
+                    if os.path.lexists(dp):
+                        os.remove(dp)
+                    os.symlink(os.readlink(sp), dp)
+                else:
+                    shutil.copy2(sp, dp)
     return True, []
 
 

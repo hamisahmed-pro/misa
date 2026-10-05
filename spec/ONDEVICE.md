@@ -92,11 +92,16 @@ networking disabled and still diagnoses. That is the exit proof.
 
 ## 6. Milestones
 
-- **M1 (this task):** syntax + `E50x` codes, interpreter ONNX backend,
+- **M1 (done):** syntax + `E50x` codes, interpreter ONNX backend,
   real tiny ONNX model + tests (incl. the socket-blocked offline
   test), `plantdoc_edge.misa` running offline on Linux.
-- **M2:** AOT ONNX Runtime C wiring (Linux host build first, then
-  Android/iOS via vendored ORT).
+- **M2 (done):** AOT ONNX Runtime C wiring for the Linux host —
+  `misa build` compiles on-device `.onnx` programs to native binaries;
+  the model file and `libonnxruntime` are staged next to the binary
+  (relocatable via exe-dir resolution); E501/E502/E503 surface from
+  compiled binaries; E504 remains for unwired runtimes/targets.
+  Verified: `plantdoc_edge` binary diagnoses with no network namespace,
+  probabilities bit-identical to the interpreter.
 - **M3:** CoreML backend in `platform_apple.m` (compile-verified by
   the macOS CI job; device test when hardware is available).
 - **M4:** TFLite/NNAPI on Android.

@@ -8,6 +8,13 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - run: pip install llvmlite==0.50.0 onnxruntime==1.21.0
+      - name: Vendor ONNX Runtime C library (AOT on-device, M2)
+        run: |
+          mkdir -p ~/workspace/deps/ort
+          cd ~/workspace/deps/ort
+          curl -sSL -o onnxruntime-linux-x64-1.21.0.tgz \
+            https://github.com/microsoft/onnxruntime/releases/download/v1.21.0/onnxruntime-linux-x64-1.21.0.tgz
+          tar xzf onnxruntime-linux-x64-1.21.0.tgz
       - name: Interpreter suite
         run: |
           chmod +x impl/bin/misa
@@ -16,3 +23,5 @@ jobs:
         run: python3 tests/aot/run_aot_tests.py
       - name: On-device AI suite (M1)
         run: python3 tests/ondevice/run_ondevice_tests.py
+      - name: On-device AOT suite (M2)
+        run: python3 tests/aot/test_ondevice.py

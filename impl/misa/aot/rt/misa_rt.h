@@ -159,6 +159,7 @@ void  misa_screen_end(void);
 typedef struct MModelParam {
     const char *name;
     const char *kind;      /* "Photo" for media params, else "" */
+    const char *type;      /* declared type, e.g. "Float", "[Float]" */
 } MModelParam;
 
 typedef struct MPromptPart {
@@ -180,6 +181,7 @@ typedef struct MModelMeta {
     int               has_cost;
     double            budget_cost_usd;
     const char       *schema;         /* return-type schema string */
+    const char       *model_file;    /* on-device model path (kind=ondevice) */
     int               nparams;
     const MModelParam *params;
     int               nprompt;

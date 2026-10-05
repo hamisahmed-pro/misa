@@ -962,7 +962,9 @@ class Emitter:
                            f"unknown provider '{prov_name}'",
                            decl.line, decl.col)
         kind = prov_name  # provider names double as kinds
-        if kind not in ("openai", "gemini", "mock"):
+        if prov.model_file:
+            kind = "ondevice"
+        if kind not in ("openai", "gemini", "mock", "ondevice"):
             raise AOTError("E600",
                            f"provider kind '{kind}' not supported "
                            f"in AOT v0.3",
@@ -982,9 +984,11 @@ class Emitter:
             f"cost_usd: {b.cost_usd if b and b.cost_usd is not None else -1}",
             f"schema: {self.schema_of(decl.ret)}",
         ]
+        if kind == "ondevice":
+            lines.append(f"model_file: {prov.model_file}")
         for pn, pte in decl.params:
             pkind = "Photo" if pte.name == "Photo" else ""
-            lines.append(f"param: {pn}\t{pkind}")
+            lines.append(f"param: {pn}\t{pkind}\t{self.schema_of(pte)}")
         for part in decl.prompt:
             if isinstance(part, str):
                 lines.append(f"prompt: L\t{self._esc(part)}")

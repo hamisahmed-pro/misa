@@ -279,11 +279,25 @@ print(classify([0.5, -0.2, 0.9, 0.1]))
     assert "E503" in r.stderr, r.stderr
 
 
-@test("E504: misa build refuses on-device models (M1)")
+@test("E504: misa build refines on-device refusal (M2)")
 def _():
-    r = run_misa("build",
-                 os.path.join(ROOT, "examples", "plantdoc_edge.misa"),
-                 "-o", os.path.join(tempfile.gettempdir(), "edge_bin"))
+    # M2 lifted the blanket M1 refusal: .onnx now compiles on the host
+    # (tested end-to-end in tests/aot/test_ondevice.py). E504 remains
+    # for runtimes the target cannot run -- CoreML on Linux here.
+    d = tempfile.mkdtemp(prefix="e504-")
+    os.makedirs(os.path.join(d, "m.mlpackage"))
+    p = write_tmp(".misa", """provider edge {
+    model: file("%s/m.mlpackage")
+}
+models {
+    c: edge("x"),
+}
+model m(x: [Float]) -> [Float]
+    with edge.c
+    prompt v1 "x"
+print(m([1.0]))
+""" % d)
+    r = run_misa("build", p, "-o", os.path.join(d, "m"))
     assert r.returncode == 1, r.stdout
     assert "E504" in r.stdout + r.stderr, r.stdout + r.stderr
 
