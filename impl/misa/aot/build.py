@@ -155,7 +155,9 @@ RT_SOURCES_BY_TARGET = {
 }
 RT_HEADERS = ("misa_rt.h", "misa_platform.h", "misa_ui.h", "jni_android.h")
 
-EMSDK_DIR = os.path.join(os.path.expanduser("~"), "workspace", "emsdk")
+EMSDK_DIR = (os.environ.get("EMSDK")              # set by emsdk_env.sh
+             or os.environ.get("MISA_EMSDK_DIR")    # manual override
+             or os.path.join(os.path.expanduser("~"), "workspace", "emsdk"))
 
 
 def _rt_sources(target: str) -> tuple:
@@ -163,7 +165,11 @@ def _rt_sources(target: str) -> tuple:
 
 
 def _emcc(argv: list, **kw) -> "subprocess.CompletedProcess":
-    """Run emcc with the emsdk environment (~/workspace/emsdk) active."""
+    """Run emcc with the emsdk environment active.
+
+    The SDK location is $EMSDK (set by emsdk_env.sh), $MISA_EMSDK_DIR,
+    or ~/workspace/emsdk as a fallback.
+    """
     env_sh = os.path.join(EMSDK_DIR, "emsdk_env.sh")
     if not os.path.exists(env_sh):
         raise RuntimeError(
