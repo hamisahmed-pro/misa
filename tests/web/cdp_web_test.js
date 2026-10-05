@@ -17,6 +17,9 @@ const WebSocket = globalThis.WebSocket ?? require('ws');
 
 const BASE = process.argv[2] || 'http://localhost:8471';
 const CDP = 'http://localhost:9222';
+// Repo root (for the host `misa` binary used as the reference tree).
+// Overridden in CI: MISA_ROOT=$GITHUB_WORKSPACE.
+const MISA_ROOT = process.env.MISA_ROOT || '/home/hatch/workspace/misa';
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -204,7 +207,7 @@ async function main() {
     const domJson = await c.evalJs(TREE_FN);
     const domTree = JSON.parse(domJson || '[]');
     const hostOut = execSync(
-      '/home/hatch/workspace/misa/impl/bin/misa run /home/hatch/workspace/misa/examples/webslice.misa --mock /home/hatch/workspace/misa/examples/webslice.mock.json',
+      `"${MISA_ROOT}/impl/bin/misa" run "${MISA_ROOT}/examples/webslice.misa" --mock "${MISA_ROOT}/examples/webslice.mock.json"`,
       { encoding: 'utf8' });
     const textTree = parseTextTree(hostOut);
     // text tree root: [Column]; DOM root: [Screen > Column]

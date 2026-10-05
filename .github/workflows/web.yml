@@ -42,6 +42,7 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/tests/web
           export MISA_WEB_BASE="file://$GITHUB_WORKSPACE/web"
+          export MISA_ROOT="$GITHUB_WORKSPACE"
           node cdp_web_test.js "$MISA_WEB_BASE"
           node cdp_web_m5_test.js
       - name: Live provider check (optional, needs MISA_LIVE_API_KEY secret)
