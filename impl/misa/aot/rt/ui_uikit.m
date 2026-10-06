@@ -460,9 +460,9 @@ void misa_ui_bind_id(MisaUI *ui, MisaWidget w, int32_t slot) {
 }
 
 void misa_ui_show_screen(MisaUI *ui, MisaWidget root) {
-    os_log_debug(OS_LOG_DEFAULT,
-                 "misa: show_screen ui=%p rootView=%p",
-                 (void *)ui, (__bridge void *)ui->rootView);
+    /* NSLog (unbuffered): os_log_debug is filtered out by default. */
+    NSLog(@"misa: show_screen ui=%p rootView=%p",
+          (void *)ui, (__bridge void *)ui->rootView);
     ui_main_sync(^{
         UIView *rv = ui_view(ui, root);
         UIView *container = ui->rootView;

@@ -50,7 +50,14 @@ void misa_ui_set_root_view(MisaUI *ui, void *rootView);
     misa_rt_init();   /* once, before any Misa call */
     os_log(OS_LOG_DEFAULT, "misa: calling misa_main");
     misa_main();      /* builds the first screen through the driver */
-    os_log(OS_LOG_DEFAULT, "misa: misa_main returned, app alive");
+    /* NSLog (unbuffered): proves misa_main returned even if os_log drops it. */
+    NSLog(@"misa: misa_main returned, app alive");
+    /* Heartbeat: if the app survives startup, this fires every 5s. */
+    [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES
+        block:^(NSTimer *t) {
+            (void)t;
+            NSLog(@"misa: heartbeat - app still alive");
+        }];
     return YES;
 }
 
