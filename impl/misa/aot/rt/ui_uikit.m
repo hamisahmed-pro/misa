@@ -37,6 +37,7 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <os/log.h>
 
 #include <pthread.h>
 #include <stdio.h>
