@@ -433,7 +433,75 @@ class Interpreter:
                 raise IOError_(f"fs.write failed: {ex}")
         if name == "http.get":
             return self.http_get(args[0])
+        # -- Phase 6 prerequisites: str namespace + process.run ---------
+        if name == "str.slice":
+            s, i, j = args[0], args[1], args[2]
+            if not isinstance(s, str) or not isinstance(i, int) \
+                    or not isinstance(j, int):
+                raise RuntimeError_(
+                    "str.slice(Text, Int, Int) needs text + ints")
+            n = len(s)
+            i = max(0, min(i, n))
+            j = max(0, min(j, n))
+            return s[i:j] if i <= j else ""
+        if name == "str.starts_with":
+            if not isinstance(args[0], str) \
+                    or not isinstance(args[1], str):
+                raise RuntimeError_(
+                    "str.starts_with(Text, Text) needs text args")
+            return args[0].startswith(args[1])
+        if name == "str.split":
+            if not isinstance(args[0], str) \
+                    or not isinstance(args[1], str):
+                raise RuntimeError_(
+                    "str.split(Text, Text) needs text args")
+            if args[1] == "":
+                raise RuntimeError_("str.split separator is empty")
+            return args[0].split(args[1])
+        if name == "str.trim":
+            if not isinstance(args[0], str):
+                raise RuntimeError_("str.trim(Text) needs a text arg")
+            return args[0].strip()
+        if name == "str.ord":
+            if not isinstance(args[0], str) or not args[0]:
+                raise RuntimeError_(
+                    "str.ord(Text) needs a non-empty text arg")
+            return ord(args[0][0])
+        if name == "str.chr":
+            if not isinstance(args[0], int):
+                raise RuntimeError_("str.chr(Int) needs an int arg")
+            try:
+                return chr(args[0])
+            except (ValueError, OverflowError):
+                raise RuntimeError_(
+                    f"str.chr: invalid code point {args[0]}")
+        if name == "process.run":
+            return self.process_run(args[0], e)
         return self.call_builtin(name, args, e)
+
+    def process_run(self, cmd, node) -> dict:
+        """Run a subprocess; return {code, stdout, stderr} as a record.
+
+        Phase 6 prerequisite: the self-hosted AOT compiler driver
+        shells out to clang/llc. Timeout is 5 minutes; spawn failures
+        and timeouts raise E303 (catchable), mirroring fs.read/write.
+        """
+        import subprocess
+        if not isinstance(cmd, list) or not cmd \
+                or not all(isinstance(c, str) for c in cmd):
+            raise RuntimeError_(
+                "process.run([Text]) needs a non-empty text list")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=300)
+            return {"code": r.returncode, "stdout": r.stdout,
+                    "stderr": r.stderr}
+        except FileNotFoundError:
+            raise IOError_(f"process.run: command not found: {cmd[0]}")
+        except subprocess.TimeoutExpired:
+            raise IOError_(f"process.run timed out (300s): {cmd[0]}")
+        except OSError as ex:
+            raise IOError_(f"process.run failed: {ex}")
 
     def call_fn(self, decl: ast.FnDecl, args: list, node: ast.Node) -> Any:
         local = Env(self.global_env)

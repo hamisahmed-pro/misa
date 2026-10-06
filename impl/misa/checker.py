@@ -31,6 +31,15 @@ NS_BUILTINS = {
     "fs.read": (["Text"], "Text"),
     "fs.write": (["Text", "Text"], "Void"),
     "http.get": (["Text"], "Text"),
+    # Phase 6 prerequisites (self-hosting): string utilities for the
+    # self-hosted lexer, and subprocess for the self-hosted AOT driver.
+    "str.slice": (["Text", "Int", "Int"], "Text"),
+    "str.starts_with": (["Text", "Text"], "Bool"),
+    "str.split": (["Text", "Text"], "[Text]"),
+    "str.trim": (["Text"], "Text"),
+    "str.ord": (["Text"], "Int"),
+    "str.chr": (["Int"], "Text"),
+    "process.run": (["[Text]"], "record"),
 }
 
 LAYOUT_COMPONENTS = {"Column", "Row"}

@@ -1,7 +1,8 @@
 # Misa Standard Library — v0.2
 
 v0.2 (2026-10-05); supersedes v0.1. Everything here is available with
-no import.
+no import. The `str` and `process` namespaces were added 2026-10-06
+as Phase 6 (self-hosting) prerequisites.
 
 ## 1. Builtin functions
 
@@ -31,6 +32,23 @@ untrusted Misa programs — a program can read and write your files.
 | Function | Signature | Description |
 |---|---|---|
 | `http.get` | `http.get(url: Text) -> Text` | GET a URL, return the body as text; throws `Error{code: "E304"}` on network failure or non-2xx status (30s timeout). |
+
+## 3b. Strings (`str` namespace) — Phase 6 prerequisite
+
+| Function | Signature | Description |
+|---|---|---|
+| `str.slice` | `str.slice(s: Text, i: Int, j: Int) -> Text` | Characters `[i, j)`; indices clamp to `[0, len(s)]`; empty when `i >= j`. |
+| `str.starts_with` | `str.starts_with(s: Text, prefix: Text) -> Bool` | True when `s` starts with `prefix`. |
+| `str.split` | `str.split(s: Text, sep: Text) -> [Text]` | Split on `sep`; error when `sep` is empty. |
+| `str.trim` | `str.trim(s: Text) -> Text` | Strip leading/trailing whitespace. |
+| `str.ord` | `str.ord(c: Text) -> Int` | Unicode code point of the first character; error on empty input. |
+| `str.chr` | `str.chr(code: Int) -> Text` | Character for a Unicode code point; error on invalid code. |
+
+## 3c. Processes (`process` namespace) — Phase 6 prerequisite
+
+| Function | Signature | Description |
+|---|---|---|
+| `process.run` | `process.run(cmd: [Text]) -> record` | Run a command; returns `{code: Int, stdout: Text, stderr: Text}`. Throws `Error{code: "E303"}` when the command cannot be started or times out (5 minutes). **Security note:** a Misa program with `process.run` can execute arbitrary commands — treat it with the same care as `fs.write`. |
 
 ## 4. Maps
 
