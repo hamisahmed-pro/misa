@@ -736,11 +736,13 @@ class Interpreter:
         if name == "str.chr":
             if not isinstance(args[0], int):
                 raise RuntimeError_("str.chr(Int) needs an int arg")
-            try:
-                return chr(args[0])
-            except (ValueError, OverflowError):
+            cp = args[0]
+            # chr() allows lone surrogates, which then crash on output;
+            # reject them here for a clean E300 (mirrors the AOT runtime).
+            if cp < 0 or cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
                 raise RuntimeError_(
-                    f"str.chr: invalid code point {args[0]}")
+                    f"str.chr: invalid code point {cp}")
+            return chr(cp)
         if name == "process.run":
             return self.process_run(args[0], e)
         # Phase 5a: call through a variable holding a function value.

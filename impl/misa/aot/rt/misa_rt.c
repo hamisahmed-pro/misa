@@ -1411,6 +1411,197 @@ MVal *misa_math_round(MVal *x, int line, int col) {
     return math_to_int(round(d), line, col, "round");
 }
 
+/* ---------------- str namespace ------------------ */
+/* Phase 5 prerequisite (self-hosting). Code-point semantics matching the
+ * Python interpreter exactly — NOT byte semantics. */
+
+static size_t str_utf8_decode(const unsigned char *p, size_t maxlen,
+                              uint32_t *cp) {
+    if (maxlen == 0) return 0;
+    unsigned char c = p[0];
+    if (c < 0x80) { *cp = c; return 1; }
+    if ((c & 0xE0) == 0xC0 && maxlen >= 2) {
+        *cp = ((uint32_t)(c & 0x1F) << 6) | (p[1] & 0x3F);
+        return 2;
+    }
+    if ((c & 0xF0) == 0xE0 && maxlen >= 3) {
+        *cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6)
+              | (p[2] & 0x3F);
+        return 3;
+    }
+    if ((c & 0xF8) == 0xF0 && maxlen >= 4) {
+        *cp = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12)
+              | ((uint32_t)(p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+        return 4;
+    }
+    *cp = c; /* malformed: treat as single byte */
+    return 1;
+}
+
+static size_t str_utf8_encode(uint32_t cp, char *out) {
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/* Byte offset of code-point index idx in [data, data+len). */
+static size_t str_byte_off(const char *data, size_t len, size_t idx) {
+    size_t off = 0, n = 0;
+    while (off < len && n < idx) {
+        uint32_t cp;
+        off += str_utf8_decode((const unsigned char *)data + off,
+                               len - off, &cp);
+        n++;
+    }
+    return off;
+}
+
+/* Python str.strip() whitespace set (the Bidirectional/space separators
+ * Python treats as whitespace). */
+static int str_is_space(uint32_t cp) {
+    if (cp == 0x20 || (cp >= 0x09 && cp <= 0x0D) || cp == 0x85 || cp == 0xA0
+        || cp == 0x1680 || cp == 0x2028 || cp == 0x2029 || cp == 0x202F
+        || cp == 0x205F || cp == 0x3000)
+        return 1;
+    if (cp >= 0x2000 && cp <= 0x200A)
+        return 1;
+    return 0;
+}
+
+MVal *misa_str_slice(MVal *s, MVal *i, MVal *j, int line, int col) {
+    if (s->tag != M_TAG_TEXT || i->tag != M_TAG_INT || j->tag != M_TAG_INT) {
+        misa_raise("E300", "str.slice(Text, Int, Int) needs text + ints",
+                   line, col);
+        return NULL;
+    }
+    const char *data = s->u.text.data;
+    size_t len = s->u.text.len;
+    int64_t n = (int64_t)misa_text_nchars(s);
+    int64_t a = i->u.i, b = j->u.i;
+    if (a < 0) a = 0;
+    if (a > n) a = n;
+    if (b < 0) b = 0;
+    if (b > n) b = n;
+    if (a >= b)
+        return misa_text("", 0);
+    size_t start = str_byte_off(data, len, (size_t)a);
+    size_t end = str_byte_off(data, len, (size_t)b);
+    return misa_text(data + start, end - start);
+}
+
+MVal *misa_str_starts_with(MVal *s, MVal *prefix, int line, int col) {
+    if (s->tag != M_TAG_TEXT || prefix->tag != M_TAG_TEXT) {
+        misa_raise("E300", "str.starts_with(Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    /* Byte-prefix check is correct for UTF-8 under code-point semantics. */
+    size_t sl = s->u.text.len, pl = prefix->u.text.len;
+    if (pl > sl)
+        return misa_bool(0);
+    return misa_bool(memcmp(s->u.text.data, prefix->u.text.data, pl) == 0);
+}
+
+MVal *misa_str_split(MVal *s, MVal *sep, int line, int col) {
+    if (s->tag != M_TAG_TEXT || sep->tag != M_TAG_TEXT) {
+        misa_raise("E300", "str.split(Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    if (sep->u.text.len == 0) {
+        misa_raise("E300", "str.split separator is empty", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    const char *data = s->u.text.data, *sp = sep->u.text.data;
+    size_t len = s->u.text.len, slen = sep->u.text.len;
+    size_t start = 0;
+    for (size_t k = 0; k + slen <= len; k++) {
+        if (memcmp(data + k, sp, slen) == 0) {
+            misa_list_push(out, misa_text(data + start, k - start));
+            start = k + slen;
+            k += slen - 1;
+        }
+    }
+    misa_list_push(out, misa_text(data + start, len - start));
+    return out;
+}
+
+MVal *misa_str_trim(MVal *s, int line, int col) {
+    if (s->tag != M_TAG_TEXT) {
+        misa_raise("E300", "str.trim(Text) needs a text arg", line, col);
+        return NULL;
+    }
+    const char *data = s->u.text.data;
+    size_t len = s->u.text.len;
+    size_t lo = 0;
+    while (lo < len) {
+        uint32_t cp;
+        size_t nb = str_utf8_decode((const unsigned char *)data + lo,
+                                    len - lo, &cp);
+        if (!str_is_space(cp))
+            break;
+        lo += nb;
+    }
+    size_t hi = len;
+    while (hi > lo) {
+        /* step back one code point: rewind over continuation bytes */
+        size_t p = hi - 1;
+        while (p > lo && (((unsigned char)data[p] & 0xC0) == 0x80))
+            p--;
+        uint32_t cp;
+        str_utf8_decode((const unsigned char *)data + p, hi - p, &cp);
+        if (!str_is_space(cp))
+            break;
+        hi = p;
+    }
+    return misa_text(data + lo, hi - lo);
+}
+
+MVal *misa_str_ord(MVal *c, int line, int col) {
+    if (c->tag != M_TAG_TEXT || c->u.text.len == 0) {
+        misa_raise("E300", "str.ord(Text) needs a non-empty text arg",
+                   line, col);
+        return NULL;
+    }
+    uint32_t cp;
+    str_utf8_decode((const unsigned char *)c->u.text.data,
+                    c->u.text.len, &cp);
+    return misa_int((int64_t)cp);
+}
+
+MVal *misa_str_chr(MVal *code, int line, int col) {
+    if (code->tag != M_TAG_INT) {
+        misa_raise("E300", "str.chr(Int) needs an int arg", line, col);
+        return NULL;
+    }
+    int64_t v = code->u.i;
+    uint32_t cp = (uint32_t)v;
+    if (v < 0 || v > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        misa_raise_fmt("E300", line, col,
+                       "str.chr: invalid code point %lld",
+                       (long long)v);
+        return NULL;
+    }
+    char buf[4];
+    size_t n = str_utf8_encode(cp, buf);
+    return misa_text(buf, n);
+}
+
 /* ---------------- screens ------------------ */
 /* The 7 misa_screen_* functions now live in ui_text.c: they are thin
  * shims over the text UI driver (rt/misa_ui.h), selected at link

@@ -1961,6 +1961,45 @@ def _():
     assert any(e["code"] == "E210" for e in errs), errs
 
 
+@test("str: slice/starts_with/split/trim edge cases incl. unicode")
+def _():
+    out = run_src(
+        'print(str.slice("hello world", 0, 5))\n'
+        'print(str.slice("hello", 2, 100))\n'
+        'print(str.slice("hello", -5, 3))\n'
+        'print("[" + str.slice("hello", 3, 2) + "]")\n'
+        'let e = str.chr(233)\n'
+        'let sm = str.chr(128512)\n'
+        'print(str.slice("h" + e + "llo" + sm, 1, 4))\n'
+        'print(str.starts_with("hello", "he"))\n'
+        'print(str.starts_with("hello", ""))\n'
+        'print(str.split("a,,b", ","))\n'
+        'print("[" + str.trim(" \\t\\n hi \\r\\n") + "]")\n'
+        'print("[" + str.trim(str.chr(160) + "hi" + str.chr(160)) + "]")\n'
+    )
+    eq(out,
+       "hello\nllo\nhel\n[]\n\u00e9ll\n"
+       "true\ntrue\n[a, , b]\n[hi]\n[hi]\n")
+
+
+@test("str: ord/chr incl. non-BMP round-trip and error cases")
+def _():
+    out = run_src(
+        'print(str.ord("A"))\n'
+        'print(str.ord(str.chr(128512)))\n'
+        'print(str.chr(65))\n'
+        'print(str.chr(128512))\n'
+        'print(str.chr(str.ord(str.chr(233))))\n'
+    )
+    eq(out, "65\n128512\nA\n\U0001F600\n\u00e9\n")
+    raises_code(lambda: run_src('print(str.split("a", ""))\n'), "E300")
+    raises_code(lambda: run_src('print(str.ord(""))\n'), "E300")
+    raises_code(lambda: run_src('print(str.chr(-1))\n'), "E300")
+    raises_code(lambda: run_src('print(str.chr(1114112))\n'), "E300")
+    # lone surrogates are rejected cleanly (no traceback)
+    raises_code(lambda: run_src('print(str.chr(55296))\n'), "E300")
+
+
 @test("ffi: formatter round-trips extern blocks")
 def _():
     from misa.fmt import format_source

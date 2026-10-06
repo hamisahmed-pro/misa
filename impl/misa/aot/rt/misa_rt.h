@@ -170,6 +170,13 @@ MVal *misa_math_abs(MVal *x, int line, int col);
 MVal *misa_math_floor(MVal *x, int line, int col);
 MVal *misa_math_ceil(MVal *x, int line, int col);
 MVal *misa_math_round(MVal *x, int line, int col);
+/* str namespace (code-point semantics, mirroring the interpreter). */
+MVal *misa_str_slice(MVal *s, MVal *i, MVal *j, int line, int col);
+MVal *misa_str_starts_with(MVal *s, MVal *prefix, int line, int col);
+MVal *misa_str_split(MVal *s, MVal *sep, int line, int col);
+MVal *misa_str_trim(MVal *s, int line, int col);
+MVal *misa_str_ord(MVal *c, int line, int col);
+MVal *misa_str_chr(MVal *code, int line, int col);
 
 /* -- db (Phase 5): SQLite bindings (misa_db.c) ------------------------ */
 MVal *misa_db_open(MVal *path, int line, int col);           /* E303 */

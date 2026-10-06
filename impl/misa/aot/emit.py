@@ -154,6 +154,13 @@ _RT_SIGS = {
     "misa_math_floor": (PTR, [PTR, I32, I32]),
     "misa_math_ceil": (PTR, [PTR, I32, I32]),
     "misa_math_round": (PTR, [PTR, I32, I32]),
+    # str namespace (code-point semantics; Phase 5 self-hosting prereq).
+    "misa_str_slice": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_str_starts_with": (PTR, [PTR, PTR, I32, I32]),
+    "misa_str_split": (PTR, [PTR, PTR, I32, I32]),
+    "misa_str_trim": (PTR, [PTR, I32, I32]),
+    "misa_str_ord": (PTR, [PTR, I32, I32]),
+    "misa_str_chr": (PTR, [PTR, I32, I32]),
     # Phase 5 (DB): SQLite bindings.
     "misa_db_open": (PTR, [PTR, I32, I32]),
     "misa_db_exec": (PTR, [PTR, PTR, PTR, I32, I32]),
@@ -1334,6 +1341,24 @@ class Emitter:
                              [arg(0), line, col], e)
         if name == "math.round":
             return self.call(ctx, "misa_math_round",
+                             [arg(0), line, col], e)
+        if name == "str.slice":
+            return self.call(ctx, "misa_str_slice",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "str.starts_with":
+            return self.call(ctx, "misa_str_starts_with",
+                             [arg(0), arg(1), line, col], e)
+        if name == "str.split":
+            return self.call(ctx, "misa_str_split",
+                             [arg(0), arg(1), line, col], e)
+        if name == "str.trim":
+            return self.call(ctx, "misa_str_trim",
+                             [arg(0), line, col], e)
+        if name == "str.ord":
+            return self.call(ctx, "misa_str_ord",
+                             [arg(0), line, col], e)
+        if name == "str.chr":
+            return self.call(ctx, "misa_str_chr",
                              [arg(0), line, col], e)
         # Phase 5 (DB): SQLite bindings. The optional `args` list
         # defaults to an empty list.

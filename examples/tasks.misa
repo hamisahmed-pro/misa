@@ -1,0 +1,340 @@
+// ============================================================================
+// tasks — a CLI task manager in Misa.
+//
+// A showcase of Misa's Phase 5/7 features in one real, usable program:
+//
+//   SQLite persistence ..... `db.*` + `table tasks` (compile-time checked SQL)
+//   Sum types ............... `Status`, `Cmd`, and generic `Result<T>`
+//   Pattern matching ........ `match` with exhaustiveness checking
+//   Generics ................ `filter<T>`, `find<T>`, `first<T>`
+//   First-class functions ... lambdas passed to the generic helpers
+//   FFI ..................... `extern "c"` calls C's getenv() for the db path
+//   JSON .................... `json.stringify` / `json.parse` for export/import
+//   Time .................... `time.now()` stamps, `time.format` rendering
+//   Strings ................. `str.trim` / `str.split` / `str.starts_with`
+//                             (now fully supported by the AOT backend too)
+//
+// CLI interface via environment variables (Misa v0.2 has no argv; a two-line
+// shell wrapper maps `tasks add "..."` onto these):
+//
+//   TASKS_CMD=add     TASKS_ARG="Write the report"   tasks
+//   TASKS_CMD=list                                    tasks
+//   TASKS_CMD=doing   TASKS_ARG=2                     tasks
+//   TASKS_CMD=done    TASKS_ARG=2                     tasks
+//   TASKS_CMD=export                                  tasks
+//   TASKS_CMD=import  TASKS_ARG=backup.json           tasks
+//
+// The database lives at $HOME/.misa-tasks.db (via FFI getenv).
+// ============================================================================
+
+// --- FFI: C's getenv() gives us the database path ---------------------------
+// Phase 7 feature: declare a C library function and call it like Misa code.
+// A NULL return becomes Misa `nil` (handled in db_path below).
+extern "c" {
+  fn getenv(name: Text) -> Text,
+}
+
+// --- Domain model: sum types ------------------------------------------------
+type Status { Todo, Doing, Done }
+
+type Cmd { Add, List, Doing, Done, Export, Import }
+
+// Generic Result: Ok carries a value, Err carries a message.
+type Result<T> { Ok(T), Err(Text) }
+
+// The `table` decl lets the checker validate our SQL at compile time:
+// unknown tables/columns in db.query are E224, and result rows are typed.
+table tasks {
+  id: Int @primary,
+  title: Text,
+  status: Text,
+  created: Int,
+}
+
+// A task as a plain Misa record (converted from query rows once, so the
+// generic helpers below work over a named type).
+type Task { id: Int, title: Text, status: Text, created: Int }
+
+// Shape of one object inside an imported JSON backup file.
+type TaskIn { title: Text, status: Text, created: Int }
+
+// --- Status helpers (match expressions) ------------------------------------
+fn status_to_text(s: Status) -> Text {
+  return match s {
+    Status.Todo => "Todo",
+    Status.Doing => "Doing",
+    Status.Done => "Done",
+  }
+}
+
+fn status_icon(s: Status) -> Text {
+  return match s {
+    Status.Todo => "[ ]",
+    Status.Doing => "[~]",
+    Status.Done => "[x]",
+  }
+}
+
+// Fallible parse: unknown text becomes Result.Err, not a crash.
+fn status_from_text(t: Text) -> Result<Status> {
+  if t == "Todo" {
+    return Result.Ok(Status.Todo)
+  }
+  if t == "Doing" {
+    return Result.Ok(Status.Doing)
+  }
+  if t == "Done" {
+    return Result.Ok(Status.Done)
+  }
+  return Result.Err("unknown status '" + t + "'")
+}
+
+// --- Generic higher-order helpers (first-class functions) -------------------
+fn filter<T>(xs: [T], pred: (T) -> Bool) -> [T] {
+  var out: [T] = []
+  for x in xs {
+    if pred(x) {
+      out = out + [x]
+    }
+  }
+  return out
+}
+
+fn find<T>(xs: [T], pred: (T) -> Bool) -> Result<T> {
+  for x in xs {
+    if pred(x) {
+      return Result.Ok(x)
+    }
+  }
+  return Result.Err("not found")
+}
+
+fn first<T>(xs: [T]) -> T {
+  return xs[0]
+}
+
+// --- String utilities --------------------------------------------------------
+// The `str.*` namespace is fully supported on the interpreter and the AOT
+// backend (code-point semantics, so unicode titles trim/split correctly).
+
+// --- Small utilities --------------------------------------------------------
+// print() returns Text; say() is its Void twin, for match arms where
+// every arm must yield the same type (E217).
+fn say(msg: Text) -> Void {
+  print(msg)
+}
+
+fn get_env_or(name: Text, default: Text) -> Text {
+  var out: Text = default
+  try {
+    out = env(name)
+  } catch e {
+    out = default
+  }
+  return out
+}
+
+fn db_path() -> Text {
+  let home = getenv("HOME")
+  if home == nil {
+    return "/tmp/.misa-tasks.db"
+  }
+  return home + "/.misa-tasks.db"
+}
+
+fn usage() -> Text {
+  return "usage:\n" +
+    "  TASKS_CMD=add     TASKS_ARG=\"<title>\"   add a task\n" +
+    "  TASKS_CMD=list                            list tasks\n" +
+    "  TASKS_CMD=doing   TASKS_ARG=<id>          mark task Doing\n" +
+    "  TASKS_CMD=done    TASKS_ARG=<id>          mark task Done\n" +
+    "  TASKS_CMD=export                          print tasks as JSON\n" +
+    "  TASKS_CMD=import  TASKS_ARG=<file>        import tasks from JSON"
+}
+
+fn parse_cmd(s: Text) -> Result<Cmd> {
+  if s == "add" {
+    return Result.Ok(Cmd.Add)
+  }
+  if s == "list" {
+    return Result.Ok(Cmd.List)
+  }
+  if s == "doing" {
+    return Result.Ok(Cmd.Doing)
+  }
+  if s == "done" {
+    return Result.Ok(Cmd.Done)
+  }
+  if s == "export" {
+    return Result.Ok(Cmd.Export)
+  }
+  if s == "import" {
+    return Result.Ok(Cmd.Import)
+  }
+  return Result.Err("unknown command '" + s + "'")
+}
+
+fn parse_id(s: Text) -> Result<Int> {
+  var out: Result<Int> = Result<Int>.Err("bad task id '" + s + "': expected a number")
+  try {
+    out = Result.Ok(int(s))
+  } catch e {
+    out = Result<Int>.Err("bad task id '" + s + "': expected a number")
+  }
+  return out
+}
+
+// --- Database ---------------------------------------------------------------
+fn open_db() -> Db {
+  let db = db.open(db_path())
+  db.exec(db, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL)")
+  return db
+}
+
+// Convert typed query rows into named Task records.
+fn load_tasks(db: Db) -> [Task] {
+  let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
+  var out: [Task] = []
+  for r in rows {
+    out = out + [{ id: r.id, title: r.title, status: r.status, created: r.created }]
+  }
+  return out
+}
+
+// --- Commands ----------------------------------------------------------------
+fn cmd_add(db: Db, title: Text) -> Void {
+  let trimmed = str.trim(title)
+  if trimmed == "" {
+    print("Error: task title is empty")
+    return
+  }
+  db.exec(db, "INSERT INTO tasks (title, status, created) VALUES (?, ?, ?)", [trimmed, "Todo", str(time.now())])
+  // The new row has the highest id; first() over the descending order
+  // gives us its id for the confirmation message.
+  let latest = db.query(db, "SELECT id FROM tasks ORDER BY id DESC LIMIT 1")
+  if len(latest) > 0 {
+    print("Added task " + str(first(latest).id) + ": " + trimmed)
+  } else {
+    print("Added: " + trimmed)
+  }
+}
+
+fn cmd_list(db: Db) -> Void {
+  let tasks = load_tasks(db)
+  if len(tasks) == 0 {
+    print("No tasks yet. Add one with TASKS_CMD=add TASKS_ARG=\"<title>\"")
+    return
+  }
+  for t in tasks {
+    // Statuses in the db are text; a corrupt row renders [?] instead of
+    // crashing — the Result makes the failure explicit.
+    let icon = match status_from_text(t.status) {
+      Result.Ok(s) => status_icon(s),
+      Result.Err(_) => "[?]",
+    }
+    let when = time.format(t.created, "%Y-%m-%d")
+    print(str(t.id) + ". " + icon + " " + t.title + "  (" + when + ")")
+  }
+  // Generic filter over the same list for a one-line summary.
+  let open = filter(tasks, |t: Task| t.status != "Done")
+  print("— " + str(len(open)) + " open of " + str(len(tasks)))
+}
+
+fn apply_status(db: Db, id: Int, s: Status) -> Void {
+  db.exec(db, "UPDATE tasks SET status = ? WHERE id = ?", [status_to_text(s), str(id)])
+  print("Task " + str(id) + " -> " + status_to_text(s))
+}
+
+fn cmd_set_status(db: Db, id_text: Text, s: Status) -> Void {
+  // find<T> locates the task first, so a bad id gets a clean message
+  // instead of a silent no-op.
+  match parse_id(id_text) {
+    Result.Err(e) => say("Error: " + e),
+    Result.Ok(id) => check_then_apply(db, id, s),
+  }
+}
+
+fn check_then_apply(db: Db, id: Int, s: Status) -> Void {
+  let tasks = load_tasks(db)
+  match find(tasks, |t: Task| t.id == id) {
+    Result.Err(_) => say("Error: no task with id " + str(id)),
+    Result.Ok(_) => apply_status(db, id, s),
+  }
+}
+
+fn cmd_export(db: Db) -> Void {
+  let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
+  print(json.stringify(rows))
+}
+
+// Import a JSON backup (as produced by export). Returns how many tasks
+// were imported, or a descriptive error — never a traceback.
+fn cmd_import(db: Db, path: Text) -> Result<Int> {
+  var content: Text = ""
+  try {
+    content = fs.read(path)
+  } catch e {
+    return Result.Err("cannot read '" + path + "'")
+  }
+  var n: Int = 0
+  var skipped: Int = 0
+  try {
+    var data = json.parse(content)
+    for item in data {
+      // Convert each JSON object into the typed TaskIn record; a missing
+      // or mistyped field throws, which we catch per-item so one bad
+      // entry doesn't abort the whole import.
+      try {
+        let t: TaskIn = { title: item.title, status: item.status, created: item.created }
+        let st = match status_from_text(t.status) {
+          Result.Ok(_) => t.status,
+          Result.Err(_) => "Todo",
+        }
+        let clean_title = str.trim(t.title)
+        if clean_title == "" {
+          skipped = skipped + 1
+        } else {
+          db.exec(db, "INSERT INTO tasks (title, status, created) VALUES (?, ?, ?)", [clean_title, st, str(t.created)])
+          n = n + 1
+        }
+      } catch e {
+        skipped = skipped + 1
+      }
+    }
+  } catch e {
+    return Result.Err("invalid backup file: expected a JSON array of tasks")
+  }
+  if skipped > 0 {
+    print("Imported " + str(n) + " tasks (" + str(skipped) + " entries skipped)")
+  }
+  return Result.Ok(n)
+}
+
+// --- Entry point -------------------------------------------------------------
+fn report_import(db: Db, arg_text: Text) -> Void {
+  match cmd_import(db, arg_text) {
+    Result.Ok(n) => say("Imported " + str(n) + " tasks"),
+    Result.Err(e) => say("Error: " + e),
+  }
+}
+
+fn dispatch(db: Db, c: Cmd, arg_text: Text) -> Void {
+  match c {
+    Cmd.Add => cmd_add(db, arg_text),
+    Cmd.List => cmd_list(db),
+    Cmd.Doing => cmd_set_status(db, arg_text, Status.Doing),
+    Cmd.Done => cmd_set_status(db, arg_text, Status.Done),
+    Cmd.Export => cmd_export(db),
+    Cmd.Import => report_import(db, arg_text),
+  }
+}
+
+let db = open_db()
+let cmd_text = get_env_or("TASKS_CMD", "")
+let arg_text = get_env_or("TASKS_ARG", "")
+
+match parse_cmd(cmd_text) {
+  Result.Err(e) => say("Error: " + e + "\n" + usage()),
+  Result.Ok(c) => dispatch(db, c, arg_text),
+}
+db.close(db)

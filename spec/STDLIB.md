@@ -37,6 +37,10 @@ untrusted Misa programs — a program can read and write your files.
 
 ## 3b. Strings (`str` namespace) — Phase 6 prerequisite
 
+All six functions use Unicode code-point semantics (not bytes) on both
+the interpreter and the AOT backend. `str.chr` rejects negative values,
+surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
+
 | Function | Signature | Description |
 |---|---|---|
 | `str.slice` | `str.slice(s: Text, i: Int, j: Int) -> Text` | Characters `[i, j)`; indices clamp to `[0, len(s)]`; empty when `i >= j`. |

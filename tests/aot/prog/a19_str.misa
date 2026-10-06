@@ -1,0 +1,52 @@
+// a19_str: str.* namespace — AOT parity (byte-identical interp vs binary).
+// Code-point semantics (not bytes): unicode slicing, ord/chr round-trips.
+
+// --- str.slice ---
+print(str.slice("hello world", 0, 5))       // hello
+print(str.slice("hello", 2, 100))           // llo (clamp)
+print(str.slice("hello", -5, 3))            // hel (clamp)
+print(str.slice("hello", 3, 2))             // "" (i > j)
+print(str.slice("hello", 2, 2))             // "" (i == j)
+print(str.slice("", 0, 5))                  // ""
+print(str.slice("héllo😀", 0, 1))            // h
+print(str.slice("héllo😀", 1, 4))            // éll
+print(str.slice("héllo😀", 5, 6))            // 😀
+print(str.slice("héllo😀", 0, 6))            // héllo😀
+
+// --- str.starts_with ---
+print(str.starts_with("hello", "he"))       // true
+print(str.starts_with("hello", "lo"))       // false
+print(str.starts_with("hello", ""))         // true
+print(str.starts_with("", ""))              // true
+print(str.starts_with("héllo", "hé"))       // true
+
+// --- str.split ---
+print(str.split("a,b,c", ","))
+print(str.split("hello", ","))
+print(str.split("", ","))
+print(str.split("a,,b", ","))
+print(str.split("a😀b😀c", "😀"))
+
+// --- str.trim ---
+print("[" + str.trim("  hi  ") + "]")
+print("[" + str.trim("\t\n hi \r\n") + "]")
+print("[" + str.trim("") + "]")
+print("[" + str.trim("   ") + "]")
+print("[" + str.trim(" hi ") + "]")
+
+// --- str.ord ---
+print(str.ord("A"))                         // 65
+print(str.ord("é"))                         // 233
+print(str.ord("😀"))                        // 128512
+print(str.ord("ABC"))                       // 65 (first char)
+
+// --- str.chr ---
+print(str.chr(65))                          // A
+print(str.chr(233))                         // é
+print(str.chr(128512))                      // 😀
+print(str.chr(0))                           // NUL char (prints empty-ish)
+
+// --- round trips ---
+print(str.chr(str.ord("é")))
+print(str.chr(str.ord("😀")))
+print(str.chr(str.ord("z")))
