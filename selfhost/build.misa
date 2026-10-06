@@ -1,0 +1,112 @@
+// build.misa — Misa self-hosted AOT build driver (Phase 6b).
+//
+// Reads a .misa source file, runs lex -> parse -> check -> emit_ir,
+// writes the LLVM IR to out.ll, then invokes clang via process.run to
+// assemble + link against the (unchanged) C runtime.
+//
+// Configuration via environment (Misa has no argv):
+//   MISA_SRC     source .misa file (required)
+//   MISA_OUT     output binary path (default "out")
+//   MISA_LL      IR output path (default "<out>.ll")
+//   MISA_RT_DIR  C runtime dir (default "<repo>/impl/misa/aot/rt")
+//   MISA_DEPS    deps dir (default "~/workspace/deps")
+//   MISA_VERBOSE "1" to print the clang command
+//
+// Exit reporting: prints "@@BUILD-OK@@ <binary>" or "@@BUILD-ERR@@ ...".
+
+import "lexer.misa"
+import "parser.misa"
+import "checker.misa"
+import "emit.misa"
+
+fn getenv(k: Text, dflt: Text) -> Text {
+    var v = ""
+    try {
+        v = env(k)
+    } catch e {
+        v = ""
+    }
+    if v == "" {
+        return dflt
+    }
+    return v
+}
+
+fn build_main() {
+    let src_path = getenv("MISA_SRC", "")
+    if src_path == "" {
+        print("@@BUILD-ERR@@<unknown>: E600: MISA_SRC is not set")
+        return
+    }
+    let out_path = getenv("MISA_OUT", "out")
+    let ll_path = getenv("MISA_LL", out_path + ".ll")
+    let rt_dir = getenv("MISA_RT_DIR", "/home/hatch/workspace/misa/impl/misa/aot/rt")
+    let deps = getenv("MISA_DEPS", "/home/hatch/workspace/deps")
+    let verbose = getenv("MISA_VERBOSE", "") == "1"
+
+    // --- frontend ---
+    var src = ""
+    try {
+        src = fs.read(src_path)
+    } catch e {
+        print("@@BUILD-ERR@@<unknown>: E303: cannot read " + src_path)
+        return
+    }
+    var prog: Node = parse(lex(""))
+    try {
+        prog = parse(lex(src))
+    } catch e {
+        print("@@BUILD-ERR@@" + e.code + ": " + e.message)
+        return
+    }
+    let diags = check(prog)
+    if len(diags) > 0 {
+        print("@@BUILD-ERR@@" + diags[0].code + ": " + diags[0].message)
+        return
+    }
+
+    // --- emit IR ---
+    var ir = ""
+    try {
+        ir = emit_ir(prog)
+    } catch e {
+        print("@@BUILD-ERR@@" + e.code + ": " + e.message)
+        return
+    }
+    try {
+        fs.write(ll_path, ir)
+    } catch e {
+        print("@@BUILD-ERR@@<unknown>: E303: cannot write " + ll_path)
+        return
+    }
+    if verbose {
+        print("wrote IR: " + ll_path + " (" + str(len(ir)) + " chars)")
+    }
+
+    // --- clang: assemble + link ---
+    // Mirrors build.py's host link: clang compiles the .ll and the C
+    // runtime sources in one invocation.
+    let gc_a = deps + "/gc/lib/libgc.a"
+    let curl_so = "/lib/x86_64-linux-gnu/libcurl.so.4.8.0"
+    let cmd = ["clang", ll_path,
+        rt_dir + "/misa_rt.c", rt_dir + "/misa_model.c",
+        rt_dir + "/platform_linux.c", rt_dir + "/ui_text.c",
+        "-O2", "-DMISA_USE_GC", "-DMISA_USE_CURL",
+        "-I" + deps + "/gc/include", "-I" + deps + "/include",
+        "-o", out_path, gc_a, curl_so, "-lm"]
+    if verbose {
+        var cs = ""
+        for c in cmd {
+            cs = cs + c + " "
+        }
+        print("clang: " + cs)
+    }
+    let r = process.run(cmd)
+    if r.code != 0 {
+        print("@@BUILD-ERR@@<unknown>: E600: clang failed:\n" + r.stderr)
+        return
+    }
+    print("@@BUILD-OK@@ " + out_path)
+}
+
+build_main()

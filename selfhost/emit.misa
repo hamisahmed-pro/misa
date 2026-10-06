@@ -1,0 +1,1546 @@
+// emit.misa — Misa self-hosted AOT backend (Phase 6b).
+//
+// AST -> LLVM IR text. Mirrors impl/misa/aot/emit.py semantics; the C
+// runtime (impl/misa/aot/rt/) is used unchanged. Output is assembled
+// with clang via process.run (see build.misa).
+//
+// Every Misa value is an i8* (MVal*). Fallible runtime calls are
+// followed by a pending-error check branching to the innermost error
+// target, exactly like the Python emitter.
+
+import "parser.misa"
+
+// ------------------------------------------------------------------
+// emitter state (records are references: mutate via a local alias)
+// ------------------------------------------------------------------
+
+type SBind {
+    name: Text,
+    ssa: Text
+}
+
+type Em {
+    mod: [Text],
+    globs: [Text],
+    cur: [Text],
+    pre: [Text],
+    fn_head: Text,
+    str_keys: [Text],
+    str_vals: [Text],
+    str_n: Int,
+    tmp_n: Int,
+    blk_n: Int,
+    terminated: Bool,
+    err_stack: [Text],
+    fn_names: [Text],
+    fn_arity: [Int],
+    scopes: [[SBind]],
+    nil_ssa: Text,
+    handlers: [Text],
+    in_handler: Bool,
+    id_names: [Text],
+    id_slot: [Int]
+}
+
+fn new_em() -> Em {
+    let e: Em = {
+        mod: [], globs: [], cur: [], pre: [], fn_head: "",
+        str_keys: [], str_vals: [], str_n: 0,
+        tmp_n: 0, blk_n: 0, terminated: false,
+        err_stack: [], fn_names: [], fn_arity: [],
+        scopes: [], nil_ssa: "",
+        handlers: [], in_handler: false,
+        id_names: [], id_slot: []
+    }
+    return e
+}
+
+// append an IR line to the current function body
+fn w(em: Em, line: Text) {
+    var m = em
+    m.cur = m.cur + [line]
+}
+
+// append to the function preamble (allocas + nil; flushed right after
+// the entry label, before all other entry-block lines)
+fn wpre(em: Em, line: Text) {
+    var m = em
+    m.pre = m.pre + [line]
+}
+
+// fresh SSA temp: %t0, %t1, ...
+fn tmp(em: Em) -> Text {
+    var m = em
+    let n = m.tmp_n
+    m.tmp_n = n + 1
+    return "%t" + str(n)
+}
+
+// fresh block suffix number
+fn blkn(em: Em) -> Int {
+    var m = em
+    let n = m.blk_n
+    m.blk_n = n + 1
+    return n
+}
+
+// integer division / modulo on non-negative ints (via ftrunc from parser)
+fn idiv(a: Int, b: Int) -> Int {
+    return ftrunc(a / b)
+}
+
+// ------------------------------------------------------------------
+// LLVM string-constant escaping (matches llvmlite's c"..." format:
+// printable ASCII except " and \ as-is, everything else \xx hex)
+// ------------------------------------------------------------------
+
+fn hex2(b: Int) -> Text {
+    let digs = "0123456789abcdef"
+    return digs[idiv(b, 16)] + digs[b % 16]
+}
+
+fn utf8_esc(cp: Int) -> Text {
+    if cp < 128 {
+        return "\\" + hex2(cp)
+    }
+    if cp < 2048 {
+        return "\\" + hex2(192 + idiv(cp, 64)) + "\\" + hex2(128 + (cp % 64))
+    }
+    if cp < 65536 {
+        return "\\" + hex2(224 + idiv(cp, 4096)) + "\\" +
+            hex2(128 + (idiv(cp, 64) % 64)) + "\\" + hex2(128 + (cp % 64))
+    }
+    return "\\" + hex2(240 + idiv(cp, 262144)) + "\\" +
+        hex2(128 + (idiv(cp, 4096) % 64)) + "\\" +
+        hex2(128 + (idiv(cp, 64) % 64)) + "\\" + hex2(128 + (cp % 64))
+}
+
+// escaped content for c"...", WITHOUT the trailing NUL
+fn llvm_esc(s: Text) -> Text {
+    var out = ""
+    for c in s {
+        let cp = str.ord(c)
+        if cp >= 32 and cp < 127 and cp != 34 and cp != 92 {
+            out = out + c
+        } else {
+            out = out + utf8_esc(cp)
+        }
+    }
+    return out
+}
+
+// byte length of the UTF-8 encoding (for the [N x i8] array type)
+fn utf8_len(s: Text) -> Int {
+    var n = 0
+    for c in s {
+        let cp = str.ord(c)
+        if cp < 128 {
+            n = n + 1
+        } else {
+            if cp < 2048 {
+                n = n + 2
+            } else {
+                if cp < 65536 {
+                    n = n + 3
+                } else {
+                    n = n + 4
+                }
+            }
+        }
+    }
+    return n
+}
+
+// Register a string constant; return a constant expression usable as
+// an i8* call argument:
+//   i8* bitcast ([N x i8]* @misa_str_K to i8*)
+fn cstr(em: Em, s: Text) -> Text {
+    var m = em
+    var g = ""
+    var i = 0
+    while i < len(m.str_keys) {
+        if m.str_keys[i] == s {
+            g = m.str_vals[i]
+        }
+        i = i + 1
+    }
+    if g == "" {
+        g = "@misa_str_" + str(m.str_n)
+        m.str_n = m.str_n + 1
+        m.str_keys = m.str_keys + [s]
+        m.str_vals = m.str_vals + [g]
+        let nbytes = utf8_len(s) + 1
+        m.globs = m.globs + [g + " = internal constant [" + str(nbytes) +
+            " x i8] c\"" + llvm_esc(s) + "\\00\""]
+    }
+    let nbytes = utf8_len(s) + 1
+    return "i8* bitcast ([" + str(nbytes) + " x i8]* " + g + " to i8*)"
+}
+
+// ------------------------------------------------------------------
+// runtime declarations (mirrors _RT_SIGS in emit.py)
+// ------------------------------------------------------------------
+
+fn rt_decls() -> [Text] {
+    return [
+        "declare void @misa_rt_init()",
+        "declare i8* @misa_int(i64)",
+        "declare i8* @misa_float(double)",
+        "declare i8* @misa_bool(i32)",
+        "declare i8* @misa_null()",
+        "declare i8* @misa_text_cstr(i8*)",
+        "declare i8* @misa_list_new()",
+        "declare void @misa_list_push(i8*, i8*)",
+        "declare i8* @misa_map_new()",
+        "declare i8* @misa_record_new()",
+        "declare void @misa_record_set_cstr(i8*, i8*, i8*)",
+        "declare i8* @misa_pending()",
+        "declare i8* @misa_take_pending()",
+        "declare void @misa_do_throw(i8*, i32, i32)",
+        "declare i8* @misa_make_thrown(i8*, i32, i32)",
+        "declare i8* @misa_catch_record(i8*)",
+        "declare void @misa_report_uncaught(i8*)",
+        "declare i32 @misa_truthy(i8*)",
+        "declare i8* @misa_add(i8*, i8*, i32, i32)",
+        "declare i8* @misa_sub(i8*, i8*, i32, i32)",
+        "declare i8* @misa_mul(i8*, i8*, i32, i32)",
+        "declare i8* @misa_div(i8*, i8*, i32, i32)",
+        "declare i8* @misa_mod(i8*, i8*, i32, i32)",
+        "declare i8* @misa_neg(i8*, i32, i32)",
+        "declare i8* @misa_not(i8*)",
+        "declare i8* @misa_eq(i8*, i8*)",
+        "declare i8* @misa_ne(i8*, i8*)",
+        "declare i8* @misa_lt(i8*, i8*, i32, i32)",
+        "declare i8* @misa_le(i8*, i8*, i32, i32)",
+        "declare i8* @misa_gt(i8*, i8*, i32, i32)",
+        "declare i8* @misa_ge(i8*, i8*, i32, i32)",
+        "declare i8* @misa_text_concat(i8*, i8*)",
+        "declare i8* @misa_index_get(i8*, i8*, i32, i32)",
+        "declare void @misa_index_set(i8*, i8*, i8*, i32, i32)",
+        "declare i8* @misa_record_get(i8*, i8*, i32, i32)",
+        "declare void @misa_record_set(i8*, i8*, i8*, i32, i32)",
+        "declare i8* @misa_iter_new(i8*, i32, i32)",
+        "declare i8* @misa_iter_next(i8*)",
+        "declare i8* @misa_print(i8*)",
+        "declare i8* @misa_builtin_len(i8*, i32, i32)",
+        "declare i8* @misa_builtin_str(i8*)",
+        "declare i8* @misa_builtin_int(i8*, i32, i32)",
+        "declare i8* @misa_builtin_float(i8*, i32, i32)",
+        "declare i8* @misa_builtin_assert(i8*, i8*, i32, i32)",
+        "declare i8* @misa_builtin_env(i8*, i32, i32)",
+        "declare i8* @misa_fs_read(i8*, i32, i32)",
+        "declare i8* @misa_fs_write(i8*, i8*, i32, i32)",
+        "declare i8* @misa_http_get(i8*, i32, i32)",
+        "declare i8* @misa_text_z(i8*)",
+        "declare void @misa_screen_begin(i8*)",
+        "declare void @misa_screen_comp_begin(i8*, i32)",
+        "declare void @misa_screen_comp_arg(i8*, i8*, i32)",
+        "declare void @misa_screen_comp_arg_handler(i8*, i32, i32)",
+        "declare void @misa_screen_comp_bind_id(i32)",
+        "declare void @misa_screen_comp_head_end(i32)",
+        "declare void @misa_screen_comp_end()",
+        "declare void @misa_screen_end()",
+        "declare i8* @misa_ui_active()",
+        "declare i32 @misa_ui_find_bound(i8*, i32)",
+        "declare i8* @misa_ui_get_text(i8*, i32)"
+    ]
+}
+
+// ------------------------------------------------------------------
+// error checking: branch to innermost error target if pending
+// ------------------------------------------------------------------
+
+fn do_check(em: Em, line: Int, col: Int) -> Text {
+    var m = em
+    let pe = tmp(m)
+    let ok = tmp(m)
+    let cn = "cont." + str(blkn(m))
+    let err = m.err_stack[len(m.err_stack) - 1]
+    w(m, "  " + pe + " = call i8* @misa_pending()")
+    w(m, "  " + ok + " = icmp eq i8* " + pe + ", null")
+    w(m, "  br i1 " + ok + ", label %" + cn + ", label %" + err)
+    w(m, cn + ":")
+    m.terminated = false
+    return cn
+}
+
+// Emit a runtime call. ret is "i8*", "i32", "i64" or "void".
+// args are already-typed fragments like "i8* %t3", "i32 5".
+// Returns the result SSA name ("" for void). When docheck is true,
+// follows the call with do_check.
+fn rt_call(em: Em, name: Text, ret: Text, args: [Text], docheck: Bool, line: Int, col: Int) -> Text {
+    var m = em
+    var argstr = ""
+    var i = 0
+    while i < len(args) {
+        if i > 0 {
+            argstr = argstr + ", "
+        }
+        argstr = argstr + args[i]
+        i = i + 1
+    }
+    if ret == "void" {
+        w(m, "  call void @" + name + "(" + argstr + ")")
+        if docheck {
+            do_check(m, line, col)
+        }
+        return ""
+    }
+    let t = tmp(m)
+    w(m, "  " + t + " = call " + ret + " @" + name + "(" + argstr + ")")
+    if docheck {
+        do_check(m, line, col)
+    }
+    return t
+}
+
+fn loc2(line: Int, col: Int) -> [Text] {
+    return ["i32 " + str(line), "i32 " + str(col)]
+}
+
+// ------------------------------------------------------------------
+// nil value (emitted once per function into the preamble)
+// ------------------------------------------------------------------
+
+fn get_nil(em: Em) -> Text {
+    var m = em
+    if m.nil_ssa == "" {
+        m.nil_ssa = "%nil"
+        wpre(m, "  %nil = call i8* @misa_null()")
+    }
+    return m.nil_ssa
+}
+
+// ------------------------------------------------------------------
+// lexical scopes: stack of [SBind]; innermost last
+// ------------------------------------------------------------------
+
+fn scope_push(em: Em) {
+    var m = em
+    let empty: [SBind] = []
+    m.scopes = m.scopes + [empty]
+}
+
+fn scope_pop(em: Em) {
+    var m = em
+    var kept: [[SBind]] = []
+    var i = 0
+    while i < len(m.scopes) - 1 {
+        kept = kept + [m.scopes[i]]
+        i = i + 1
+    }
+    m.scopes = kept
+}
+
+fn err_pop(em: Em) {
+    var m = em
+    var kept: [Text] = []
+    var i = 0
+    while i < len(m.err_stack) - 1 {
+        kept = kept + [m.err_stack[i]]
+        i = i + 1
+    }
+    m.err_stack = kept
+}
+
+fn scope_declare(em: Em, name: Text, ssa: Text) {
+    var m = em
+    let top = len(m.scopes) - 1
+    var cur = m.scopes[top]
+    var kept: [SBind] = []
+    for b in cur {
+        if b.name != name {
+            kept = kept + [b]
+        }
+    }
+    let nb: SBind = { name: name, ssa: ssa }
+    m.scopes[top] = kept + [nb]
+}
+
+fn scope_lookup(em: Em, name: Text, line: Int, col: Int) -> Text {
+    var m = em
+    var i = len(m.scopes) - 1
+    while i >= 0 {
+        for b in m.scopes[i] {
+            if b.name == name {
+                return b.ssa
+            }
+        }
+        i = i - 1
+    }
+    throw {code: "E101", message: str(line) + ":" + str(col) + "\nundefined name '" + name + "'"}
+    return ""
+}
+
+// ------------------------------------------------------------------
+// function scaffolding
+// ------------------------------------------------------------------
+
+// Begin a function definition. params are Misa param names; each
+// becomes i8* %p<i>. The define line is buffered in fn_head and
+// flushed by end_fn (so nested handler emission can't interleave).
+fn start_fn(em: Em, fname: Text, params: [Text]) {
+    var m = em
+    m.cur = []
+    m.pre = []
+    m.nil_ssa = ""
+    m.terminated = false
+    m.scopes = []
+    m.err_stack = ["err"]
+    var pdecl = ""
+    var i = 0
+    while i < len(params) {
+        if i > 0 {
+            pdecl = pdecl + ", "
+        }
+        pdecl = pdecl + "i8* %p" + str(i)
+        i = i + 1
+    }
+    m.fn_head = "define i8* @" + fname + "(" + pdecl + ") {{"
+    w(m, "entry:")
+    scope_push(m)
+    // bind params to allocas in the preamble
+    i = 0
+    while i < len(params) {
+        let a = "%a" + str(m.tmp_n)
+        m.tmp_n = m.tmp_n + 1
+        wpre(m, "  " + a + " = alloca i8*")
+        w(m, "  store i8* %p" + str(i) + ", i8** " + a)
+        scope_declare(m, params[i], a)
+        i = i + 1
+    }
+}
+
+// alloca for a local variable; returns the SSA name
+fn alloca_var(em: Em, name: Text) -> Text {
+    var m = em
+    let a = "%a" + str(m.tmp_n)
+    m.tmp_n = m.tmp_n + 1
+    wpre(m, "  " + a + " = alloca i8*")
+    scope_declare(m, name, a)
+    return a
+}
+
+// Finish a function: fallthrough `ret nil` if needed, then the err
+// block, then close the brace. Layout in mod:
+//   define ... {{
+//   entry:
+//   <pre: allocas + nil>
+//   <body>
+//   err:
+//     ret i8* null
+//   }
+fn end_fn(em: Em) {
+    var m = em
+    if not m.terminated {
+        m.cur = m.cur + ["  ret i8* " + get_nil(m)]
+    }
+    m.mod = m.mod + [m.fn_head]
+    m.mod = m.mod + ["entry:"]
+    for l in m.pre {
+        m.mod = m.mod + [l]
+    }
+    var i = 1
+    while i < len(m.cur) {
+        m.mod = m.mod + [m.cur[i]]
+        i = i + 1
+    }
+    m.mod = m.mod + ["err:", "  ret i8* null", "}"]
+    m.cur = []
+    m.pre = []
+}
+
+// ------------------------------------------------------------------
+// expressions: returns the SSA name holding the i8* value
+// ------------------------------------------------------------------
+
+fn emit_expr(em: Em, e: Node) -> Text {
+    var m = em
+    if e.node == "IntLit" {
+        return rt_call(m, "misa_int", "i8*", ["i64 " + str(e.ival)], false, e.line, e.col)
+    }
+    if e.node == "FloatLit" {
+        return rt_call(m, "misa_float", "i8*", ["double " + str(e.fval)], false, e.line, e.col)
+    }
+    if e.node == "BoolLit" {
+        var b = "0"
+        if e.bval {
+            b = "1"
+        }
+        return rt_call(m, "misa_bool", "i8*", ["i32 " + b], false, e.line, e.col)
+    }
+    if e.node == "NilLit" {
+        return get_nil(m)
+    }
+    if e.node == "DurationLit" {
+        return rt_call(m, "misa_int", "i8*", ["i64 " + str(e.ival)], false, e.line, e.col)
+    }
+    if e.node == "MoneyLit" {
+        return rt_call(m, "misa_float", "i8*", ["double " + str(e.fval)], false, e.line, e.col)
+    }
+    if e.node == "StrLit" {
+        return emit_str(m, e)
+    }
+    if e.node == "Ident" {
+        if m.in_handler {
+            return emit_handler_ident(m, e)
+        }
+        let a = scope_lookup(m, e.name, e.line, e.col)
+        let t = tmp(m)
+        w(m, "  " + t + " = load i8*, i8** " + a)
+        return t
+    }
+    if e.node == "Call" {
+        return emit_call(m, e)
+    }
+    if e.node == "Field" {
+        if m.in_handler {
+            let hv = emit_handler_field(m, e)
+            if hv != "" {
+                return hv
+            }
+        }
+        let obj = emit_expr(m, e.obj[0])
+        do_check(m, e.line, e.col)
+        let lc = loc2(e.line, e.col)
+        return rt_call(m, "misa_record_get", "i8*",
+            ["i8* " + obj, cstr(m, e.name), lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.node == "Index" {
+        let obj = emit_expr(m, e.obj[0])
+        do_check(m, e.line, e.col)
+        let idx = emit_expr(m, e.idx[0])
+        do_check(m, e.line, e.col)
+        let lc = loc2(e.line, e.col)
+        return rt_call(m, "misa_index_get", "i8*",
+            ["i8* " + obj, "i8* " + idx, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.node == "ListLit" {
+        let l = rt_call(m, "misa_list_new", "i8*", [], false, e.line, e.col)
+        for it in e.items {
+            let v = emit_expr(m, it)
+            do_check(m, e.line, e.col)
+            rt_call(m, "misa_list_push", "void", ["i8* " + l, "i8* " + v], false, e.line, e.col)
+        }
+        return l
+    }
+    if e.node == "RecordLit" {
+        let r = rt_call(m, "misa_record_new", "i8*", [], false, e.line, e.col)
+        for p in e.pairs {
+            let v = emit_expr(m, p.value)
+            do_check(m, e.line, e.col)
+            rt_call(m, "misa_record_set_cstr", "void",
+                ["i8* " + r, cstr(m, p.name), "i8* " + v], false, e.line, e.col)
+        }
+        return r
+    }
+    if e.node == "MapLit" {
+        return emit_map(m, e)
+    }
+    if e.node == "BinOp" {
+        return emit_binop(m, e)
+    }
+    if e.node == "UnOp" {
+        let v = emit_expr(m, e.operand[0])
+        do_check(m, e.line, e.col)
+        if e.op == "not" {
+            return rt_call(m, "misa_not", "i8*", ["i8* " + v], false, e.line, e.col)
+        }
+        if e.op == "-" {
+            let lc = loc2(e.line, e.col)
+            return rt_call(m, "misa_neg", "i8*", ["i8* " + v, lc[0], lc[1]], true, e.line, e.col)
+        }
+        throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nunknown unary '" + e.op + "'"}
+        return ""
+    }
+    if e.node == "Lambda" {
+        throw {code: "E402", message: str(e.line) + ":" + str(e.col) + "\nfirst-class lambdas are not supported in AOT v1"}
+        return ""
+    }
+    throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nunsupported expression " + e.node + " in AOT v1"}
+    return ""
+}
+
+fn emit_str(em: Em, e: Node) -> Text {
+    var m = em
+    var acc = rt_call(m, "misa_text_cstr", "i8*", [cstr(m, "")], false, e.line, e.col)
+    for part in e.items {
+        var pv = ""
+        if part.node == "StrPart" {
+            pv = rt_call(m, "misa_text_cstr", "i8*", [cstr(m, part.sval)], false, e.line, e.col)
+        } else {
+            pv = emit_expr(m, part)
+            do_check(m, e.line, e.col)
+        }
+        acc = rt_call(m, "misa_text_concat", "i8*", ["i8* " + acc, "i8* " + pv], false, e.line, e.col)
+    }
+    return acc
+}
+
+fn emit_map(em: Em, e: Node) -> Text {
+    var m = em
+    let mp = rt_call(m, "misa_map_new", "i8*", [], false, e.line, e.col)
+    let lc = loc2(e.line, e.col)
+    for p in e.pairs {
+        let kv = rt_call(m, "misa_text_cstr", "i8*", [cstr(m, p.name)], false, e.line, e.col)
+        let v = emit_expr(m, p.value)
+        do_check(m, e.line, e.col)
+        rt_call(m, "misa_index_set", "void",
+            ["i8* " + mp, "i8* " + kv, "i8* " + v, lc[0], lc[1]], true, e.line, e.col)
+    }
+    return mp
+}
+
+// RecordLit emitted as a Map (for `var m: Map<..> = {...}`)
+fn emit_record_as_map(em: Em, e: Node) -> Text {
+    var m = em
+    let mp = rt_call(m, "misa_map_new", "i8*", [], false, e.line, e.col)
+    let lc = loc2(e.line, e.col)
+    for p in e.pairs {
+        let kv = rt_call(m, "misa_text_cstr", "i8*", [cstr(m, p.name)], false, e.line, e.col)
+        let v = emit_expr(m, p.value)
+        do_check(m, e.line, e.col)
+        rt_call(m, "misa_index_set", "void",
+            ["i8* " + mp, "i8* " + kv, "i8* " + v, lc[0], lc[1]], true, e.line, e.col)
+    }
+    return mp
+}
+
+fn emit_binop(em: Em, e: Node) -> Text {
+    var m = em
+    if e.op == "and" {
+        return emit_sc(m, e, true)
+    }
+    if e.op == "or" {
+        return emit_sc(m, e, false)
+    }
+    let l = emit_expr(m, e.left[0])
+    do_check(m, e.line, e.col)
+    let r = emit_expr(m, e.right[0])
+    do_check(m, e.line, e.col)
+    let ll = "i8* " + l
+    let rr = "i8* " + r
+    let lc = loc2(e.line, e.col)
+    if e.op == "==" {
+        return rt_call(m, "misa_eq", "i8*", [ll, rr], false, e.line, e.col)
+    }
+    if e.op == "!=" {
+        return rt_call(m, "misa_ne", "i8*", [ll, rr], false, e.line, e.col)
+    }
+    if e.op == "+" {
+        return rt_call(m, "misa_add", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "-" {
+        return rt_call(m, "misa_sub", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "*" {
+        return rt_call(m, "misa_mul", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "/" {
+        return rt_call(m, "misa_div", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "%" {
+        return rt_call(m, "misa_mod", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "<" {
+        return rt_call(m, "misa_lt", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == "<=" {
+        return rt_call(m, "misa_le", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == ">" {
+        return rt_call(m, "misa_gt", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if e.op == ">=" {
+        return rt_call(m, "misa_ge", "i8*", [ll, rr, lc[0], lc[1]], true, e.line, e.col)
+    }
+    throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nunknown operator '" + e.op + "'"}
+    return ""
+}
+
+fn emit_sc(em: Em, e: Node, is_and: Bool) -> Text {
+    var m = em
+    let l = emit_expr(m, e.left[0])
+    do_check(m, e.line, e.col)
+    let t = rt_call(m, "misa_truthy", "i32", ["i8* " + l], false, e.line, e.col)
+    let c = tmp(m)
+    w(m, "  " + c + " = icmp ne i32 " + t + ", 0")
+    let n = blkn(m)
+    let rhs_b = "sc.rhs." + str(n)
+    let short_b = "sc.short." + str(n)
+    let end_b = "sc.end." + str(n)
+    if is_and {
+        w(m, "  br i1 " + c + ", label %" + rhs_b + ", label %" + short_b)
+    } else {
+        w(m, "  br i1 " + c + ", label %" + short_b + ", label %" + rhs_b)
+    }
+    m.terminated = true
+    w(m, short_b + ":")
+    m.terminated = false
+    var short_v = l
+    if is_and {
+        short_v = rt_call(m, "misa_bool", "i8*", ["i32 0"], false, e.line, e.col)
+    }
+    w(m, "  br label %" + end_b)
+    m.terminated = true
+    w(m, rhs_b + ":")
+    m.terminated = false
+    let r = emit_expr(m, e.right[0])
+    let rhs_end = do_check(m, e.line, e.col)
+    w(m, "  br label %" + end_b)
+    m.terminated = true
+    w(m, end_b + ":")
+    m.terminated = false
+    let phi = tmp(m)
+    w(m, "  " + phi + " = phi i8* [ " + short_v + ", %" + short_b + " ], [ " + r + ", %" + rhs_end + " ]")
+    return phi
+}
+
+// ------------------------------------------------------------------
+// calls
+// ------------------------------------------------------------------
+
+fn fn_arity_lookup(em: Em, name: Text) -> Int {
+    var m = em
+    var i = 0
+    while i < len(m.fn_names) {
+        if m.fn_names[i] == name {
+            return m.fn_arity[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn emit_call(em: Em, e: Node) -> Text {
+    var m = em
+    let name = e.name
+    let arity = fn_arity_lookup(m, name)
+    if arity >= 0 {
+        if len(e.items) != arity {
+            throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nfn '" + name + "' takes " + str(arity) + " args, got " + str(len(e.items))}
+            return ""
+        }
+        var args: [Text] = []
+        for a in e.items {
+            let v = emit_expr(m, a)
+            do_check(m, e.line, e.col)
+            args = args + ["i8* " + v]
+        }
+        return rt_call(m, "misa_fn_" + name, "i8*", args, true, e.line, e.col)
+    }
+    return emit_builtin(m, e)
+}
+
+fn builtin_arg(em: Em, e: Node, i: Int) -> Text {
+    var m = em
+    let v = emit_expr(m, e.items[i])
+    do_check(m, e.line, e.col)
+    return v
+}
+
+fn emit_builtin(em: Em, e: Node) -> Text {
+    var m = em
+    let name = e.name
+    let lc = loc2(e.line, e.col)
+    if name == "print" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_print", "i8*", ["i8* " + a], true, e.line, e.col)
+    }
+    if name == "len" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_builtin_len", "i8*", ["i8* " + a, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "str" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_builtin_str", "i8*", ["i8* " + a], false, e.line, e.col)
+    }
+    if name == "int" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_builtin_int", "i8*", ["i8* " + a, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "float" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_builtin_float", "i8*", ["i8* " + a, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "assert" {
+        let c = builtin_arg(m, e, 0)
+        var msg = get_nil(m)
+        if len(e.items) > 1 {
+            msg = builtin_arg(m, e, 1)
+        }
+        return rt_call(m, "misa_builtin_assert", "i8*", ["i8* " + c, "i8* " + msg, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "env" {
+        let v = builtin_arg(m, e, 0)
+        let z = rt_call(m, "misa_text_z", "i8*", ["i8* " + v], true, e.line, e.col)
+        return rt_call(m, "misa_builtin_env", "i8*", ["i8* " + z, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "fs.read" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_fs_read", "i8*", ["i8* " + a, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "fs.write" {
+        let a = builtin_arg(m, e, 0)
+        let b = builtin_arg(m, e, 1)
+        return rt_call(m, "misa_fs_write", "i8*", ["i8* " + a, "i8* " + b, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "http.get" {
+        let a = builtin_arg(m, e, 0)
+        return rt_call(m, "misa_http_get", "i8*", ["i8* " + a, lc[0], lc[1]], true, e.line, e.col)
+    }
+    if name == "navigate" {
+        return emit_navigate(m, e)
+    }
+    throw {code: "E101", message: str(e.line) + ":" + str(e.col) + "\nundefined function '" + name + "'"}
+    return ""
+}
+
+// navigate(Screen(...)): call the screen function directly
+fn emit_navigate(em: Em, e: Node) -> Text {
+    var m = em
+    if len(e.items) != 1 or e.items[0].node != "Call" {
+        throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nnavigate needs a screen call, e.g. navigate(Home())"}
+        return ""
+    }
+    let tgt = e.items[0]
+    if fn_arity_lookup(m, "screen_" + tgt.name) < 0 {
+        throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nnavigate needs a screen call, e.g. navigate(Home())"}
+        return ""
+    }
+    var args: [Text] = []
+    for a in tgt.items {
+        let v = emit_expr(m, a)
+        do_check(m, e.line, e.col)
+        args = args + ["i8* " + v]
+    }
+    return rt_call(m, "misa_screen_" + tgt.name, "i8*", args, true, e.line, e.col)
+}
+
+// --- handler scope (Phase 4 M4): inside event handlers, bare idents
+// must be lambda params or id: bindings; <id>.text reads via the UI
+// driver. Returns "" when the node is not handler-special.
+
+fn id_slot_lookup(em: Em, name: Text) -> Int {
+    var m = em
+    var i = 0
+    while i < len(m.id_names) {
+        if m.id_names[i] == name {
+            return m.id_slot[i]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn emit_handler_ident(em: Em, e: Node) -> Text {
+    var m = em
+    if id_slot_lookup(m, e.name) >= 0 {
+        throw {code: "E201", message: str(e.line) + ":" + str(e.col) + "\ncomponent id '" + e.name + "' cannot be used as a value"}
+        return ""
+    }
+    // lambda params are in scope; anything else is a closure (E600)
+    var i = len(m.scopes) - 1
+    while i >= 0 {
+        for b in m.scopes[i] {
+            if b.name == e.name {
+                let t = tmp(m)
+                w(m, "  " + t + " = load i8*, i8** " + b.ssa)
+                return t
+            }
+        }
+        i = i - 1
+    }
+    throw {code: "E600", message: str(e.line) + ":" + str(e.col) + "\nhandler cannot capture '" + e.name + "'"}
+    return ""
+}
+
+fn emit_handler_field(em: Em, e: Node) -> Text {
+    var m = em
+    if e.obj[0].node == "Ident" and id_slot_lookup(m, e.obj[0].name) >= 0 {
+        let ui = rt_call(m, "misa_ui_active", "i8*", [], false, e.line, e.col)
+        let slot = id_slot_lookup(m, e.obj[0].name)
+        let wd = rt_call(m, "misa_ui_find_bound", "i32", ["i8* " + ui, "i32 " + str(slot)], false, e.line, e.col)
+        return rt_call(m, "misa_ui_get_text", "i8*", ["i8* " + ui, "i32 " + wd], false, e.line, e.col)
+    }
+    return ""
+}
+
+// ------------------------------------------------------------------
+// statements
+// ------------------------------------------------------------------
+
+fn emit_block(em: Em, stmts: [Node]) {
+    var m = em
+    for s in stmts {
+        emit_stmt(m, s)
+        if m.terminated {
+            let d = "dead." + str(blkn(m))
+            w(m, d + ":")
+            m.terminated = false
+        }
+    }
+}
+
+fn emit_stmt(em: Em, s: Node) {
+    var m = em
+    if s.node == "LetStmt" {
+        var v = ""
+        if len(s.ann) > 0 and s.ann[0].is_map and s.value[0].node == "RecordLit" {
+            v = emit_record_as_map(m, s.value[0])
+        } else {
+            v = emit_expr(m, s.value[0])
+        }
+        do_check(m, s.line, s.col)
+        let a = alloca_var(m, s.name)
+        w(m, "  store i8* " + v + ", i8** " + a)
+        return
+    }
+    if s.node == "AssignStmt" {
+        let v = emit_expr(m, s.value[0])
+        do_check(m, s.line, s.col)
+        let tgt = s.target[0]
+        if tgt.node == "Ident" {
+            let a = scope_lookup(m, tgt.name, s.line, s.col)
+            w(m, "  store i8* " + v + ", i8** " + a)
+            return
+        }
+        if tgt.node == "Field" {
+            let obj = emit_expr(m, tgt.obj[0])
+            do_check(m, s.line, s.col)
+            let lc = loc2(s.line, s.col)
+            rt_call(m, "misa_record_set", "void",
+                ["i8* " + obj, cstr(m, tgt.name), "i8* " + v, lc[0], lc[1]], true, s.line, s.col)
+            return
+        }
+        if tgt.node == "Index" {
+            let obj = emit_expr(m, tgt.obj[0])
+            do_check(m, s.line, s.col)
+            let idx = emit_expr(m, tgt.idx[0])
+            do_check(m, s.line, s.col)
+            let lc = loc2(s.line, s.col)
+            rt_call(m, "misa_index_set", "void",
+                ["i8* " + obj, "i8* " + idx, "i8* " + v, lc[0], lc[1]], true, s.line, s.col)
+            return
+        }
+        throw {code: "E201", message: str(s.line) + ":" + str(s.col) + "\ninvalid assignment target"}
+        return
+    }
+    if s.node == "IfStmt" {
+        emit_if(m, s)
+        return
+    }
+    if s.node == "WhileStmt" {
+        emit_while(m, s)
+        return
+    }
+    if s.node == "ForStmt" {
+        emit_for(m, s)
+        return
+    }
+    if s.node == "ReturnStmt" {
+        var v = get_nil(m)
+        if len(s.value) > 0 {
+            v = emit_expr(m, s.value[0])
+            do_check(m, s.line, s.col)
+        }
+        w(m, "  ret i8* " + v)
+        m.terminated = true
+        return
+    }
+    if s.node == "TryStmt" {
+        emit_try(m, s)
+        return
+    }
+    if s.node == "ThrowStmt" {
+        let v = emit_expr(m, s.value[0])
+        do_check(m, s.line, s.col)
+        let lc = loc2(s.line, s.col)
+        let ev = rt_call(m, "misa_make_thrown", "i8*", ["i8* " + v, lc[0], lc[1]], true, s.line, s.col)
+        rt_call(m, "misa_do_throw", "void", ["i8* " + ev, lc[0], lc[1]], false, s.line, s.col)
+        do_check(m, s.line, s.col)
+        return
+    }
+    if s.node == "ExprStmt" {
+        emit_expr(m, s.value[0])
+        do_check(m, s.line, s.col)
+        return
+    }
+    throw {code: "E600", message: str(s.line) + ":" + str(s.col) + "\nunsupported statement " + s.node + " in AOT v1"}
+}
+
+fn emit_cond_br(em: Em, c: Text, then_b: Text, else_b: Text) {
+    var m = em
+    let t = rt_call(m, "misa_truthy", "i32", ["i8* " + c], false, 0, 0)
+    let cc = tmp(m)
+    w(m, "  " + cc + " = icmp ne i32 " + t + ", 0")
+    w(m, "  br i1 " + cc + ", label %" + then_b + ", label %" + else_b)
+    m.terminated = true
+}
+
+fn emit_if(em: Em, s: Node) {
+    var m = em
+    let c = emit_expr(m, s.cond[0])
+    do_check(m, s.line, s.col)
+    let n = blkn(m)
+    let then_b = "if.then." + str(n)
+    let else_b = "if.else." + str(n)
+    let end_b = "if.end." + str(n)
+    emit_cond_br(m, c, then_b, else_b)
+    w(m, then_b + ":")
+    m.terminated = false
+    scope_push(m)
+    emit_block(m, s.items)
+    scope_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + end_b)
+        m.terminated = true
+    }
+    w(m, else_b + ":")
+    m.terminated = false
+    scope_push(m)
+    emit_block(m, s.items2)
+    scope_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + end_b)
+        m.terminated = true
+    }
+    w(m, end_b + ":")
+    m.terminated = false
+}
+
+fn emit_while(em: Em, s: Node) {
+    var m = em
+    let n = blkn(m)
+    let cond_b = "while.cond." + str(n)
+    let body_b = "while.body." + str(n)
+    let end_b = "while.end." + str(n)
+    w(m, "  br label %" + cond_b)
+    m.terminated = true
+    w(m, cond_b + ":")
+    m.terminated = false
+    let c = emit_expr(m, s.cond[0])
+    do_check(m, s.line, s.col)
+    emit_cond_br(m, c, body_b, end_b)
+    w(m, body_b + ":")
+    m.terminated = false
+    scope_push(m)
+    emit_block(m, s.items)
+    scope_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + cond_b)
+        m.terminated = true
+    }
+    w(m, end_b + ":")
+    m.terminated = false
+}
+
+fn emit_for(em: Em, s: Node) {
+    var m = em
+    let v = emit_expr(m, s.iter[0])
+    do_check(m, s.line, s.col)
+    let lc = loc2(s.line, s.col)
+    let it = rt_call(m, "misa_iter_new", "i8*", ["i8* " + v, lc[0], lc[1]], true, s.line, s.col)
+    let n = blkn(m)
+    let loop_b = "for.loop." + str(n)
+    let body_b = "for.body." + str(n)
+    let end_b = "for.end." + str(n)
+    w(m, "  br label %" + loop_b)
+    m.terminated = true
+    w(m, loop_b + ":")
+    m.terminated = false
+    let x = rt_call(m, "misa_iter_next", "i8*", ["i8* " + it], false, s.line, s.col)
+    let done = tmp(m)
+    w(m, "  " + done + " = icmp eq i8* " + x + ", null")
+    w(m, "  br i1 " + done + ", label %" + end_b + ", label %" + body_b)
+    m.terminated = true
+    w(m, body_b + ":")
+    m.terminated = false
+    scope_push(m)
+    let a = alloca_var(m, s.name)
+    w(m, "  store i8* " + x + ", i8** " + a)
+    emit_block(m, s.items)
+    scope_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + loop_b)
+        m.terminated = true
+    }
+    w(m, end_b + ":")
+    m.terminated = false
+}
+
+fn emit_try(em: Em, s: Node) {
+    var m = em
+    let n = blkn(m)
+    let catch_b = "try.catch." + str(n)
+    let end_b = "try.end." + str(n)
+    m.err_stack = m.err_stack + [catch_b]
+    scope_push(m)
+    emit_block(m, s.items)
+    scope_pop(m)
+    err_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + end_b)
+        m.terminated = true
+    }
+    w(m, catch_b + ":")
+    m.terminated = false
+    let ev = rt_call(m, "misa_take_pending", "i8*", [], false, s.line, s.col)
+    let rec = rt_call(m, "misa_catch_record", "i8*", ["i8* " + ev], false, s.line, s.col)
+    scope_push(m)
+    let a = alloca_var(m, s.name)
+    w(m, "  store i8* " + rec + ", i8** " + a)
+    emit_block(m, s.items2)
+    scope_pop(m)
+    if not m.terminated {
+        w(m, "  br label %" + end_b)
+        m.terminated = true
+    }
+    w(m, end_b + ":")
+    m.terminated = false
+}
+
+// ------------------------------------------------------------------
+// screens (host text-UI driver)
+// ------------------------------------------------------------------
+
+// Collect id: binding names in order (recursive, like the Python
+// checker's id_bindings). Rejects id: inside ScreenFor.
+fn collect_ids(em: Em, items: [Node]) {
+    var m = em
+    for it in items {
+        if it.node == "Component" {
+            for p in it.pairs {
+                if p.name == "id" and p.value.node == "Ident" {
+                    m.id_names = m.id_names + [p.value.name]
+                    m.id_slot = m.id_slot + [len(m.id_names) - 1]
+                }
+            }
+            collect_ids(m, it.items)
+        } else {
+            if it.node == "ScreenIf" {
+                collect_ids(m, it.items)
+                collect_ids(m, it.items2)
+            } else {
+                if it.node == "ScreenFor" {
+                    for y in it.items {
+                        if has_id_arg(y) {
+                            throw {code: "E600", message: str(it.line) + ":" + str(it.col) + "\nid: inside ScreenFor is not supported in AOT"}
+                        }
+                    }
+                    collect_ids(m, it.items)
+                }
+            }
+        }
+    }
+}
+
+fn has_id_arg(n: Node) -> Bool {
+    if n.node == "Component" {
+        for p in n.pairs {
+            if p.name == "id" {
+                return true
+            }
+        }
+        for c in n.items {
+            if has_id_arg(c) {
+                return true
+            }
+        }
+        return false
+    }
+    if n.node == "ScreenIf" {
+        for c in n.items {
+            if has_id_arg(c) {
+                return true
+            }
+        }
+        for c in n.items2 {
+            if has_id_arg(c) {
+                return true
+            }
+        }
+        return false
+    }
+    if n.node == "ScreenFor" {
+        for c in n.items {
+            if has_id_arg(c) {
+                return true
+            }
+        }
+        return false
+    }
+    return false
+}
+
+fn emit_screen_decl(em: Em, decl: Node) {
+    var m = em
+    m.id_names = []
+    m.id_slot = []
+    collect_ids(m, decl.items)
+    var params: [Text] = []
+    for p in decl.pairs {
+        params = params + [p.name]
+    }
+    start_fn(m, "misa_screen_" + decl.name, params)
+    // register arity for navigate()
+    m.fn_names = m.fn_names + ["screen_" + decl.name]
+    m.fn_arity = m.fn_arity + [len(params)]
+    rt_call(m, "misa_screen_begin", "void", [cstr(m, decl.name)], false, decl.line, decl.col)
+    for item in decl.items {
+        emit_screen_item(m, item, decl.name)
+    }
+    rt_call(m, "misa_screen_end", "void", [], false, decl.line, decl.col)
+    let nilv = get_nil(m)
+    w(m, "  ret i8* " + nilv)
+    m.terminated = true
+    end_fn(m)
+}
+
+fn emit_screen_item(em: Em, node: Node, screen_name: Text) {
+    var m = em
+    if node.node == "ScreenIf" {
+        let c = emit_expr(m, node.cond[0])
+        do_check(m, node.line, node.col)
+        let n = blkn(m)
+        let then_b = "sc.if.then." + str(n)
+        let else_b = "sc.if.else." + str(n)
+        let end_b = "sc.if.end." + str(n)
+        emit_cond_br(m, c, then_b, else_b)
+        w(m, then_b + ":")
+        m.terminated = false
+        for x in node.items {
+            emit_screen_item(m, x, screen_name)
+        }
+        if not m.terminated {
+            w(m, "  br label %" + end_b)
+            m.terminated = true
+        }
+        w(m, else_b + ":")
+        m.terminated = false
+        for x in node.items2 {
+            emit_screen_item(m, x, screen_name)
+        }
+        if not m.terminated {
+            w(m, "  br label %" + end_b)
+            m.terminated = true
+        }
+        w(m, end_b + ":")
+        m.terminated = false
+        return
+    }
+    if node.node == "ScreenFor" {
+        let v = emit_expr(m, node.iter[0])
+        do_check(m, node.line, node.col)
+        let lc = loc2(node.line, node.col)
+        let it = rt_call(m, "misa_iter_new", "i8*", ["i8* " + v, lc[0], lc[1]], true, node.line, node.col)
+        let n = blkn(m)
+        let loop_b = "sc.for.loop." + str(n)
+        let body_b = "sc.for.body." + str(n)
+        let end_b = "sc.for.end." + str(n)
+        w(m, "  br label %" + loop_b)
+        m.terminated = true
+        w(m, loop_b + ":")
+        m.terminated = false
+        let x = rt_call(m, "misa_iter_next", "i8*", ["i8* " + it], false, node.line, node.col)
+        let done = tmp(m)
+        w(m, "  " + done + " = icmp eq i8* " + x + ", null")
+        w(m, "  br i1 " + done + ", label %" + end_b + ", label %" + body_b)
+        m.terminated = true
+        w(m, body_b + ":")
+        m.terminated = false
+        scope_push(m)
+        let a = alloca_var(m, node.name)
+        w(m, "  store i8* " + x + ", i8** " + a)
+        for y in node.items {
+            emit_screen_item(m, y, screen_name)
+        }
+        scope_pop(m)
+        if not m.terminated {
+            w(m, "  br label %" + loop_b)
+            m.terminated = true
+        }
+        w(m, end_b + ":")
+        m.terminated = false
+        return
+    }
+    emit_component(m, node, screen_name)
+}
+
+fn emit_component(em: Em, comp: Node, screen_name: Text) {
+    var m = em
+    // filter id args (not rendered)
+    var nargs = 0
+    for p in comp.pairs {
+        if not (p.name == "id" and p.value.node == "Ident") {
+            nargs = nargs + 1
+        }
+    }
+    var has_args = "0"
+    if nargs > 0 {
+        has_args = "1"
+    }
+    rt_call(m, "misa_screen_comp_begin", "void",
+        [cstr(m, comp.name), "i32 " + has_args], false, comp.line, comp.col)
+    for p in comp.pairs {
+        if p.name == "id" and p.value.node == "Ident" {
+            let slot = id_slot_lookup(m, p.value.name)
+            if slot >= 0 {
+                rt_call(m, "misa_screen_comp_bind_id", "void", ["i32 " + str(slot)], false, comp.line, comp.col)
+            }
+        }
+    }
+    var i = 0
+    for p in comp.pairs {
+        if p.name == "id" and p.value.node == "Ident" {
+            // skipped (bound above)
+        } else {
+            var first = "0"
+            if i == 0 {
+                first = "1"
+            }
+            if p.value.node == "Lambda" {
+                let hid = emit_handler(m, screen_name, p.value)
+                rt_call(m, "misa_screen_comp_arg_handler", "void",
+                    [cstr(m, p.name), "i32 " + first, "i32 " + str(hid)], false, comp.line, comp.col)
+            } else {
+                let v = emit_expr(m, p.value)
+                do_check(m, comp.line, comp.col)
+                rt_call(m, "misa_screen_comp_arg", "void",
+                    [cstr(m, p.name), "i8* " + v, "i32 " + first], false, comp.line, comp.col)
+            }
+            i = i + 1
+        }
+    }
+    rt_call(m, "misa_screen_comp_head_end", "void", ["i32 " + has_args], false, comp.line, comp.col)
+    for child in comp.items {
+        emit_screen_item(m, child, screen_name)
+    }
+    rt_call(m, "misa_screen_comp_end", "void", [], false, comp.line, comp.col)
+}
+
+fn emit_handler(em: Em, screen_name: Text, lam: Node) -> Int {
+    var m = em
+    let hid = len(m.handlers)
+    let fname = "misa_handler_" + screen_name + "_" + str(hid)
+    m.handlers = m.handlers + [fname]
+    // save outer per-function state (start_fn resets it)
+    let saved_cur = m.cur
+    let saved_pre = m.pre
+    let saved_head = m.fn_head
+    let saved_scopes = m.scopes
+    let saved_err = m.err_stack
+    let saved_nil = m.nil_ssa
+    let saved_term = m.terminated
+    let saved_handler = m.in_handler
+    let saved_ids = m.id_names
+    let saved_slots = m.id_slot
+    m.in_handler = true
+    start_fn(m, fname, ["__ev"])
+    // lambda params alias the event-arg alloca
+    for pn in lam.slist {
+        scope_declare(m, pn, scope_lookup(m, "__ev", lam.line, lam.col))
+    }
+    if len(lam.expr_body) > 0 {
+        let v = emit_expr(m, lam.expr_body[0])
+        do_check(m, lam.line, lam.col)
+        w(m, "  ret i8* " + v)
+        m.terminated = true
+    } else {
+        emit_block(m, lam.items)
+    }
+    end_fn(m)
+    // restore outer per-function state
+    m.cur = saved_cur
+    m.pre = saved_pre
+    m.fn_head = saved_head
+    m.scopes = saved_scopes
+    m.err_stack = saved_err
+    m.nil_ssa = saved_nil
+    m.terminated = saved_term
+    m.in_handler = saved_handler
+    m.id_names = saved_ids
+    m.id_slot = saved_slots
+    return hid
+}
+
+// ------------------------------------------------------------------
+// top-level
+// ------------------------------------------------------------------
+
+fn is_stream_node(n: Node) -> Bool {
+    return n.node == "StreamDecl" or n.node == "Await" or n.node == "OnStmt"
+}
+
+fn check_no_streaming(em: Em, n: Node) {
+    var m = em
+    if is_stream_node(n) {
+        throw {code: "E402", message: str(n.line) + ":" + str(n.col) + "\nstreaming is not supported in AOT v1 (use `misa run`)"}
+    }
+    if n.node == "Component" {
+        for p in n.pairs {
+            if p.value.node != "Lambda" {
+                check_no_streaming(m, p.value)
+            }
+        }
+        for c in n.items {
+            check_no_streaming(m, c)
+        }
+        return
+    }
+    // recurse into child nodes
+    for c in n.left {
+        check_no_streaming(m, c)
+    }
+    for c in n.right {
+        check_no_streaming(m, c)
+    }
+    for c in n.operand {
+        check_no_streaming(m, c)
+    }
+    for c in n.obj {
+        check_no_streaming(m, c)
+    }
+    for c in n.idx {
+        check_no_streaming(m, c)
+    }
+    for c in n.value {
+        check_no_streaming(m, c)
+    }
+    for c in n.cond {
+        check_no_streaming(m, c)
+    }
+    for c in n.iter {
+        check_no_streaming(m, c)
+    }
+    for c in n.target {
+        check_no_streaming(m, c)
+    }
+    for c in n.items {
+        check_no_streaming(m, c)
+    }
+    for c in n.items2 {
+        check_no_streaming(m, c)
+    }
+    for c in n.expr_body {
+        check_no_streaming(m, c)
+    }
+    for p in n.pairs {
+        check_no_streaming(m, p.value)
+    }
+}
+
+fn is_top_decl(n: Node) -> Bool {
+    return n.node == "AppDecl" or n.node == "ProviderDecl" or n.node == "ModelsDecl" or
+        n.node == "TypeDecl" or n.node == "ModelDecl" or n.node == "ScreenDecl" or
+        n.node == "EvalDecl" or n.node == "FnDecl" or n.node == "ImportDecl"
+}
+
+fn emit_ir(prog: Node) -> Text {
+    var m = new_em()
+    // module header
+    m.mod = m.mod + ["; ModuleID = 'misa'"]
+    m.mod = m.mod + ["target triple = \"x86_64-unknown-linux-gnu\""]
+    m.mod = m.mod + ["target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\""]
+    m.mod = m.mod + [""]
+    for d in rt_decls() {
+        m.mod = m.mod + [d, ""]
+    }
+    check_no_streaming(m, prog)
+    // collect function arities first (recursion)
+    for item in prog.items {
+        if item.node == "FnDecl" {
+            m.fn_names = m.fn_names + [item.name]
+            m.fn_arity = m.fn_arity + [len(item.pairs)]
+        }
+    }
+    // reject stubs: models, imports
+    for item in prog.items {
+        if item.node == "ModelDecl" {
+            throw {code: "E600", message: str(item.line) + ":" + str(item.col) + "\nmodel calls are not supported in self-hosted AOT v1"}
+        }
+        if item.node == "ImportDecl" {
+            throw {code: "E600", message: str(item.line) + ":" + str(item.col) + "\nimport is not supported in self-hosted AOT v1"}
+        }
+    }
+    // emit function bodies
+    for item in prog.items {
+        if item.node == "FnDecl" {
+            var params: [Text] = []
+            for p in item.pairs {
+                params = params + [p.name]
+            }
+            start_fn(m, "misa_fn_" + item.name, params)
+            emit_block(m, item.items)
+            end_fn(m)
+            m.mod = m.mod + [""]
+        }
+    }
+    // emit screens
+    for item in prog.items {
+        if item.node == "ScreenDecl" {
+            emit_screen_decl(m, item)
+            m.mod = m.mod + [""]
+        }
+    }
+    // handler table
+    emit_handler_table(m)
+    // misa_main: top-level statements
+    start_fn(m, "misa_main", [])
+    for item in prog.items {
+        if not is_top_decl(item) {
+            emit_stmt(m, item)
+        }
+    }
+    end_fn(m)
+    m.mod = m.mod + [""]
+    // entry main
+    emit_entry_main(m)
+    // string globals (emitted after functions; forward refs are fine)
+    for g in m.globs {
+        m.mod = m.mod + [g]
+    }
+    // join
+    var out = ""
+    for l in m.mod {
+        out = out + l + "\n"
+    }
+    return out
+}
+
+fn emit_handler_table(em: Em) {
+    var m = em
+    let n = len(m.handlers)
+    var elems = ""
+    var i = 0
+    while i < n {
+        if i > 0 {
+            elems = elems + ", "
+        }
+        elems = elems + "i8* (i8*)* @" + m.handlers[i]
+        i = i + 1
+    }
+    // always emitted (even empty): the UI driver references these.
+    // external linkage (NOT internal) so the driver can link them.
+    m.mod = m.mod + ["@misa_handler_table = constant [" + str(n) +
+        " x i8* (i8*)*] [" + elems + "]"]
+    m.mod = m.mod + ["@misa_num_handlers = constant i32 " + str(n)]
+    m.mod = m.mod + [""]
+}
+
+fn emit_entry_main(em: Em) {
+    var m = em
+    m.mod = m.mod + ["define i32 @main() {{"]
+    m.mod = m.mod + ["entry:"]
+    m.mod = m.mod + ["  call void @misa_rt_init()"]
+    m.mod = m.mod + ["  %r = call i8* @misa_main()"]
+    m.mod = m.mod + ["  %pe = call i8* @misa_pending()"]
+    m.mod = m.mod + ["  %bad = icmp ne i8* %pe, null"]
+    m.mod = m.mod + ["  br i1 %bad, label %fail, label %ok"]
+    m.mod = m.mod + ["fail:"]
+    m.mod = m.mod + ["  call void @misa_report_uncaught(i8* %pe)"]
+    m.mod = m.mod + ["  ret i32 1"]
+    m.mod = m.mod + ["ok:"]
+    m.mod = m.mod + ["  ret i32 0"]
+    m.mod = m.mod + ["}"]
+}
