@@ -1,0 +1,27 @@
+import "lexer.misa"
+import "parser.misa"
+
+fn dump(n: Node, d: Int) -> Text {
+    var s = ""
+    var i = 0
+    while i < d {
+        s = s + "  "
+        i = i + 1
+    }
+    s = s + n.node + " name=" + n.name + " sval=" + n.sval + " op=" + n.op + " ival=" + str(n.ival)
+    return s
+}
+
+fn walk(n: Node, d: Int) {
+    print(dump(n, d))
+    for c in n.left { walk(c, d + 1) }
+    for c in n.right { walk(c, d + 1) }
+    for c in n.items { walk(c, d + 1) }
+    for c in n.value { walk(c, d + 1) }
+    for c in n.cond { walk(c, d + 1) }
+}
+
+let src = fs.read("/tmp/tin.misa")
+let toks = lex(src)
+let prog = parse(toks)
+for d in prog.items { walk(d, 0) }
