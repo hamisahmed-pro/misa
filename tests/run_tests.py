@@ -308,6 +308,260 @@ def _():
                 "hint")) <= set(e.keys()), e
 
 
+@test("checker: json shape")
+def _():
+    errs = check_source("print(nope)\n", "f.misa")
+    e = errs[0]
+    assert set(("code", "message", "line", "col",
+                "hint")) <= set(e.keys()), e
+
+
+# ---------------------------------------------------------------- checked throws (Phase 8 overtake)
+
+@test("throws: parser accepts clause, throws as ident still works")
+def _():
+    p = parse_source(
+        "fn fetch(u: Text) -> Text throws E304, E303 {\n"
+        "  return http.get(u)\n}\n", "f.misa")
+    fn = p.items[0]
+    eq(fn.throws, ["E304", "E303"])
+    # `throws` as an identifier is unaffected (contextual keyword)
+    p2 = parse_source("fn f() {\n  let throws = 5\n  return throws\n}\n",
+                      "f.misa")
+    eq(p2.items[0].body[0].name, "throws")
+
+
+@test("throws: formatter round-trips clause")
+def _():
+    src = ("fn fetch(u: Text) -> Text throws E304 {\n"
+           "    return http.get(u)\n}\n")
+    eq(format_source(src, "f.misa"), src)
+
+
+@test("throws: declared and satisfied")
+def _():
+    src = ("fn fetch(u: Text) -> Text throws E304 {\n"
+           "  return http.get(u)\n}\n")
+    errs = check_source(src)
+    assert errs == [], errs
+
+
+@test("throws: undeclared call is E227")
+def _():
+    src = ("fn load(u: Text) -> Text {\n"
+           "  return fetch(u)\n"
+           "}\n"
+           "fn fetch(u: Text) -> Text throws E304 {\n"
+           "  return http.get(u)\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E304" in e["message"]
+               and "'load'" in e["message"] for e in errs), errs
+
+
+@test("throws: try/catch discharges")
+def _():
+    src = ("fn fetch(u: Text) -> Text throws E304 {\n"
+           "  return http.get(u)\n"
+           "}\n"
+           "fn safe(u: Text) -> Text {\n"
+           "  try {\n"
+           "    return fetch(u)\n"
+           "  } catch e {\n"
+           "    return \"\"\n"
+           "  }\n"
+           "  return \"\"\n"
+           "}\n")
+    errs = [e for e in check_source(src) if e["code"] == "E227"]
+    assert errs == [], errs
+
+
+@test("throws: transitive inference across undeclared fns")
+def _():
+    src = ("fn a() -> Text {\n"
+           "  return b()\n"
+           "}\n"
+           "fn b() -> Text {\n"
+           "  return http.get(\"x\")\n"
+           "}\n")
+    errs = check_source(src)
+    codes = [e["code"] for e in errs]
+    # both a (via b) and b (via http.get) are unhandled
+    assert codes.count("E227") == 2, errs
+
+
+@test("throws: builtin sets (fs E303, env E302, json E300)")
+def _():
+    src = ("fn r(p: Text) -> Text {\n"
+           "  return fs.read(p)\n"
+           "}\n"
+           "fn g(k: Text) -> Text {\n"
+           "  return env(k)\n"
+           "}\n"
+           "fn j(s: Text) {\n"
+           "  let v = json.parse(s)\n"
+           "}\n")
+    errs = check_source(src)
+    msgs = " ".join(e["message"] for e in errs if e["code"] == "E227")
+    assert "E303" in msgs and "E302" in msgs and "E300" in msgs, errs
+
+
+@test("throws: over-broad declaration is allowed (upper bound)")
+def _():
+    # Declared ⊃ inferred is permitted: the clause is a contract
+    # (upper bound), not an exact set. Only under-declaration errors.
+    src = ("fn fetch(u: Text) -> Text throws E304, E303 {\n"
+           "  return http.get(u)\n"
+           "}\n")
+    errs = [e for e in check_source(src) if e["code"] == "E227"]
+    assert errs == [], errs
+
+
+@test("throws: malformed code in clause is E227")
+def _():
+    src = ("fn f() throws OOPS {\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "OOPS" in e["message"]
+               for e in errs), errs
+
+
+@test("throws: throw with literal code is tracked")
+def _():
+    src = ("fn f() {\n"
+           "  throw { code: \"E303\", message: \"bad\" }\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E303" in e["message"]
+               for e in errs), errs
+    src2 = ("fn f() throws E303 {\n"
+            "  throw { code: \"E303\", message: \"bad\" }\n"
+            "}\n")
+    assert [e for e in check_source(src2)
+            if e["code"] == "E227"] == []
+
+
+@test("throws: rethrow of caught error carries the try set")
+def _():
+    src = ("fn fetch(u: Text) -> Text throws E304 {\n"
+           "  return http.get(u)\n"
+           "}\n"
+           "fn wrap(u: Text) -> Text throws E304 {\n"
+           "  try {\n"
+           "    return fetch(u)\n"
+           "  } catch e {\n"
+           "    throw e\n"
+           "  }\n"
+           "}\n")
+    errs = [e for e in check_source(src) if e["code"] == "E227"]
+    assert errs == [], errs
+
+
+@test("throws: lambda infers, call site checks")
+def _():
+    src = ("fn run(u: Text) -> Text {\n"
+           "  let f = |u| http.get(u)\n"
+           "  return f(u)\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E304" in e["message"]
+               for e in errs), errs
+
+
+@test("throws: spawn/await propagates task set")
+def _():
+    src = ("fn run(u: Text) -> Text {\n"
+           "  let t = spawn { return http.get(u) }\n"
+           "  return await t\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E304" in e["message"]
+               for e in errs), errs
+    src2 = ("fn run(u: Text) -> Text throws E304, E306 {\n"
+            "  let t = spawn { return http.get(u) }\n"
+            "  return await t\n"
+            "}\n")
+    assert [e for e in check_source(src2)
+            if e["code"] == "E227"] == []
+
+
+@test("throws: top level is exempt (program boundary)")
+def _():
+    errs = check_source("print(http.get(\"http://x\"))\n")
+    assert [e for e in errs if e["code"] == "E227"] == [], errs
+
+
+@test("throws: extern calls raise E226")
+def _():
+    src = ("extern \"c\" {\n"
+           "  fn strlen(s: Text) -> Int\n"
+           "}\n"
+           "fn n(s: Text) -> Int {\n"
+           "  return strlen(s)\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E226" in e["message"]
+               for e in errs), errs
+
+
+@test("throws: model calls raise E400")
+def _():
+    src = ("provider mock { key: env(\"K\") }\n"
+           "models { m: mock(\"s\") }\n"
+           "model f(a: Text) -> Text with mock.m prompt v1 \"\"\"{a}\"\"\"\n"
+           "fn g(a: Text) -> Text {\n"
+           "  return f(a)\n"
+           "}\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E227" and "E400" in e["message"]
+               for e in errs), errs
+
+
+@test("throws: throws_graph in Checker")
+def _():
+    src = ("fn fetch(u: Text) -> Text throws E304 {\n"
+           "  return http.get(u)\n"
+           "}\n"
+           "fn load(u: Text) -> Text {\n"
+           "  return fetch(u)\n"
+           "}\n")
+    c = Checker()
+    c.check(parse_source(src, "f.misa"))
+    eq(c.throws_graph["fetch"],
+       {"declared": ["E304"], "inferred": ["E304"]})
+    eq(c.throws_graph["load"],
+       {"declared": [], "inferred": ["E304"]})
+
+
+@test("throws: operators are unchecked (panic-like)")
+def _():
+    # `xs[0]` and `a / b` may raise E300 at runtime, but operators are
+    # unchecked by design — no throws clause required.
+    src = ("fn first(xs: [Int]) -> Int {\n"
+           "  return xs[0]\n"
+           "}\n"
+           "fn half(a: Int) -> Int {\n"
+           "  return a / 2\n"
+           "}\n")
+    errs = [e for e in check_source(src) if e["code"] == "E227"]
+    assert errs == [], errs
+
+
+@test("throws: screens are exempt in v1")
+def _():
+    # Screen handlers are inline lambdas; the v1 "inline lambdas
+    # unchecked" limitation applies. (Requiring try/catch in every UI
+    # handler would be the verbosity trap in the most handler-dense
+    # layer.)
+    src = ("screen Main() {\n"
+           "  button(id: b, text: \"go\", on_click: |_| {\n"
+           "    let x = http.get(\"http://x\")\n"
+           "  })\n"
+           "}\n")
+    assert [e for e in check_source(src)
+            if e["code"] == "E227"] == []
+
+
 # ---------------------------------------------------------------- formatter
 
 @test("formatter: idempotent on examples")
@@ -1910,6 +2164,86 @@ def _():
                for e in errs), errs
 
 
+@test("db: exec_many bulk insert")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE t (id INT, name TEXT)")\n'
+           'let rows = [[1, "a"], [2, "b"], [3, "c"]]\n'
+           'print(db.exec_many(db, "INSERT INTO t VALUES (?, ?)", rows))\n'
+           'print(len(db.query(db, "SELECT * FROM t")))\n'
+           'db.close(db)\n')
+    eq(run_src(src), "3\n3\n")
+
+
+@test("db: begin/commit/rollback")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE t (id INT)")\n'
+           'db.begin(db)\n'
+           'db.exec(db, "INSERT INTO t VALUES (1)")\n'
+           'db.rollback(db)\n'
+           'print(len(db.query(db, "SELECT * FROM t")))\n'
+           'db.begin(db)\n'
+           'db.exec(db, "INSERT INTO t VALUES (2)")\n'
+           'db.commit(db)\n'
+           'print(len(db.query(db, "SELECT * FROM t")))\n'
+           'db.close(db)\n')
+    eq(run_src(src), "0\n1\n")
+
+
+@test("builder: basic append/build")
+def _():
+    src = ('let b = builder()\n'
+           'b.append("hello")\n'
+           'b.append(" ")\n'
+           'b.append("world")\n'
+           'print(b.build())\n')
+    _, buf = run_src_checked(src)
+    eq(buf.getvalue(), "hello world\n")
+
+
+@test("builder: append non-text (int)")
+def _():
+    src = ('let b = builder()\n'
+           'b.append(42)\n'
+           'b.append("!")\n'
+           'print(b.build())\n')
+    _, buf = run_src_checked(src)
+    eq(buf.getvalue(), "42!\n")
+
+
+@test("builder: empty build")
+def _():
+    src = ('let b = builder()\n'
+           'print(b.build())\n'
+           'print(len(b.build()))\n')
+    _, buf = run_src_checked(src)
+    eq(buf.getvalue(), "\n0\n")
+
+
+@test("unbox: int arithmetic wrapping (P-2)")
+def _():
+    # 64-bit two's-complement wrapping must be preserved by unboxing.
+    src = ('let max = 9223372036854775807\n'
+           'print(max + 1)\n'
+           'print(-max - 2)\n'
+           'let x: Int = 100\n'
+           'let y: Int = 200\n'
+           'print(x * y + 5)\n'
+           'print((x < y) == true)\n')
+    eq(run_src(src), "-9223372036854775808\n9223372036854775807\n20005\ntrue\n")
+
+
+@test("unbox: fib via int specialization (P-2)")
+def _():
+    src = ('fn fib(n: Int) -> Int {\n'
+           '  if n < 2 { return n }\n'
+           '  return fib(n - 1) + fib(n - 2)\n'
+           '}\n'
+           'print(fib(20))\n')
+    eq(run_src(src), "6765\n")
+
+
 @test("db: checker query on undeclared table is dynamic (no error)")
 def _():
     src = ('let db = db.open(":memory:")\n'
@@ -2898,6 +3232,197 @@ def _():
         eq(run_src(src).strip(), "E304")
     finally:
         srv.shutdown()
+
+
+# ----------------------------------------------------------------------
+# `test` blocks + `misa test` runner, assert_eq/assert_ne, argv()
+
+
+def run_src_argv(src, argv):
+    prog = parse_source(src)
+    errs = check_source(src)
+    assert not errs, errs
+    buf = io.StringIO()
+    Interpreter(out=buf, argv=argv).run(prog)
+    return buf.getvalue()
+
+
+@test("parser: test block")
+def _():
+    prog = parse_source("test addition {\n  assert_eq(1 + 1, 2)\n}\n")
+    assert len(prog.items) == 1
+    t = prog.items[0]
+    assert type(t).__name__ == "TestDecl", type(t).__name__
+    eq(t.name, "addition")
+    assert len(t.body) == 1
+
+
+@test("parser: `test` stays usable as an identifier (contextual keyword)")
+def _():
+    # `test` alone / called / followed by a block is NOT a test block.
+    prog = parse_source("test\n")
+    assert type(prog.items[0]).__name__ != "TestDecl"
+    prog = parse_source("print(test)\n")
+    assert type(prog.items[0]).__name__ != "TestDecl"
+    prog = parse_source("test { }\n")
+    assert all(type(i).__name__ != "TestDecl" for i in prog.items)
+    # but `test <name> {` is
+    prog = parse_source("test foo { }\n")
+    assert type(prog.items[0]).__name__ == "TestDecl"
+
+
+@test("checker: duplicate test name E210")
+def _():
+    errs = check_source("test a { }\ntest a { }\n")
+    assert any(e["code"] == "E210" for e in errs), errs
+
+
+@test("checker: assert_eq/assert_ne/argv signatures")
+def _():
+    assert not check_source("assert_eq(1, 1)\nassert_ne(1, 2)\n"
+                            "let a = argv()\n")
+    errs = check_source("assert_eq(1)\n")
+    assert any(e["code"] == "E102" for e in errs), errs
+    errs = check_source("argv(1)\n")
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("checker: test body sees top-level bindings")
+def _():
+    assert not check_source("let x = 1\ntest t { assert_eq(x, 1) }\n"), \
+        check_source("let x = 1\ntest t { assert_eq(x, 1) }\n")
+
+
+@test("checker: test body rejects bad types")
+def _():
+    errs = check_source("test t { assert_eq(1, \"a\") }\n")
+    # assert_eq takes any/any — no error; but unknown names still E101
+    assert not errs, errs
+    errs = check_source("test t { assert_eq(nope, 1) }\n")
+    assert any(e["code"] == "E101" for e in errs), errs
+
+
+@test("interp: assert_eq/assert_ne pass")
+def _():
+    out = run_src('assert_eq([1, 2], [1, 2])\n'
+                  'assert_eq({a: 1}, {a: 1})\n'
+                  'assert_ne(1, 2)\nprint("ok")\n')
+    eq(out.strip(), "ok")
+
+
+@test("interp: assert_eq failure renders values (E301)")
+def _():
+    e = raises_code(
+        lambda: run_src('assert_eq(1 + 1, 3)\n'), "E301")
+    assert "2 != 3" in e.message, e.message
+
+
+@test("interp: assert_ne failure renders value (E301)")
+def _():
+    e = raises_code(lambda: run_src('assert_ne("x", "x")\n'), "E301")
+    assert "both are x" in e.message, e.message
+
+
+@test("interp: argv() returns program args")
+def _():
+    out = run_src_argv('print(str(argv()))\n', ["a", "b c"])
+    eq(out.strip(), "[a, b c]")
+    out = run_src_argv('print(str(len(argv())))\n', [])
+    eq(out.strip(), "0")
+
+
+@test("fmt: test block round-trips")
+def _():
+    src = "test addition {\n    assert_eq(1 + 1, 2)\n}\n"
+    eq(format_source(src), src)
+
+
+@test("cli: misa test discovers, isolates, and reports")
+def _():
+    d = tempfile.mkdtemp(prefix="misa-test-")
+    try:
+        with open(os.path.join(d, "math_test.misa"), "w") as f:
+            f.write("test ok1 { assert_eq(1, 1) }\n"
+                    "test bad1 { assert_eq(1, 2) }\n")
+        with open(os.path.join(d, "test_str.misa"), "w") as f:
+            f.write("test ok2 { assert_ne(\"a\", \"b\") }\n"
+                    "test boom { throw {code: \"E1\", message: \"x\"} }\n")
+        with open(os.path.join(d, "not_a_test.txt"), "w") as f:
+            f.write("test nope { }\n")
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "test", d],
+            capture_output=True, text=True)
+        assert p.returncode == 1, p.stdout  # failures -> non-zero
+        assert "PASS  ok1" in p.stdout, p.stdout
+        assert "FAIL  bad1" in p.stdout, p.stdout
+        assert "E301: assert_eq failed: 1 != 2" in p.stdout, p.stdout
+        assert "PASS  ok2" in p.stdout, p.stdout
+        assert "FAIL  boom" in p.stdout, p.stdout  # throw doesn't kill run
+        assert "nope" not in p.stdout  # .txt not discovered
+        assert "2/4 tests passed" in p.stdout, p.stdout
+        # all-pass run exits 0
+        with open(os.path.join(d, "math_test.misa"), "w") as f:
+            f.write("test ok1 { assert_eq(1, 1) }\n")
+        os.remove(os.path.join(d, "test_str.misa"))
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "test", d],
+            capture_output=True, text=True)
+        assert p.returncode == 0, p.stdout
+        assert "1/1 tests passed" in p.stdout, p.stdout
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("cli: misa test --json is structured")
+def _():
+    d = tempfile.mkdtemp(prefix="misa-test-")
+    try:
+        with open(os.path.join(d, "a_test.misa"), "w") as f:
+            f.write("test ok { assert_eq(1, 1) }\n"
+                    "test bad { assert_eq(1, 2) }\n")
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "test", d, "--json"],
+            capture_output=True, text=True)
+        assert p.returncode == 1
+        data = json.loads(p.stdout)
+        assert len(data) == 2, data
+        by_name = {r["name"]: r for r in data}
+        assert by_name["ok"]["pass"] is True
+        assert by_name["ok"]["kind"] == "test"
+        assert by_name["bad"]["pass"] is False
+        assert "E301" in by_name["bad"]["message"]
+        assert by_name["bad"]["line"] == 2
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("cli: misa run -- forwards argv to the program")
+def _():
+    d = tempfile.mkdtemp(prefix="misa-test-")
+    try:
+        prog = os.path.join(d, "args.misa")
+        with open(prog, "w") as f:
+            f.write('for a in argv() { print("arg:" + a) }\n')
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "run", prog, "--", "x", "y z"],
+            capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        eq(p.stdout, "arg:x\narg:y z\n")
+        # no `--`: empty argv
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "run", prog],
+            capture_output=True, text=True)
+        eq(p.stdout, "")
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

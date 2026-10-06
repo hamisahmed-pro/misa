@@ -40,7 +40,7 @@ class Formatter:
     _DECLS = (ast.AppDecl, ast.ProviderDecl, ast.ModelsDecl, ast.TypeDecl,
               ast.TableDecl,
               ast.ModelDecl, ast.ScreenDecl, ast.EvalDecl, ast.FnDecl,
-              ast.ExternDecl, ast.ImportDecl)
+              ast.ExternDecl, ast.ImportDecl, ast.TestDecl)
 
     def format_item(self, item: ast.Node):
         # statements emit their own leading comments via format_stmt
@@ -144,6 +144,13 @@ class Formatter:
             self.w(f"runs: {item.runs},")
             self.ind -= 1
             self.w("}")
+        elif isinstance(item, ast.TestDecl):
+            self.w(f"test {item.name} {{")
+            self.ind += 1
+            for stmt in item.body:
+                self.format_stmt(stmt)
+            self.ind -= 1
+            self.w("}")
         elif isinstance(item, ast.FnDecl):
             params = ", ".join(f"{n}: {self.fmt_type(t)}"
                                for n, t in item.params)
@@ -153,6 +160,9 @@ class Formatter:
             head = f"fn {item.name}{tp}({params})"
             if item.ret is not None:
                 head += f" -> {self.fmt_type(item.ret)}"
+            # Phase 8 (overtake): checked `throws` signatures.
+            if item.throws:
+                head += f" throws {', '.join(item.throws)}"
             self.w(head + " {")
             self.ind += 1
             for st in item.body:

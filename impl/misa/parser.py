@@ -85,6 +85,12 @@ class Parser:
             return self.parse_screen()
         if k == "eval":
             return self.parse_eval()
+        # `test` is a contextual keyword: only `test <name> {` at the top
+        # level parses as a test block. Any other use of `test` (call,
+        # variable, assignment) falls through to parse_statement.
+        if (k == "IDENT" and self.peek().value == "test"
+                and self.peek(1).kind == "IDENT" and self.at("{", 2)):
+            return self.parse_test_decl()
         if k == "fn":
             return self.parse_fn_decl()
         if k == "extern":
@@ -566,6 +572,13 @@ class Parser:
                             expect=expect, runs=runs,
                             line=t.line, col=t.col)
 
+    def parse_test_decl(self) -> ast.TestDecl:
+        t = self.advance()  # the contextual `test` identifier
+        name = self.expect("IDENT", "test name").value
+        body = self.parse_block()
+        return ast.TestDecl(name=name, body=body,
+                            line=t.line, col=t.col)
+
     def parse_record_fields(self) -> list:
         self.expect("{", "'{'")
         fields = []
@@ -704,9 +717,26 @@ class Parser:
         if self.at("->"):
             self.advance()
             ret = self.parse_type_expr()
+        # Phase 8 (overtake): checked `throws` signatures, e.g.
+        # `fn fetch(u: Text) -> Text throws E304, E303`.
+        # `throws` is contextual (an IDENT here, not a keyword) so
+        # existing code using `throws` as an identifier keeps working.
+        throws: List[str] = []
+        throws_line, throws_col = 0, 0
+        if self.at("IDENT") and self.peek().value == "throws":
+            t_throws = self.advance()
+            throws_line, throws_col = t_throws.line, t_throws.col
+            while True:
+                ctok = self.expect_ident("error code (e.g. E304)")
+                throws.append(ctok.value)
+                if self.at(","):
+                    self.advance()
+                    continue
+                break
         body = self.parse_block()
         return ast.FnDecl(name=name, params=params, ret=ret, body=body,
-                          type_params=type_params,
+                          type_params=type_params, throws=throws,
+                          throws_line=throws_line, throws_col=throws_col,
                           line=t.line, col=t.col)
 
     def parse_extern_block(self) -> ast.ExternDecl:

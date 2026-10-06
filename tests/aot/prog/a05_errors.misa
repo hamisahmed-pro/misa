@@ -25,7 +25,7 @@ try {
     print("int-parse {e.code}")
 }
 
-fn risky(n: Int) -> Int {
+fn risky(n: Int) -> Int throws E111 {
     if n == 0 {
         throw {code: "E111", message: "zero!"}
     }

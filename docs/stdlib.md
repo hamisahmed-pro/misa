@@ -18,18 +18,33 @@ host AOT (Linux/macOS binary), Android (APK), iOS, web (Emscripten).
 | `int` | `int(x: Text) -> Int` | Parses; `E300` on failure. Wraps on overflow. |
 | `float` | `float(x: Text) -> Float` | Parses; `E300` on failure. |
 | `assert` | `assert(cond: Bool, msg: Text)` | Aborts with `E301` + msg if false. |
+| `assert_eq` | `assert_eq(a: any, b: any)` | Aborts with `E301` (`assert_eq failed: <a> != <b>`) if `a == b` is false. |
+| `assert_ne` | `assert_ne(a: any, b: any)` | Aborts with `E301` (`assert_ne failed: both are <a>`) if `a == b` is true. |
+| `argv` | `argv() -> [Text]` | CLI args minus program name (like `sys.argv[1:]`). Pass via `misa run prog.misa -- a b`; host AOT gets real OS argv; `[]` on Android/iOS/web. |
 | `env` | `env(name: Text) -> Text` | Env var; `E302` if unset. |
+| `builder` | `builder() -> Builder` | Create a `Text.Builder` for amortized O(1) string appends. |
 | `state` | `state(initial: T) -> T` | **Screens only.** Declares ephemeral per-screen-instance state; must be bound with `let`/`var` (`let c = state(0)`). Assigning re-renders the screen. E211 outside a screen body, unbound, in a handler/`for` body, or on type mismatch. |
+
+**`Text.Builder`:** repeated `s = s + x` in a loop is O(n²). Build with a `Builder` instead:
+
+```misa
+let b = builder()
+b.append("hello")
+b.append(42)          // any value; rendered canonically
+let s = b.build()     // "hello42"
+```
 
 ```misa
 print(str(42))        // 42
 print(len("hello"))   // 5
 print(int("42"))      // 42
 assert(1 + 1 == 2, "math broke")
+assert_eq([1, 2], [1, 2])
 print(env("HOME"))    // e.g. /home/you
+print(str(argv()))    // e.g. [hello, world] after `misa run prog.misa -- hello world`
 ```
 
-All platforms ✅.
+All platforms ✅ (`argv()` is `[]` on Android/iOS/web).
 
 ## Concurrency
 
@@ -179,14 +194,23 @@ Zero-dependency embedded database. `Db` is an opaque handle.
 | Function | Signature |
 |---|---|
 | `db.open` | `db.open(path: Text) -> Db` — `":memory:"` for transient DBs |
-| `db.exec` | `db.exec(db: Db, sql: Text, args: [any]?) -> Int` — rows changed; `?` placeholders |
+| `db.exec` | `db.exec(db: Db, sql: Text, args: [any]?) -> Int` — rows changed; `?` placeholders; statements cached |
 | `db.query` | `db.query(db: Db, sql: Text, args: [any]?) -> [record]` — list of column-name → value records |
 | `db.close` | `db.close(db: Db) -> Void` |
+| `db.exec_many` | `db.exec_many(db: Db, sql: Text, rows: [[any]]) -> Int` — bulk insert: prepare once, total rows changed |
+| `db.begin` | `db.begin(db: Db) -> Void` — begin explicit transaction |
+| `db.commit` | `db.commit(db: Db) -> Void` — commit |
+| `db.rollback` | `db.rollback(db: Db) -> Void` — roll back |
 
 ```misa
 let db = db.open(":memory:")
 db.exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
 db.exec(db, "INSERT INTO users (name) VALUES (?)", ["Hamis"])
+// Bulk inserts: 10× faster than looped db.exec
+db.begin(db)
+db.exec_many(db, "INSERT INTO users (name) VALUES (?)",
+             [["A"], ["B"], ["C"]])
+db.commit(db)
 let rows = db.query(db, "SELECT id, name FROM users")
 for r in rows {
     print("{r.id}: {r.name}")   // 1: Hamis

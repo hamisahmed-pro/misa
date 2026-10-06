@@ -56,8 +56,8 @@ An explicit `;` is also legal but the formatter never emits one.
 ```
 program     := item*
 item        := appDecl | providerDecl | modelsDecl | typeDecl
-             | modelDecl | screenDecl | evalDecl | fnDecl | importDecl
-             | tableDecl | externDecl | statement
+             | modelDecl | screenDecl | evalDecl | testDecl | fnDecl
+             | importDecl | tableDecl | externDecl | statement
 
 appDecl     := "app" IDENT "{" appField* "}"
 appField    := IDENT ":" literal ","?
@@ -90,8 +90,11 @@ typeExpr    := IDENT "?"? | "[" typeExpr "]" "?"?
              | "(" (typeExpr ("," typeExpr)*)? ")" "->" typeExpr "?"?
              // Phase 5a: function types, e.g. (Int, Text) -> Bool
 
-fnDecl      := "fn" IDENT typeParams? "(" params? ")" ("->" typeExpr)? "{" statement* "}"
+fnDecl      := "fn" IDENT typeParams? "(" params? ")" ("->" typeExpr)? throwsClause? "{" statement* "}"
              // Phase 5c: generic functions, e.g. fn first<T>(xs: [T]) -> T
+             // Phase 8: checked throws, e.g. fn fetch(u: Text) -> Text throws E304
+throwsClause:= "throws" IDENT ("," IDENT)*
+             // contextual keyword; each IDENT is an E-code like E304
 importDecl  := "import" STRING
 
 modelDecl   := "model" IDENT "(" params ")" "->" typeExpr
@@ -120,6 +123,10 @@ evalDecl    := "eval" IDENT "{"
                "given" ":" recordLit ","
                "expect" ":" expr ","
                "runs" ":" INT ","? "}"
+
+testDecl    := "test" IDENT "{" statement* "}"
+              // contextual keyword: `test` is not reserved; only
+              // `test <name> {` at the top level is a test block.
 
 statement   := letStmt | varStmt | assignStmt | ifStmt | forStmt
              | whileStmt | returnStmt | tryStmt | throwStmt | onStmt

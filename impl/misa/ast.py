@@ -153,6 +153,15 @@ class EvalDecl(Node):
 
 
 @dataclass
+class TestDecl(Node):
+    # `test <name> { ... }` — a unit test block. Parsed as a contextual
+    # keyword (`test` is not reserved): `test foo { }` at the top level
+    # is a TestDecl; `test` used any other way parses as an expression.
+    name: str = ""
+    body: List[Node] = field(default_factory=list)
+
+
+@dataclass
 class FnDecl(Node):
     name: str = ""
     params: List[Tuple[str, TypeExpr]] = field(default_factory=list)
@@ -160,6 +169,12 @@ class FnDecl(Node):
     body: List[Node] = field(default_factory=list)
     # Phase 5c: type parameters, e.g. `fn first<T>(xs: [T]) -> T`.
     type_params: List[str] = field(default_factory=list)
+    # Phase 8 (overtake): checked `throws` signatures, e.g.
+    # `fn fetch(u: Text) -> Text throws E304`. The declared E-codes
+    # (as written); empty = no clause (strict: uncaught codes error).
+    throws: List[str] = field(default_factory=list)
+    throws_line: int = 0
+    throws_col: int = 0
 
 
 @dataclass

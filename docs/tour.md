@@ -188,10 +188,29 @@ print(unwrap(bad, 0))               // 0
 Type parameters are unconstrained in v1 (no `where` clauses). The AOT
 compiler monomorphizes — one specialization per concrete type tuple.
 
-## Errors: `try` / `catch` / `throw`
+## Errors: `try` / `catch` / `throw` / `throws`
 
 Runtime, I/O, HTTP, model, and budget failures surface as catchable
-`Error` values (`{code, message}`):
+`Error` values (`{code, message}`). Error *codes* are part of the
+function signature — the checker verifies them (E227 otherwise):
+
+```misa
+fn load(path: Text) -> Text throws E303 {
+    var out = ""
+    try {
+        out = fs.read(path)   // E303: caught, so no `throws` needed...
+    } catch e {
+        print("failed [{e.code}]: {e.message}")
+        out = "fallback"
+    }
+    return out
+}
+```
+
+Wait — `fs.read` is inside `try`, so why does `load` declare
+`throws E303`? It doesn't need to! `catch` is total: it discharges
+every code raised in the `try` body. This version is clean without
+the clause:
 
 ```misa
 fn load(path: Text) -> Text {
@@ -206,11 +225,23 @@ fn load(path: Text) -> Text {
 }
 ```
 
-Custom errors with `throw` (the value must be an `Error` — E212
-otherwise):
+But when the error *escapes* the function, you must declare it:
 
 ```misa
-fn need_positive(n: Int) -> Int {
+fn fetch(u: Text) -> Text throws E304 {
+    return http.get(u)   // E304 escapes: declared in the signature
+}
+
+fn load2(u: Text) -> Text {
+    return fetch(u)      // E227: unhandled E304 — declare or catch
+}
+```
+
+Custom errors with `throw` (the value must be an `Error` — E212
+otherwise; the thrown code is tracked like any other):
+
+```misa
+fn need_positive(n: Int) -> Int throws EBAD {
     if n <= 0 {
         throw { code: "EBAD", message: "need a positive number" }
     }
@@ -224,6 +255,13 @@ try {
 }
 // caught EBAD: need a positive number
 ```
+
+The rules in one paragraph: the checker infers every function's
+throws set (which E-codes its body may raise). At each call, `throw`,
+or `await`, the raised codes must be declared in the enclosing
+function's `throws` clause or caught by `try`. Calls are checked;
+operators (`/`, `[i]`) are unchecked by design. `misa check --json`
+prints the per-function throws graph (`declared` + `inferred`).
 
 Static errors (E0xx–E2xx) are compile-time and cannot be caught.
 
@@ -424,6 +462,57 @@ screen's `state()` bindings. A few rules:
   SQLite (`db.*`).
 - Like React hooks, state slots are source-ordered: don't conditionally
   reorder `state()` declarations between renders.
+
+## Testing
+
+Unit tests live in `*_test.misa` (or `test_*.misa`) files as `test` blocks.
+`test` is a contextual keyword — `test` used as a variable or call still
+parses normally; only `test <name> {` at the top level is a test block.
+
+```misa
+fn add(a: Int, b: Int) -> Int {
+    return a + b
+}
+
+test addition {
+    assert_eq(add(2, 3), 5)
+    assert_ne(add(2, 2), 5)
+    assert(add(0, 0) == 0)
+}
+```
+
+- `assert_eq(a, b)` / `assert_ne(a, b)` abort with `E301` and render both
+  values: `assert_eq failed: 2 != 3`.
+- Each test runs in a **fresh interpreter**: top-level statements re-run
+  per test, so shared `var` fixtures reset. A failing test never kills
+  the run. Test bodies can see top-level bindings (unlike `fn` bodies).
+- `misa test [path]` discovers test files (a directory is walked
+  recursively), prints `PASS`/`FAIL` per test plus a summary
+  (`12 passed, 2 failed`), and exits non-zero on failure.
+- `misa test --json` emits structured results
+  (`kind`/`name`/`file`/`line`/`pass`/`message`) — the red/green loop
+  contract for agents.
+- Model `eval` blocks keep working: `misa test` runs them too, reported
+  as `eval` results.
+
+## Command-line arguments
+
+`argv()` returns the program's command-line arguments as `[Text]`,
+excluding the program name (like Python's `sys.argv[1:]`):
+
+```misa
+for arg in argv() {
+    print("arg: " + arg)
+}
+```
+
+```sh
+misa run prog.misa -- hello world   # argv() == ["hello", "world"]
+```
+
+Args after `--` go to the program; without `--` the program sees `[]`.
+Host AOT binaries receive the real OS argv. On Android/iOS/web there is
+no CLI, so `argv()` is `[]` there.
 
 ## What's next
 

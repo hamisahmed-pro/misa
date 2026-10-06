@@ -15,7 +15,7 @@ PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void",
               # passed back to C and compared to nil, never dereferenced.
               "Ptr"}
 MEDIA = {"Photo", "Audio", "Video", "Document"}
-SPECIAL = {"TokenStream", "Embedding", "Db"}
+SPECIAL = {"TokenStream", "Embedding", "Db", "Builder"}
 # Phase 7 (concurrency): builtin generic type names, exactly 1 type
 # argument (like List<T>). `Task<Text>`, `Chan<Int>` are valid
 # annotations; bare `Task`/`Chan` is an error (E221, suggesting the
@@ -28,12 +28,19 @@ BUILTINS = {
     "int": (["Text"], "Int"),
     "float": (["Text"], "Float"),
     "assert": (["Bool"], "Text"),
+    "assert_eq": (["any", "any"], "Bool"),
+    "assert_ne": (["any", "any"], "Bool"),
+    "argv": ([], "[Text]"),
     "env": (["Text"], "Text"),
     "navigate": (["any"], "Text"),
+    # Text.Builder: amortized O(1) string building (perf gap P-1).
+    "builder": ([], "Builder"),
 }
 BUILTIN_ARITY = {
     "print": (1, 1), "len": (1, 1), "str": (1, 1), "int": (1, 1),
-    "float": (1, 1), "assert": (1, 2), "env": (1, 1), "navigate": (1, 1),
+    "float": (1, 1), "assert": (1, 2), "assert_eq": (2, 2),
+    "assert_ne": (2, 2), "argv": (0, 0),
+    "env": (1, 1), "navigate": (1, 1), "builder": (0, 0),
 }
 # namespaced builtins: name -> (param types, return type)
 NS_BUILTINS = {
@@ -58,6 +65,14 @@ NS_BUILTINS = {
     "db.exec": (["Db", "Text", "[any]"], "Int"),
     "db.query": (["Db", "Text", "[any]"], "[record]"),
     "db.close": (["Db"], "Void"),
+    # P-3: bulk inserts + explicit transactions.
+    "db.exec_many": (["Db", "Text", "[[any]]"], "Int"),
+    "db.begin": (["Db"], "Void"),
+    "db.commit": (["Db"], "Void"),
+    "db.rollback": (["Db"], "Void"),
+    # Text.Builder methods (method-style `b.append(s)` desugars to these).
+    "builder.append": (["Builder", "any"], "Void"),
+    "builder.build": (["Builder"], "Text"),
     # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
     "json.parse": (["Text"], "unknown"),
     "json.stringify": (["any"], "Text"),
@@ -79,6 +94,61 @@ NS_BUILTINS = {
 NS_BUILTIN_ARITY = {
     "db.exec": (2, 3),
     "db.query": (2, 3),
+}
+
+# Phase 8 (overtake): checked `throws` signatures — known E-code sets for
+# builtins. CALLS are checked; OPERATORS (div, index, field access) are
+# unchecked, panic-like, à la Rust's Result-vs-panic split. This avoids
+# the Java verbosity trap: `xs[0]` never forces a `throws` clause.
+# Absent from this table = throws nothing (∅).
+BUILTIN_THROWS = {
+    # HTTP / network
+    "http.get": frozenset({"E304"}),
+    "http.post": frozenset({"E304"}),
+    "http.post_json": frozenset({"E304"}),
+    "fetch_all": frozenset({"E304"}),
+    # I/O
+    "fs.read": frozenset({"E303"}),
+    "fs.write": frozenset({"E303"}),
+    "process.run": frozenset({"E303"}),
+    # Database
+    "db.open": frozenset({"E303"}),
+    "db.exec": frozenset({"E303"}),
+    "db.query": frozenset({"E303"}),
+    "db.close": frozenset({"E303"}),
+    "db.exec_many": frozenset({"E303"}),
+    "db.begin": frozenset({"E303"}),
+    "db.commit": frozenset({"E303"}),
+    "db.rollback": frozenset({"E303"}),
+    # Parsing / conversion (E300 from calls is checked; E300 from
+    # operators like `/` and `[i]` is unchecked by design)
+    "json.parse": frozenset({"E300"}),
+    "json.stringify": frozenset({"E300"}),
+    "int": frozenset({"E300"}),
+    "float": frozenset({"E300"}),
+    "str.slice": frozenset({"E300"}),
+    "str.starts_with": frozenset({"E300"}),
+    "str.split": frozenset({"E300"}),
+    "str.chars": frozenset({"E300"}),
+    "str.trim": frozenset({"E300"}),
+    "str.ord": frozenset({"E300"}),
+    "str.chr": frozenset({"E300"}),
+    "time.parse": frozenset({"E300"}),
+    "time.format": frozenset({"E300"}),
+    "math.sqrt": frozenset({"E300"}),
+    "math.pow": frozenset({"E300"}),
+    "math.abs": frozenset({"E300"}),
+    "math.floor": frozenset({"E300"}),
+    "math.ceil": frozenset({"E300"}),
+    "math.round": frozenset({"E300"}),
+    # Environment / concurrency
+    "env": frozenset({"E302"}),
+    "sleep": frozenset({"E306"}),
+    "chan.recv": frozenset({"E306"}),
+    # Note: print/len/str/time.now/time.now_ms/navigate → ∅.
+    # `assert` → ∅ (unchecked by design: assert failure signals a
+    # programmer bug, like Rust's panic, not a domain error).
+    # `ch.send` / `close` / `chan` → ∅ (unbounded, never block/fail).
 }
 
 LAYOUT_COMPONENTS = {"Column", "Row"}
@@ -124,6 +194,7 @@ class Checker:
         self.aliases: Dict[str, tuple] = {}  # alias -> (provider, model_id)
         self.screens: Dict[str, ast.ScreenDecl] = {}
         self.evals: Dict[str, ast.EvalDecl] = {}
+        self.tests: Dict[str, ast.TestDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
         # Phase 7: extern (FFI) functions: name -> FnDecl (signature
         # only), plus name -> library string.
@@ -148,6 +219,16 @@ class Checker:
         self.tables: Dict[str, ast.TableDecl] = {}
         # Phase 5 (DB): counter for synthetic query-result record types.
         self._query_seq = 0
+        # Phase 8 (overtake): checked `throws` signatures.
+        # _declared: fn name -> frozenset of declared E-codes (from the
+        #   `throws` clause; absent = no clause = strict ∅).
+        # _inferred: fn name -> frozenset of E-codes the body may raise
+        #   (fixed-point over the call graph).
+        # throws_graph: public; fn name -> {"declared": [...],
+        #   "inferred": [...]} for `misa check --json`.
+        self._declared: Dict[str, frozenset] = {}
+        self._inferred: Dict[str, frozenset] = {}
+        self.throws_graph: Dict[str, dict] = {}
 
     # -- diagnostics ----------------------------------------------------
 
@@ -162,9 +243,19 @@ class Checker:
               file_of: Optional[Dict[int, str]] = None) -> List[dict]:
         self._file_of = file_of
         self._collect(prog)
+        # Phase 8 (overtake): checked `throws` — collect declared sets,
+        # run the inference fixed-point, then verify bodies.
+        self._collect_throws(prog)
+        self._infer_throws_fixpoint()
         scope: Dict[str, tuple] = {}  # global scope persists across items
         for item in prog.items:
             self._check_item(item, scope)
+        self._verify_throws(prog)
+        self.throws_graph = {
+            name: {"declared": sorted(self._declared.get(name, ())),
+                   "inferred": sorted(self._inferred.get(name, ()))}
+            for name in self.fns
+        }
         return self.errors
 
     def _collect(self, prog: ast.Program):
@@ -193,6 +284,8 @@ class Checker:
                 self._dup(self.screens, item.name, item, "screen")
             elif isinstance(item, ast.EvalDecl):
                 self._dup(self.evals, item.name, item, "eval")
+            elif isinstance(item, ast.TestDecl):
+                self._dup(self.tests, item.name, item, "test")
             elif isinstance(item, ast.FnDecl):
                 self._dup(self.fns, item.name, item, "function")
             elif isinstance(item, ast.ExternDecl):
@@ -227,6 +320,8 @@ class Checker:
             self._check_screen(item)
         elif isinstance(item, ast.EvalDecl):
             self._check_eval(item)
+        elif isinstance(item, ast.TestDecl):
+            self._check_test(item, scope)
         elif isinstance(item, ast.FnDecl):
             self._check_fn(item)
         elif isinstance(item, ast.ExternDecl):
@@ -332,6 +427,322 @@ class Checker:
                        eline, ecol,
                        hint="every code path must end in 'return'")
         self._tparams = saved_tparams
+
+    # -- checked throws (Phase 8 overtake) --------------------------------
+
+    # E-codes are E followed by uppercase alphanumerics: builtin E303,
+    # E304, ... and custom codes like EBAD, ELOAD (see SEMANTICS.md §4).
+    _THROWS_CODE_RE = re.compile(r"^E[A-Z0-9]+$")
+
+    def _collect_throws(self, prog: ast.Program):
+        """Parse `throws` clauses into declared E-code sets. A malformed
+        code is E227."""
+        self._declared = {}
+        for item in prog.items:
+            if isinstance(item, ast.FnDecl) and item.throws:
+                codes = []
+                for c in item.throws:
+                    if not self._THROWS_CODE_RE.match(c):
+                        self.error(
+                            "E227",
+                            f"unknown error code '{c}' in throws clause "
+                            f"(expected like E304 or EBAD)",
+                            item.throws_line or item.line,
+                            item.throws_col or item.col,
+                            hint="E-codes start with E followed by "
+                                 "uppercase letters/digits")
+                    else:
+                        codes.append(c)
+                self._declared[item.name] = frozenset(codes)
+
+    def _effective_throws(self, name: str) -> frozenset:
+        """A callee's throws set: its declared clause wins, else the
+        inferred set (fixed-point)."""
+        if name in self._declared:
+            return self._declared[name]
+        return self._inferred.get(name, frozenset())
+
+    def _infer_throws_fixpoint(self):
+        """Fixed-point inference of every function's throws set. Sets
+        only grow and E-codes are a small closed set, so this terminates."""
+        self._inferred = {name: frozenset() for name in self.fns}
+        changed = True
+        while changed:
+            changed = False
+            for name, fn in self.fns.items():
+                s = self._throws_of_fn_body(fn, emit=False)
+                if s != self._inferred[name]:
+                    self._inferred[name] = s
+                    changed = True
+
+    def _verify_throws(self, prog: ast.Program):
+        """Check every function body: uncaught codes must be declared."""
+        for _name, fn in self.fns.items():
+            self._throws_of_fn_body(fn, emit=True)
+        # Screens are exempt in v1 (like top-level statements): screen
+        # handlers are inline lambdas, and the v1 limitation for those
+        # applies. Requiring try/catch in every UI handler would be the
+        # Java verbosity trap in the layer where handlers are most
+        # pervasive.
+
+    # -- throws walk -----------------------------------------------------
+
+    def _throws_ctx(self, fn_name: str, declared: frozenset,
+                    emit: bool) -> dict:
+        return {
+            "fn_name": fn_name,    # for error messages
+            "declared": declared,  # this fn's declared set
+            "emit": emit,          # emit E227?
+            "in_try": False,       # inside a try body (all discharged)
+            # name -> ("lambda"|"task"|"stream", frozenset): let-bound
+            # closures, spawn tasks, and stream vars in this scope.
+            "var_throws": {},
+            # catch var name -> the try body's throws set (for rethrow).
+            "catch": {},
+        }
+
+    def _child_ctx(self, ctx: dict, **over) -> dict:
+        c = dict(ctx)
+        c["var_throws"] = dict(ctx["var_throws"])
+        c["catch"] = dict(ctx["catch"])
+        c.update(over)
+        return c
+
+    def _throws_of_fn_body(self, fn: ast.FnDecl, emit: bool) -> frozenset:
+        declared = self._declared.get(fn.name, frozenset())
+        ctx = self._throws_ctx(fn.name, declared, emit)
+        # Task-typed params: awaiting them may raise E306 (timeout /
+        # cancel); the task's own codes are unknowable (v1 limitation).
+        for pn, te in fn.params:
+            tn = self._tname(te)
+            if tn == "Task" or tn.startswith("Task<"):
+                ctx["var_throws"][pn] = ("task", frozenset({"E306"}))
+        return self._throws_stmts(fn.body, ctx)
+
+    def _throws_stmts(self, stmts: list, ctx: dict) -> frozenset:
+        out = set()
+        for s in stmts:
+            out |= self._throws_stmt(s, ctx)
+        return frozenset(out)
+
+    def _check_unhandled(self, node, raised: frozenset, ctx: dict,
+                         what: str):
+        """E227 when a site raises codes the function neither declares
+        nor catches."""
+        if not ctx["emit"] or ctx.get("in_try"):
+            return
+        unhandled = raised - ctx["declared"]
+        if unhandled:
+            codes = ", ".join(sorted(unhandled))
+            self.error(
+                "E227",
+                f"unhandled {codes} from {what} — '{ctx['fn_name']}' "
+                f"must declare 'throws {codes}' or catch it",
+                node.line, node.col,
+                hint="add a throws clause to the function signature "
+                     "or wrap the call in try/catch")
+
+    def _throws_stmt(self, s: ast.Node, ctx: dict) -> frozenset:
+        if isinstance(s, ast.LetStmt):
+            # `let t = spawn {...}` / `let f = (...) => ...`: infer the
+            # block's set now so later `await t` / `f()` sites can check
+            # it (closures infer; named functions are strict).
+            if isinstance(s.value, (ast.Lambda, ast.Spawn)):
+                bset = self._throws_lambda_block(s.value, ctx)
+                kind = ("task" if isinstance(s.value, ast.Spawn)
+                        else "lambda")
+                ctx["var_throws"][s.name] = (kind, bset)
+            return self._throws_expr(s.value, ctx)
+        if isinstance(s, ast.ExprStmt):
+            return self._throws_expr(s.expr, ctx)
+        if isinstance(s, ast.ReturnStmt):
+            return (self._throws_expr(s.value, ctx)
+                    if s.value is not None else frozenset())
+        if isinstance(s, ast.AssignStmt):
+            return self._throws_expr(s.value, ctx)
+        if isinstance(s, ast.IfStmt):
+            c = self._throws_expr(s.cond, ctx)
+            t = self._throws_stmts(s.then, self._child_ctx(ctx))
+            e = self._throws_stmts(s.els, self._child_ctx(ctx))
+            return c | t | e
+        if isinstance(s, ast.WhileStmt):
+            return (self._throws_expr(s.cond, ctx)
+                    | self._throws_stmts(s.body, self._child_ctx(ctx)))
+        if isinstance(s, ast.ForStmt):
+            return (self._throws_expr(s.iter, ctx)
+                    | self._throws_stmts(s.body, self._child_ctx(ctx)))
+        if isinstance(s, ast.TryStmt):
+            # The try body is fully discharged (Misa catch is total);
+            # only the handler's codes escape.
+            body_set = self._throws_stmts(
+                s.body, self._child_ctx(ctx, in_try=True))
+            hctx = self._child_ctx(ctx)
+            hctx["catch"][s.catch_var] = body_set
+            return self._throws_stmts(s.handler, hctx)
+        if isinstance(s, ast.ThrowStmt):
+            tset = self._throw_set(s, ctx)
+            self._check_unhandled(s, tset, ctx, "throw")
+            return tset
+        if isinstance(s, ast.OnStmt):
+            t = self._throws_expr(s.stream, ctx)
+            if s.handler is not None:
+                self._throws_lambda_block(s.handler, ctx)
+            return t
+        if isinstance(s, ast.StreamDecl):
+            # `stream s = model(...)` performs the model call.
+            t = self._throws_expr(s.call, ctx)
+            ctx["var_throws"][s.name] = ("stream", frozenset({"E400"}))
+            self._check_unhandled(s, t, ctx, "model call")
+            return t
+        return self._throws_generic_stmt(s, ctx)
+
+    def _throws_generic_stmt(self, s: ast.Node, ctx: dict) -> frozenset:
+        """Best-effort walk for statement types without dedicated
+        handling (screen DSL nodes)."""
+        out = set()
+        if isinstance(s, ast.ScreenIf):
+            out |= self._throws_expr(s.cond, ctx)
+            out |= self._throws_stmts(s.then, self._child_ctx(ctx))
+            out |= self._throws_stmts(s.els, self._child_ctx(ctx))
+        elif isinstance(s, ast.ScreenFor):
+            out |= self._throws_expr(s.iter, ctx)
+            out |= self._throws_stmts(s.body, self._child_ctx(ctx))
+        elif isinstance(s, ast.Component):
+            for _, v in s.args:
+                out |= self._throws_expr(v, ctx)
+            for ch in s.children:
+                out |= self._throws_generic_stmt(ch, ctx)
+        return frozenset(out)
+
+    def _throws_lambda_block(self, node: ast.Node, ctx: dict) -> frozenset:
+        """Infer a lambda/spawn/on-handler block's throws set. No
+        declared set exists for these, so nothing is emitted — the set
+        is for the consumer (`f()` / `await t`)."""
+        sub = self._child_ctx(ctx, declared=frozenset(), emit=False,
+                              in_try=False)
+        if isinstance(node, ast.Lambda):
+            body = node.body
+            if node.expr_body is not None:
+                return self._throws_expr(node.expr_body, sub)
+            return self._throws_stmts(body, sub)
+        # ast.Spawn
+        return self._throws_stmts(node.body, sub)
+
+    def _throw_set(self, s: ast.ThrowStmt, ctx: dict) -> frozenset:
+        """The E-codes a `throw` statement may raise."""
+        v = s.value
+        if isinstance(v, ast.RecordLit):
+            for fname, fval in v.fields:
+                if fname == "code" and isinstance(fval, ast.StrLit) \
+                        and len(fval.parts) == 1 \
+                        and isinstance(fval.parts[0], str):
+                    return frozenset({fval.parts[0]})
+            return frozenset({"E300"})
+        if isinstance(v, ast.Ident) and v.name in ctx["catch"]:
+            return ctx["catch"][v.name]
+        return frozenset({"E300"})
+
+    def _throws_expr(self, e: ast.Node, ctx: dict) -> frozenset:
+        if e is None:
+            return frozenset()
+        if isinstance(e, ast.Call):
+            return self._throws_call(e, ctx)
+        if isinstance(e, ast.Await):
+            return self._throws_await(e, ctx)
+        if isinstance(e, (ast.Lambda, ast.Spawn)):
+            # Inline (not let-bound): the set can't be tracked to a
+            # consumer, so it contributes nothing here.
+            return frozenset()
+        if isinstance(e, ast.Match):
+            out = self._throws_expr(e.scrutinee, ctx)
+            for arm in e.arms:
+                out |= self._throws_expr(arm.body, ctx)
+            return out
+        if isinstance(e, ast.BinOp):
+            return (self._throws_expr(e.left, ctx)
+                    | self._throws_expr(e.right, ctx))
+        if isinstance(e, ast.UnOp):
+            return self._throws_expr(e.operand, ctx)
+        if isinstance(e, ast.Field):
+            return self._throws_expr(e.obj, ctx)
+        if isinstance(e, ast.Index):
+            return (self._throws_expr(e.obj, ctx)
+                    | self._throws_expr(e.idx, ctx))
+        if isinstance(e, ast.ListLit):
+            out = set()
+            for i in e.items:
+                out |= self._throws_expr(i, ctx)
+            return frozenset(out)
+        if isinstance(e, ast.RecordLit):
+            out = set()
+            for _, v in e.fields:
+                out |= self._throws_expr(v, ctx)
+            return frozenset(out)
+        if isinstance(e, ast.MapLit):
+            out = set()
+            for _, v in e.entries:
+                out |= self._throws_expr(v, ctx)
+            return frozenset(out)
+        if isinstance(e, ast.StrLit):
+            out = set()
+            for p in e.parts:
+                if isinstance(p, ast.Node):
+                    out |= self._throws_expr(p, ctx)
+            return frozenset(out)
+        # Literals, Ident, and everything else: no throws.
+        return frozenset()
+
+    def _throws_call(self, e: ast.Call, ctx: dict) -> frozenset:
+        # Argument expressions are evaluated at this site.
+        total = set()
+        for a in e.args:
+            total |= self._throws_expr(a, ctx)
+        if e.callee is not None:
+            # Calling the result of an expression — v1: untracked
+            # (documented limitation).
+            what = "call"
+            cset = frozenset()
+        elif e.name in self.models:
+            what, cset = f"model call '{e.name}'", frozenset({"E400"})
+        elif e.name in self.fns:
+            what = f"call to '{e.name}'"
+            cset = self._effective_throws(e.name)
+        elif e.name in self.externs:
+            what, cset = (f"extern call '{e.name}'",
+                          frozenset({"E226"}))
+        elif e.name in BUILTIN_THROWS:
+            what, cset = f"call to '{e.name}'", BUILTIN_THROWS[e.name]
+        elif e.name in ctx["var_throws"]:
+            kind, vset = ctx["var_throws"][e.name]
+            # Only lambda-bound vars are callable here (task/stream
+            # vars would already be E215 in the main pass).
+            what, cset = (f"call to '{e.name}'",
+                          vset if kind == "lambda" else frozenset())
+        else:
+            what, cset = f"call to '{e.name}'", frozenset()
+        total |= cset
+        self._check_unhandled(e, total, ctx, what)
+        return frozenset(total)
+
+    def _throws_await(self, e: ast.Await, ctx: dict) -> frozenset:
+        total = set(self._throws_expr(e.operand, ctx))
+        if e.timeout is not None:
+            total |= self._throws_expr(e.timeout, ctx)
+        task_set = frozenset()
+        if isinstance(e.operand, ast.Ident):
+            entry = ctx["var_throws"].get(e.operand.name)
+            if entry is not None:
+                kind, vset = entry
+                if kind == "task":
+                    # E306 (timeout/cancel) is always possible on await.
+                    task_set = vset | {"E306"}
+                elif kind == "stream":
+                    task_set = frozenset({"E400"})
+            # Unknown operand: the main pass already reported E205/E101;
+            # default to ∅ to avoid cascading.
+        total |= task_set
+        self._check_unhandled(e, frozenset(total), ctx, "await")
+        return frozenset(total)
 
     @staticmethod
     def _block_returns(stmts: list) -> bool:
@@ -593,6 +1004,14 @@ class Checker:
         if t != "Bool":
             self.error("E204", "'expect' must be a Bool expression",
                        e.expect.line, e.expect.col)
+
+    def _check_test(self, t: ast.TestDecl, scope: dict):
+        # A test body type-checks like a Void function body (bare
+        # `return` = early pass), but unlike fn bodies it CAN see
+        # top-level bindings — fixtures live at the top level. Each
+        # test runs in a fresh interpreter, so shared `var` state is
+        # reset per test (isolation without boilerplate).
+        self._check_block(t.body, dict(scope), fn_ret="Void")
 
     # -- statements -----------------------------------------------------
 
@@ -1240,6 +1659,17 @@ class Checker:
                     and field in ("send", "recv", "close"):
                 e.name = {"send": "chan.send", "recv": "chan.recv",
                           "close": "close"}[field]
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+        # Text.Builder: `b.append(s)` / `b.build()` where the receiver
+        # variable has type Builder rewrites to `builder.append` /
+        # `builder.build`, prepending the receiver (same trick as Chan).
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if recv in scope and scope[recv][0] == "Builder" \
+                    and field in ("append", "build"):
+                e.name = f"builder.{field}"
                 e.args.insert(0, ast.Ident(name=recv, line=e.line,
                                            col=e.col))
         # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.

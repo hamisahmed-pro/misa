@@ -39,6 +39,7 @@ enum {
     M_TAG_PTR    = 12,  /* Phase 7: opaque C pointer (FFI `Ptr`) */
     M_TAG_TASK   = 13,  /* Phase 7: Task<T> handle (wraps MisaTask*) */
     M_TAG_CHAN   = 14,  /* Phase 7: Chan<T> handle (wraps MisaChan*) */
+    M_TAG_BUILDER = 15, /* Text.Builder handle (wraps Str*) */
 };
 
 /* Media kinds. */
@@ -82,6 +83,9 @@ MVal *misa_bool(int v);
 MVal *misa_null(void);
 MVal *misa_text(const char *bytes, size_t len);  /* copies bytes */
 MVal *misa_text_cstr(const char *s);             /* copies NUL string */
+MVal *misa_builder_new(void);                    /* Text.Builder handle */
+void  misa_builder_append(MVal *b, MVal *v, int line, int col);
+MVal *misa_builder_build(MVal *b, int line, int col);
 MVal *misa_list_new(void);
 void  misa_list_push(MVal *list, MVal *item);
 MVal *misa_map_new(void);
@@ -162,6 +166,10 @@ MVal *misa_builtin_str(MVal *v);
 MVal *misa_builtin_int(MVal *v, int line, int col);
 MVal *misa_builtin_float(MVal *v, int line, int col);
 MVal *misa_builtin_assert(MVal *cond, MVal *msg, int line, int col);
+MVal *misa_builtin_assert_eq(MVal *a, MVal *b, int line, int col);
+MVal *misa_builtin_assert_ne(MVal *a, MVal *b, int line, int col);
+void  misa_argv_init(int argc, char **argv);
+MVal *misa_builtin_argv(void);
 MVal *misa_builtin_env(const char *name, int line, int col);
 MVal *misa_builtin_media(int kind, MVal *path, int line, int col);
 
@@ -231,6 +239,12 @@ MVal *misa_db_exec(MVal *h, MVal *sql, MVal *args,
 MVal *misa_db_query(MVal *h, MVal *sql, MVal *args,
                     int line, int col);                      /* E303 */
 MVal *misa_db_close(MVal *h, int line, int col);              /* E303 */
+/* P-3: bulk inserts + explicit transactions. */
+MVal *misa_db_exec_many(MVal *h, MVal *sql, MVal *rows,
+                        int line, int col);                   /* E303 */
+MVal *misa_db_begin(MVal *h, int line, int col);               /* E303 */
+MVal *misa_db_commit(MVal *h, int line, int col);              /* E303 */
+MVal *misa_db_rollback(MVal *h, int line, int col);            /* E303 */
 
 /* -- screens (text preview tree, same as the interpreter) ------------- */
 /* Emitter filters out `id` args at compile time. */

@@ -14,7 +14,26 @@ as Phase 6 (self-hosting) prerequisites.
 | `int` | `int(x: Text) -> Int` | Parse; error `E300` on failure. |
 | `float` | `float(x: Text) -> Float` | Parse; error `E300` on failure. |
 | `assert` | `assert(cond: Bool, msg: Text)` | Abort with `E301` and `msg` if `cond` is false. |
+| `assert_eq` | `assert_eq(a: any, b: any)` | Abort with `E301` (`assert_eq failed: <a> != <b>`) if `a == b` is false. |
+| `assert_ne` | `assert_ne(a: any, b: any)` | Abort with `E301` (`assert_ne failed: both are <a>`) if `a == b` is true. |
+| `argv` | `argv() -> [Text]` | Command-line arguments, excluding the program name (like Python's `sys.argv[1:]`). Pass them after `--`: `misa run prog.misa -- foo bar`. Host AOT binaries receive the real OS argv; on Android/iOS/web `argv()` is `[]` (those platforms have no CLI). |
 | `env` | `env(name: Text) -> Text` | Environment variable; error `E302` if unset. |
+| `builder` | `builder() -> Builder` | Create a `Text.Builder` for amortized O(1) string appends (see below). |
+
+### `Text.Builder` (P-1)
+
+Repeated `s = s + x` in a loop is O(n²). `Text.Builder` appends in amortized O(1) via exponential overallocation:
+
+| Method | Signature | Description |
+|---|---|---|
+| `append` | `b.append(x: any) -> Void` | Append the canonical rendering of `x`. |
+| `build` | `b.build() -> Text` | Concatenate all parts into a single `Text`. |
+
+```misa
+let b = builder()
+for x in items { b.append(x) }
+let s = b.build()
+```
 
 ## 2. Filesystem (`fs` namespace)
 
@@ -90,11 +109,15 @@ SQLite, zero dependencies. `Db` is an opaque handle type.
 | Function | Signature | Description |
 |---|---|---|
 | `db.open` | `db.open(path: Text) -> Db` | Open (creating if needed) a SQLite database; `":memory:"` for transient DBs. |
-| `db.exec` | `db.exec(db: Db, sql: Text, args: [any]?) -> Int` | Run a statement; returns rows changed. `?` placeholders bound from `args` (Int/Float/Bool/Text/nil). |
+| `db.exec` | `db.exec(db: Db, sql: Text, args: [any]?) -> Int` | Run a statement; returns rows changed. `?` placeholders bound from `args` (Int/Float/Bool/Text/nil). Prepared statements are cached per connection. |
 | `db.query` | `db.query(db: Db, sql: Text, args: [any]?) -> [record]` | Run a SELECT; returns a list of records (column name → value). INTEGER→Int, REAL→Float, TEXT→Text, NULL→nil; BLOB is an E303 error in v1. |
-| `db.close` | `db.close(db: Db) -> Void` | Close the handle. |
+| `db.close` | `db.close(db: Db) -> Void` | Close the handle (finalizes cached statements). |
+| `db.exec_many` | `db.exec_many(db: Db, sql: Text, rows: [[any]]) -> Int` | Bulk exec: prepare once, bind+step each row. Returns total rows changed. |
+| `db.begin` | `db.begin(db: Db) -> Void` | Begin an explicit transaction. |
+| `db.commit` | `db.commit(db: Db) -> Void` | Commit the explicit transaction. |
+| `db.rollback` | `db.rollback(db: Db) -> Void` | Roll back the explicit transaction. |
 
-All four throw `Error{code: "E303"}` on SQLite failures.
+All eight throw `Error{code: "E303"}` on SQLite failures.
 
 **Typed queries.** Declare schemas with `table`; the checker validates
 table/column names in `db.query` SQL at compile time (E224) and infers

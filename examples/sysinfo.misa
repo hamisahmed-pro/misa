@@ -43,7 +43,7 @@ fn or_unset(v: Text) -> Text {
 }
 
 // --- Report ------------------------------------------------------------------------
-fn main() -> Void {
+fn main() -> Void throws E226, E300, E303 {
   let login = getlogin()
   let home = getenv("HOME")
   let shell = getenv("SHELL")

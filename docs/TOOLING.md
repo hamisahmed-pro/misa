@@ -10,8 +10,8 @@ and byte-stable, and the language server speaks standard LSP.
 |---|---|
 | `misa check <f.misa> [--json]` | Type/name check. `--json` emits `[{code, message, line, col, hint}]` — the machine-readable contract. |
 | `misa fmt <f.misa> [--write]` | Canonical formatter (4-space, K&R, one blank line between items). |
-| `misa run <f.misa> [--mock m.json]` | Interpret with hot-reload semantics. |
-| `misa test <f.misa> [--mock m.json]` | Run `eval` blocks (AI evals as tests). |
+| `misa run <f.misa> [--mock m.json]` | Interpret with hot-reload semantics. Args after `--` go to the program's `argv()`. |
+| `misa test [path] [--mock m.json] [--json]` | Run unit `test` blocks (`*_test.misa` / `test_*.misa` discovered under directories) plus `eval` blocks. `--json` emits structured results for agents. |
 | `misa build <f.misa> [--target triple]` | LLVM AOT native binary. |
 | `misa lsp` | **Language server** (JSON-RPC 2.0 over stdio). Never writes to stdout except protocol frames; logs to stderr. |
 
@@ -85,7 +85,11 @@ components, scaffolds), `textDocument/formatting` (returns a single
 whole-document `TextEdit`; empty array means already canonical),
 `textDocument/didChange` with full text for live re-checks.
 
-**4. Evals as tests:** `misa test app.misa --mock mocks.json` runs the
+**4. Unit tests:** `test <name> { ... }` blocks in `*_test.misa` files;
+`misa test [path]` discovers and runs them (fresh interpreter per test,
+`--json` for agents). `assert_eq`/`assert_ne` render values on failure.
+
+**5. Evals as tests:** `misa test app.misa --mock mocks.json` runs the
 `eval` blocks — the agent's way of proving an AI feature works, in CI.
 
 **Agent loop (canonical):** write → `misa check --json` → fix each

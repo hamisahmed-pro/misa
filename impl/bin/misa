@@ -2,10 +2,10 @@
 """misa - the Misa language toolchain (v0.3).
 
 Usage:
-  misa run <file.misa> [--mock mocks.json] [--json]
+  misa run <file.misa> [--mock mocks.json] [--json] [-- args...]
   misa check <file.misa> [--json]
   misa fmt <file.misa> [--write]
-  misa test <file.misa> [--mock mocks.json] [--json]
+  misa test [path] [--mock mocks.json] [--json]
   misa build <file.misa> [-o output] [--emit-llvm file.ll] [--target triple] [--preload-file src@dst]... [--json]
   misa build --list-targets
   misa serve <file.misa> [--port PORT] [--key KEY] [--key-env VAR] [--base-url URL]
@@ -64,11 +64,28 @@ def emit_errors(errors, as_json):
 
 
 def cmd_check(path, as_json):
-    errors = check_file(path)
-    if errors:
-        emit_errors(errors, as_json)
+    # Phase 8 (overtake): keep the Checker so `misa check --json` can
+    # also emit the throws graph (declared/inferred E-code sets per
+    # function) alongside the diagnostics.
+    merged, load_errors, _, file_of = load_with_imports(path)
+    if merged is None:
+        emit_errors(load_errors, as_json)
         return 1
-    if not as_json:
+    checker = Checker()
+    errors = list(load_errors)
+    errors.extend(checker.check(merged, file_of=file_of))
+    if errors:
+        if as_json:
+            print(json.dumps({"ok": False, "errors": errors,
+                              "throws_graph": checker.throws_graph},
+                             indent=2))
+        else:
+            emit_errors(errors, as_json)
+        return 1
+    if as_json:
+        print(json.dumps({"ok": True, "errors": [],
+                          "throws_graph": checker.throws_graph}, indent=2))
+    else:
         print(f"{path}: OK")
     return 0
 
@@ -87,7 +104,7 @@ def cmd_fmt(path, write):
     return 0
 
 
-def cmd_run(path, mock_path, as_json):
+def cmd_run(path, mock_path, as_json, prog_argv=None):
     mock_scripts = load_mock(mock_path)
     merged, load_errors, _order, _file_of = load_with_imports(path)
     if merged is None:
@@ -98,7 +115,8 @@ def cmd_run(path, mock_path, as_json):
         emit_errors(errors, as_json)
         return 1
     interp = Interpreter(mock_scripts=mock_scripts,
-                         main_dir=os.path.dirname(os.path.abspath(path)))
+                         main_dir=os.path.dirname(os.path.abspath(path)),
+                         argv=prog_argv or [])
     interp.file_of = _file_of
     try:
         interp.run(merged)
@@ -108,71 +126,163 @@ def cmd_run(path, mock_path, as_json):
     return 0
 
 
-def cmd_test(path, mock_path, as_json):
-    mock_scripts = load_mock(mock_path)
+
+def discover_test_files(path):
+    """Test discovery for `misa test [path]`: a file path runs that file;
+    a directory is walked for `*_test.misa` / `test_*.misa` files."""
+    if os.path.isfile(path):
+        return [path]
+    found = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames
+                       if d not in ("__pycache__", "node_modules", ".git",
+                                    "target")]
+        for fn in sorted(filenames):
+            if fn.endswith("_test.misa") or (
+                    fn.startswith("test_") and fn.endswith(".misa")):
+                found.append(os.path.join(dirpath, fn))
+    return sorted(found)
+
+
+def run_test_file(path, mock_scripts):
+    """Run one test file: unit `test` blocks (fresh interpreter per test
+    for isolation) plus model `eval` blocks (existing behavior).
+    Returns a list of result dicts:
+      {"kind": "test"|"eval"|"file", "name", "file", "line",
+       "pass": bool, "message": str}"""
+    from misa import ast as _ast
+    results = []
     merged, load_errors, _order, _file_of = load_with_imports(path)
     if merged is None:
-        emit_errors(load_errors, as_json)
-        return 1
+        results.append({"kind": "file", "name": path, "file": path,
+                        "line": 0, "pass": False,
+                        "message": "; ".join(load_errors)})
+        return results
     errors = load_errors + Checker().check(merged, file_of=_file_of)
     if errors:
-        emit_errors(errors, as_json)
-        return 1
-    interp = Interpreter(mock_scripts=mock_scripts,
-                         main_dir=os.path.dirname(os.path.abspath(path)))
-    interp.file_of = _file_of
-    interp.load(merged)
-    results = []
-    failed = 0
-    for name, edecl in interp.evals.items():
-        mdecl = interp.models[edecl.model_name]
-        # given args in model param order
-        given = {k: v for k, v in edecl.given}
-        run_results = []
-        ok_all = True
-        for run in range(edecl.runs):
-            try:
-                arg_values = []
-                for pn, _ in mdecl.params:
-                    node = given[pn]
-                    arg_values.append(
-                        interp.eval_expr(node, interp.global_env))
-                result = interp.call_model(mdecl, arg_values, edecl)
-                env = __import__("misa.interp",
-                                 fromlist=["Env"]).Env(interp.global_env)
-                env.define("result", result, False)
-                for pn, _ in mdecl.params:
-                    env.define(pn, arg_values[
-                        [p for p, _ in mdecl.params].index(pn)], False)
-                passed = interp.truthy(
-                    interp.eval_expr(edecl.expect, env))
-                run_results.append({"run": run + 1, "pass": bool(passed),
-                                    "error": None})
-                if not passed:
+        msg = "; ".join(
+            f"{e.get('line', 0)}:{e.get('col', 0)}: "
+            f"{e.get('code')}: {e.get('message')}" for e in errors)
+        results.append({"kind": "file", "name": path, "file": path,
+                        "line": 0, "pass": False,
+                        "message": "check failed: " + msg})
+        return results
+    # Unit tests: one fresh interpreter per test — a failing test (or a
+    # test that corrupts global state) can never kill the rest of the run.
+    for item in merged.items:
+        if not isinstance(item, _ast.TestDecl):
+            continue
+        tfile = _file_of.get(id(item), path)
+        interp = Interpreter(
+            mock_scripts=mock_scripts,
+            main_dir=os.path.dirname(os.path.abspath(path)))
+        interp.file_of = _file_of
+        try:
+            interp.load(merged)
+            interp.exec_setup(merged)
+            interp.run_one_test(item)
+        except MisaError as e:
+            results.append({"kind": "test", "name": item.name,
+                            "file": tfile, "line": item.line,
+                            "pass": False,
+                            "message": f"{e.code}: {e.message}"})
+        else:
+            results.append({"kind": "test", "name": item.name,
+                            "file": tfile, "line": item.line,
+                            "pass": True, "message": ""})
+    # Model evals (pre-existing `misa test` behavior, unchanged).
+    if any(isinstance(item, _ast.EvalDecl) for item in merged.items):
+        interp = Interpreter(
+            mock_scripts=mock_scripts,
+            main_dir=os.path.dirname(os.path.abspath(path)))
+        interp.file_of = _file_of
+        interp.load(merged)
+        for name, edecl in interp.evals.items():
+            efile = _file_of.get(id(edecl), path)
+            mdecl = interp.models[edecl.model_name]
+            given = {k: v for k, v in edecl.given}
+            ok_all = True
+            first_err = ""
+            for run in range(edecl.runs):
+                try:
+                    arg_values = []
+                    for pn, _ in mdecl.params:
+                        node = given[pn]
+                        arg_values.append(
+                            interp.eval_expr(node, interp.global_env))
+                    result = interp.call_model(mdecl, arg_values, edecl)
+                    env = __import__(
+                        "misa.interp", fromlist=["Env"]).Env(
+                            interp.global_env)
+                    env.define("result", result, False)
+                    for pn, _ in mdecl.params:
+                        env.define(pn, arg_values[
+                            [p for p, _ in mdecl.params].index(pn)], False)
+                    passed = interp.truthy(
+                        interp.eval_expr(edecl.expect, env))
+                    if not passed:
+                        ok_all = False
+                        if not first_err:
+                            first_err = "expect was false"
+                except MisaError as e:
                     ok_all = False
-            except MisaError as e:
-                run_results.append({"run": run + 1, "pass": False,
-                                    "error": e.to_dict()})
-                ok_all = False
-        results.append({"eval": name, "model": edecl.model_name,
-                        "pass": ok_all, "runs": run_results})
-        if not ok_all:
-            failed += 1
+                    if not first_err:
+                        first_err = f"{e.code}: {e.message}"
+            results.append({"kind": "eval", "name": name, "file": efile,
+                            "line": edecl.line, "pass": ok_all,
+                            "message": first_err})
+    return results
+
+
+def cmd_test(path, mock_path, as_json):
+    mock_scripts = load_mock(mock_path)
+    files = discover_test_files(path)
+    if not files:
+        if os.path.isfile(path):
+            files = [path]
+        else:
+            sys.stderr.write(
+                f"misa test: no test files found under '{path}'\n")
+            return 1
+    results = []
+    for f in files:
+        results.extend(run_test_file(f, mock_scripts))
+    failed = [r for r in results if not r["pass"]]
     if as_json:
         print(json.dumps(results, indent=2))
     else:
         for r in results:
-            status = "PASS" if r["pass"] else "FAIL"
-            print(f"{status}  {r['eval']}  (model {r['model']}, "
-                  f"{len(r['runs'])} runs)")
-            for rr in r["runs"]:
-                if not rr["pass"]:
-                    detail = rr["error"]["message"] if rr["error"] \
-                        else "expect was false"
-                    print(f"       run {rr['run']}: FAIL: {detail}")
-        total = len(results)
-        print(f"\n{total - failed}/{total} evals passed")
+            loc = f"{r['file']}:{r['line']}" if r["line"] else r["file"]
+            if r["kind"] == "test":
+                if r["pass"]:
+                    print(f"PASS  {r['name']}  ({loc})")
+                else:
+                    print(f"FAIL  {r['name']}  ({loc}): {r['message']}")
+            elif r["kind"] == "eval":
+                status = "PASS" if r["pass"] else "FAIL"
+                print(f"{status}  eval {r['name']}  ({loc})"
+                      + (f": {r['message']}" if r["message"] else ""))
+            else:
+                print(f"ERROR {loc}: {r['message']}")
+        n_test = sum(1 for r in results if r["kind"] == "test")
+        n_tpass = sum(1 for r in results
+                      if r["kind"] == "test" and r["pass"])
+        n_eval = sum(1 for r in results if r["kind"] == "eval")
+        n_epass = sum(1 for r in results
+                      if r["kind"] == "eval" and r["pass"])
+        parts = []
+        if n_test:
+            parts.append(f"{n_tpass}/{n_test} tests passed")
+        if n_eval:
+            parts.append(f"{n_epass}/{n_eval} evals passed")
+        if parts:
+            print(f"\n{', '.join(parts)}")
+        elif failed:
+            print(f"\n{len(failed)} file(s) failed")
+        else:
+            print("\nno tests found")
     return 1 if failed else 0
+
 
 
 def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
@@ -232,18 +342,42 @@ def main(argv):
         return cmd_check(args[0], as_json)
     if cmd == "fmt" and 1 <= len(args) <= 2:
         return cmd_fmt(args[0], "--write" in args)
-    if cmd == "run" and 1 <= len(args) <= 3:
+    if cmd == "run" and len(args) >= 1:
+        # Program argv: everything after `--` goes to the program's
+        # argv(), not to misa itself.
+        if "--" in args:
+            i = args.index("--")
+            prog_argv, args = args[i + 1:], args[:i]
+        else:
+            prog_argv = []
         mock = None
-        if "--mock" in args:
-            i = args.index("--mock")
-            mock = args[i + 1]
-        return cmd_run(args[0], mock, as_json)
-    if cmd == "test" and 1 <= len(args) <= 3:
+        rest = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--mock" and i + 1 < len(args):
+                mock = args[i + 1]
+                i += 2
+            else:
+                rest.append(args[i])
+                i += 1
+        if len(rest) != 1:
+            die("usage: misa run <file.misa> [--mock mocks.json] "
+                "[-- args...]")
+        return cmd_run(rest[0], mock, as_json, prog_argv)
+    if cmd == "test":
         mock = None
-        if "--mock" in args:
-            i = args.index("--mock")
-            mock = args[i + 1]
-        return cmd_test(args[0], mock, as_json)
+        rest = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--mock" and i + 1 < len(args):
+                mock = args[i + 1]
+                i += 2
+            else:
+                rest.append(args[i])
+                i += 1
+        if len(rest) > 1:
+            die("usage: misa test [path] [--mock mocks.json] [--json]")
+        return cmd_test(rest[0] if rest else ".", mock, as_json)
     if cmd == "build" and 1 <= len(args) <= 12:
         if "--list-targets" in args:
             return cmd_list_targets()

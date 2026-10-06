@@ -1,0 +1,37 @@
+// a26: checked throws signatures — check-time only, AOT/interp parity.
+// The throws clauses are verified by `misa check`; both backends must
+// run the program identically.
+fn fetch(u: Text) -> Text throws E304 {
+    return http.get(u)
+}
+
+fn load(u: Text) -> Text {
+    var out = ""
+    try {
+        out = fetch(u)
+    } catch e {
+        out = "caught {e.code}"
+    }
+    return out
+}
+
+fn risky(n: Int) -> Int throws EBAD {
+    if n <= 0 {
+        throw { code: "EBAD", message: "need positive" }
+    }
+    return 100 / n
+}
+
+fn apply_twice(f: (Int) -> Int, x: Int) -> Int {
+    return f(f(x))
+}
+
+let inc = |x: Int| x + 1
+print(apply_twice(inc, 5))
+print(risky(4))
+try {
+    print(risky(-1))
+} catch e {
+    print("caught {e.code}")
+}
+print(load("http://example.com"))

@@ -62,7 +62,7 @@ defined in more than one reachable file is error `E110`.
 The builtin type `Error` is `type Error { code: Text, message: Text }`.
 
 ```
-fn load(path: Text) -> Text {
+fn load(path: Text) -> Text throws E303, ELOAD {
     try {
         return fs.read(path)
     } catch e {
@@ -76,13 +76,24 @@ fn load(path: Text) -> Text {
 - `try { … } catch e { … }`: if the `try` block raises, `e` (an
   `Error`) is bound in the `catch` block and execution continues
   after the statement. If no error is raised, the `catch` block is
-  skipped.
+  skipped. `catch` is total — it discharges every error code raised
+  in the `try` body.
 - **Every runtime/model/budget error is catchable.** `E3xx`, `E4xx`,
   `E5xx` raised by the interpreter surface as `Error{code, message}`
   values. Uncaught, they abort the program with the v0.1-style
   structured report.
 - `catch` does not catch static check errors (`E1xx`/`E2xx`); those
   are compile-time.
+- **Checked `throws` (Phase 8):** a function's error codes are part of
+  its signature. `fn f() -> T throws E303, E304` declares the codes
+  its body may raise; any other uncaught code at a call/`throw`/`await`
+  site is E227 (`unhandled E304 from call to 'fetch' — 'load' must
+  declare 'throws E304' or catch it`). The checker infers each
+  function's throws set (fixed-point over the call graph); the declared
+  clause is an upper-bound contract. Calls are checked; operators
+  (`/`, `[i]`) are unchecked, panic-like. `misa check --json` emits
+  the per-function throws graph (`declared` + `inferred`). Full design:
+  `spec/PHASE8-THROWS.md`.
 
 ## 5. Types
 

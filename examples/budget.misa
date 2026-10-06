@@ -87,7 +87,7 @@ fn sum_by<T>(xs: [T], f: (T) -> Int) -> Int {
 // --- Money ---------------------------------------------------------------------
 // Amounts are integer cents: 4250 means $42.50. Integers never round.
 // (`/` is float division in Misa, so dollars come from int(cents / 100).)
-fn fmt_money(cents: Int) -> Text {
+fn fmt_money(cents: Int) -> Text throws E300 {
   let dollars = int(cents / 100)
   let rest = cents % 100
   var rest_text = str(rest)
@@ -98,7 +98,7 @@ fn fmt_money(cents: Int) -> Text {
 }
 
 // Parse "42.50" (or "42") into cents. Rejects anything else.
-fn parse_amount(s: Text) -> Result<Int> {
+fn parse_amount(s: Text) -> Result<Int> throws E300 {
   var out: Result<Int> = Result<Int>.Err("bad amount '" + s + "': use 42.50")
   let parts = str.split(s, ".")
   if len(parts) == 1 {
@@ -160,13 +160,13 @@ fn parse_cmd(s: Text) -> Result<Cmd> {
 }
 
 // --- Database --------------------------------------------------------------------
-fn open_db() -> Db {
+fn open_db() -> Db throws E303 {
   let db = db.open(db_path())
   db.exec(db, "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY, label TEXT NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, created INTEGER NOT NULL)")
   return db
 }
 
-fn load_entries(db: Db) -> [Entry] {
+fn load_entries(db: Db) -> [Entry] throws E303 {
   let rows = db.query(db, "SELECT id, label, kind, amount, created FROM entries ORDER BY id")
   var out: [Entry] = []
   for r in rows {
@@ -176,7 +176,7 @@ fn load_entries(db: Db) -> [Entry] {
 }
 
 // --- Commands ----------------------------------------------------------------------
-fn cmd_add(db: Db, label: Text, amount_text: Text, kind_text: Text) -> Void {
+fn cmd_add(db: Db, label: Text, amount_text: Text, kind_text: Text) -> Void throws E300, E303 {
   let clean = str.trim(label)
   if clean == "" {
     print("Error: label is empty")
@@ -188,21 +188,21 @@ fn cmd_add(db: Db, label: Text, amount_text: Text, kind_text: Text) -> Void {
   }
 }
 
-fn add_with_kind(db: Db, label: Text, cents: Int, kind_text: Text) -> Void {
+fn add_with_kind(db: Db, label: Text, cents: Int, kind_text: Text) -> Void throws E300, E303 {
   match kind_from_text(kind_text) {
     Result.Err(e) => say("Error: " + e),
     Result.Ok(k) => insert_entry(db, label, cents, k),
   }
 }
 
-fn insert_entry(db: Db, label: Text, cents: Int, k: Kind) -> Void {
+fn insert_entry(db: Db, label: Text, cents: Int, k: Kind) -> Void throws E300, E303 {
   db.exec(db, "INSERT INTO entries (label, kind, amount, created) VALUES (?, ?, ?, ?)",
     [label, kind_to_text(k), cents, time.now()])
   // Confirmation prints no timestamp, so output is deterministic.
   print("Added " + kind_sign(k) + "$" + fmt_money(cents) + " " + label)
 }
 
-fn cmd_list(db: Db) -> Void {
+fn cmd_list(db: Db) -> Void throws E300, E303 {
   let entries = load_entries(db)
   if len(entries) == 0 {
     print("No entries yet. Add one with BUDGET_CMD=add ...")
@@ -213,7 +213,7 @@ fn cmd_list(db: Db) -> Void {
   }
 }
 
-fn entry_line(e: Entry) -> Text {
+fn entry_line(e: Entry) -> Text throws E300 {
   var sign = "+"
   if e.kind == "Expense" {
     sign = "-"
@@ -222,7 +222,7 @@ fn entry_line(e: Entry) -> Text {
   return sign + "$" + fmt_money(e.amount) + " " + e.label + "  (" + when + ", " + e.kind + ")"
 }
 
-fn cmd_report(db: Db) -> Void {
+fn cmd_report(db: Db) -> Void throws E300, E303 {
   let entries = load_entries(db)
   if len(entries) == 0 {
     print("No entries yet. Add one with BUDGET_CMD=add ...")
@@ -262,7 +262,7 @@ fn cmd_report(db: Db) -> Void {
 }
 
 // --- Entry point ---------------------------------------------------------------------
-fn dispatch(db: Db, c: Cmd) -> Void {
+fn dispatch(db: Db, c: Cmd) -> Void throws E300, E303 {
   match c {
     Cmd.Add => cmd_add(db, get_env_or("BUDGET_ARG", ""), get_env_or("BUDGET_AMOUNT", ""), get_env_or("BUDGET_KIND", "expense")),
     Cmd.List => cmd_list(db),
@@ -270,7 +270,7 @@ fn dispatch(db: Db, c: Cmd) -> Void {
   }
 }
 
-fn main() -> Void {
+fn main() -> Void throws E300, E303 {
   let db = open_db()
   match parse_cmd(get_env_or("BUDGET_CMD", "")) {
     Result.Err(e) => say("Error: " + e),

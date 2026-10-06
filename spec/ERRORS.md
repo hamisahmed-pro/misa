@@ -60,6 +60,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E224 | **(Phase 5 DB)** Unknown table or column in a `db.query` SQL string validated against `table` declarations (`unknown column 'nam' (table 'users' has no such column)`). Queries over undeclared tables are dynamic, not errors. |
 | E225 | **(Phase 7)** Invalid `extern` signature — empty library name, type parameters on an extern function, or a parameter/return type that cannot cross the FFI boundary (only `Int`, `Float`, `Text`, `Bool`, `Ptr`, `Void` in v1). Passing a `Task<T>`/`Chan<T>` value to an `extern` function at a call site is also E225. |
 | E226 | **(Phase 7)** FFI failure at load or call time — library cannot be loaded (`cannot load library 'foo': ...`), symbol not found (`library 'm' has no symbol 'bar'`), or the foreign call itself failed. Foreign crashes are NOT caught (same as C). |
+| E227 | **(Phase 8 overtake)** Checked `throws` violation — an unhandled error code at a call/`throw`/`await` site (`unhandled E304 from call to 'fetch' — 'load' must declare 'throws E304' or catch it'), or a malformed code in a `throws` clause. See `spec/PHASE8-THROWS.md`. |
 
 ## E3xx — runtime
 

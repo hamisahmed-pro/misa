@@ -1,0 +1,17 @@
+// a25: unit-test builtins (assert_eq/assert_ne) + argv() parity.
+// Run with no args: argv() is [] on both backends.
+assert_eq(1 + 1, 2)
+assert_eq("a" + "b", "ab")
+assert_eq([1, 2], [1, 2])
+assert_eq({x: 1}, {x: 1})
+assert_ne(1, 2)
+assert_ne("a", "b")
+let args = argv()
+assert_eq(args, [])
+print("assert_eq/assert_ne/argv ok, argc=" + str(len(args)))
+
+// test blocks are decls: skipped by run/build, like evals.
+test skipped_in_programs {
+  assert_eq(1, 2)
+}
+print("done")

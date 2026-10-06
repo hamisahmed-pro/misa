@@ -21,6 +21,12 @@ DBL = ir.DoubleType()
 
 NULL_PTR = ir.Constant(PTR, None)
 
+# MVal layout mirror (must match struct MVal in misa_rt.c):
+#   uint8_t tag; uint8_t pad[7]; union { int64_t i; ... } u;
+# Only the tag and u.i offsets are used (unboxing); the union tail is
+# modeled as a single i64 since GEP only needs correct field offsets.
+_MVAL_T = ir.LiteralStructType([I8, ir.ArrayType(I8, 7), I64])
+
 
 class AOTError(Exception):
     """Compile-time rejection: carries (code, message, line, col)."""
@@ -64,6 +70,19 @@ class FnCtx:
         self.scope = Scope()
         self.err_stack = []     # basic blocks: innermost error target
         self.nil = None         # cached nil value
+        # -- int unboxing (perf gap P-2) --------------------------------
+        # int_mode: True when emitting a raw i64-specialized function
+        # body. In int_mode, Int-typed expressions produce raw i64
+        # values instead of boxed MVal*.
+        self.int_mode = False
+        # int_vars: names currently holding a (provably) Int value.
+        # In normal mode the values are still boxed MVal*; in int_mode
+        # they are raw i64 allocas.
+        self.int_vars: set = set()
+        # raw_int_vars: subset of int_vars whose alloca is a raw i64
+        # (not MVal*). Loads produce i64; stores expect i64. Applies in
+        # both normal mode (for `: Int` locals) and int_mode.
+        self.raw_int_vars: set = set()
         # Phase 5a: names of `var`s cell-allocated (1-elem lists) because
         # a nested lambda may capture them. Reads/writes go through
         # misa_list_get/misa_index_set instead of a plain alloca.
@@ -140,6 +159,10 @@ _RT_SIGS = {
     "misa_builtin_int": (PTR, [PTR, I32, I32]),
     "misa_builtin_float": (PTR, [PTR, I32, I32]),
     "misa_builtin_assert": (PTR, [PTR, PTR, I32, I32]),
+    "misa_builtin_assert_eq": (PTR, [PTR, PTR, I32, I32]),
+    "misa_builtin_assert_ne": (PTR, [PTR, PTR, I32, I32]),
+    "misa_builtin_argv": (PTR, []),
+    "misa_argv_init": (ir.VoidType(), [I32, PTR.as_pointer()]),
     "misa_builtin_env": (PTR, [PTR, I32, I32]),
     "misa_builtin_media": (PTR, [I32, PTR, I32, I32]),
     "misa_fs_read": (PTR, [PTR, I32, I32]),
@@ -172,6 +195,15 @@ _RT_SIGS = {
     "misa_db_exec": (PTR, [PTR, PTR, PTR, I32, I32]),
     "misa_db_query": (PTR, [PTR, PTR, PTR, I32, I32]),
     "misa_db_close": (PTR, [PTR, I32, I32]),
+    # P-3: bulk inserts + explicit transactions.
+    "misa_db_exec_many": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_db_begin": (PTR, [PTR, I32, I32]),
+    "misa_db_commit": (PTR, [PTR, I32, I32]),
+    "misa_db_rollback": (PTR, [PTR, I32, I32]),
+    # Text.Builder: amortized string building (perf gap P-1).
+    "misa_builder_new": (PTR, []),
+    "misa_builder_append": (ir.VoidType(), [PTR, PTR, I32, I32]),
+    "misa_builder_build": (PTR, [PTR, I32, I32]),
     "misa_text_z": (PTR, [PTR]),
     "misa_screen_begin": (ir.VoidType(), [PTR]),
     "misa_screen_comp_begin": (ir.VoidType(), [PTR, I32]),
@@ -230,6 +262,9 @@ class Emitter:
         self.rt = {}
         self.str_cache = {}
         self.fns = {}       # misa fn name -> ir.Function
+        # P-2 Level 2: raw i64 specializations for Int->Int functions.
+        # int_fns[name] -> ir.Function with signature i64 (i64, ...).
+        self.int_fns = {}
         self.models = {}    # model name -> (ir.Function, meta_global)
         self.screens = {}   # screen name -> ir.Function
         self.screen_bodies = {}  # screen name -> _body ir.Function
@@ -440,6 +475,11 @@ class Emitter:
             fty = ir.FunctionType(PTR, [PTR] * len(decl.params))
             self.fns[name] = ir.Function(
                 self.mod, fty, name=f"misa_fn_{name}")
+            # P-2 Level 2: raw i64 specialization for Int->Int functions.
+            if self._is_int_fn(decl):
+                rty = ir.FunctionType(I64, [I64] * len(decl.params))
+                self.int_fns[name] = ir.Function(
+                    self.mod, rty, name=f"misa_fn_{name}__int")
         for name, decl in self.model_decls.items():
             self.emit_model_decl(name, decl)
         for name, decl in self.screen_decls.items():
@@ -628,16 +668,20 @@ class Emitter:
             walk(st)
         return out
 
-    def new_fn_ctx(self, fn: ir.Function) -> FnCtx:
+    def new_fn_ctx(self, fn: ir.Function, int_mode=False) -> FnCtx:
         entry = fn.append_basic_block("entry")
         b = ir.IRBuilder(entry)
         ctx = FnCtx(self, b, fn)
+        ctx.int_mode = int_mode
         err = fn.append_basic_block("err")
         ctx.err_stack.append(err)
-        # Phase 7 (concurrency): every compiled function opens a task
-        # scope on entry; emit_ret() closes it on every return path so
-        # a returning scope cancels its still-running child tasks.
-        b.call(self.rt["misa_scope_enter"], [])
+        if not int_mode:
+            # Phase 7 (concurrency): every compiled function opens a task
+            # scope on entry; emit_ret() closes it on every return path so
+            # a returning scope cancels its still-running child tasks.
+            # (int_mode functions have restricted bodies: no spawn, so no
+            # scope is needed.)
+            b.call(self.rt["misa_scope_enter"], [])
         return ctx
 
     def emit_ret(self, ctx: FnCtx, v):
@@ -647,7 +691,8 @@ class Emitter:
         new_fn_ctx (normal returns, error epilogues, fallthroughs) so
         scope_enter/scope_exit stay balanced.
         """
-        ctx.builder.call(self.rt["misa_scope_exit"], [])
+        if not ctx.int_mode:
+            ctx.builder.call(self.rt["misa_scope_exit"], [])
         ctx.builder.ret(v)
 
     def finish_fn_ctx(self, ctx: FnCtx):
@@ -657,14 +702,19 @@ class Emitter:
             return
         err = ctx.err_stack[0]
         b.position_at_end(err)
-        self.emit_ret(ctx, NULL_PTR)
+        # P-2: int_mode functions return i64; the error path is
+        # unreachable for restricted bodies, but must be well-typed.
+        fb = self.const_i64(0) if ctx.int_mode else NULL_PTR
+        self.emit_ret(ctx, fb)
         # normal fallthrough: return nil
         b.position_at_end(ctx.fn.basic_blocks[0])
         # find the last non-terminated block to append fallthrough ret
         for blk in reversed(ctx.fn.blocks):
             if not blk.is_terminated:
                 b.position_at_end(blk)
-                self.emit_ret(ctx, self.get_nil(ctx))
+                fv = self.const_i64(0) if ctx.int_mode \
+                    else self.get_nil(ctx)
+                self.emit_ret(ctx, fv)
                 break
 
     def get_nil(self, ctx: FnCtx):
@@ -687,19 +737,58 @@ class Emitter:
         return a
 
     def emit_fn_body(self, name: str, decl: A.FnDecl):
+        # P-2 Level 2: Int->Int functions get a raw i64 specialization
+        # plus a thin MVal* wrapper for generic callers.
+        if name in self.int_fns:
+            self.emit_int_fn(name, decl)
+            return
         fn = self.fns[name]
         self.emit_fn_body_direct(fn, decl)
+
+    def emit_int_fn(self, name: str, decl: A.FnDecl):
+        """Emit `misa_fn_<name>__int(i64...) -> i64` and the MVal* wrapper."""
+        raw_fn = self.int_fns[name]
+        ctx = self.new_fn_ctx(raw_fn, int_mode=True)
+        b = ctx.builder
+        # Params are raw i64; alloca as i64 at entry.
+        for (pn, _), arg in zip(decl.params, raw_fn.args):
+            arg.name = f"p_{pn}"
+            save = b.block
+            b.position_at_start(raw_fn.basic_blocks[0])
+            a = b.alloca(I64, name=f"i_{pn}")
+            b.position_at_end(save)
+            b.store(arg, a)
+            ctx.scope.declare(pn, a)
+            ctx.int_vars.add(pn)
+        self.emit_block(decl.body, ctx)
+        self.finish_fn_ctx(ctx)
+        # MVal* wrapper for generic callers: unbox args, call raw, box.
+        fn = self.fns[name]
+        wctx = self.new_fn_ctx(fn)
+        wb = wctx.builder
+        raw_args = []
+        for (pn, _), arg in zip(decl.params, fn.args):
+            uv = self.call(wctx, "misa_as_int", [arg], decl, check=True)
+            raw_args.append(uv)
+        r = wb.call(raw_fn, raw_args, name="_raw")
+        self.check(wctx, decl)
+        boxed = self.call(wctx, "misa_int", [r], decl, check=False)
+        self.emit_ret(wctx, boxed)
+        self.finish_fn_ctx(wctx)
 
     def emit_fn_body_direct(self, fn, decl: A.FnDecl):
         ctx = self.new_fn_ctx(fn)
         # Phase 5a: cell-allocate `var`s captured by nested lambdas.
         ctx.cell_vars = self._cell_vars_for(decl.body)
         b = ctx.builder
-        for (pn, _), arg in zip(decl.params, fn.args):
+        for (pn, pte), arg in zip(decl.params, fn.args):
             arg.name = f"p_{pn}"
             a = self.alloca_var(ctx, pn)
             b.store(arg, a)
             ctx.scope.declare(pn, a)
+            # P-2: track provably-Int variables for unboxing.
+            if self._te_is_int(pte):
+                ctx.int_vars.add(pn)
         # make nil available
         self.get_nil(ctx)
         b.position_at_end(fn.basic_blocks[0])
@@ -832,7 +921,8 @@ class Emitter:
                                              A.ModelsDecl, A.TypeDecl,
                                              A.TableDecl,
                                              A.ModelDecl, A.ScreenDecl,
-                                             A.EvalDecl, A.FnDecl,
+                                             A.EvalDecl, A.TestDecl,
+                                             A.FnDecl,
                                              A.ExternDecl,
                                              A.ImportDecl))]
         ctx.cell_vars = self._cell_vars_for(top_stmts)
@@ -842,7 +932,8 @@ class Emitter:
             if isinstance(item, (A.AppDecl, A.ProviderDecl, A.ModelsDecl,
                                  A.TypeDecl, A.TableDecl, A.ModelDecl,
                                  A.ScreenDecl,
-                                 A.EvalDecl, A.FnDecl, A.ExternDecl,
+                                 A.EvalDecl, A.TestDecl, A.FnDecl,
+                                 A.ExternDecl,
                                  A.ImportDecl)):
                 continue
             self.emit_stmt(item, ctx)
@@ -859,10 +950,14 @@ class Emitter:
             return
         if self.entry == "misa_main":
             return
-        fty = ir.FunctionType(I32, [])
+        fty = ir.FunctionType(I32, [I32, PTR.as_pointer()])
         fn = ir.Function(self.mod, fty, name="main")
         b = ir.IRBuilder(fn.append_basic_block("entry"))
         b.call(self.rt["misa_rt_init"], [])
+        # argv(): stash the C argv for the `argv()` builtin. Targets
+        # whose entry isn't this main (Android/iOS/web) never call
+        # misa_argv_init, so argv() is [] there (documented).
+        b.call(self.rt["misa_argv_init"], [fn.args[0], fn.args[1]])
         main = self.mod.get_global("misa_main")
         r = b.call(main, [], name="r")
         # Phase 7: reap outstanding tasks (bounded), cancel stragglers,
@@ -933,15 +1028,52 @@ class Emitter:
                     line=val_node.line, col=val_node.col)
             v = self.emit_expr(val_node, ctx)
             self.check(ctx, s)
-            a = self.alloca_var(ctx, s.name)
-            if s.name in ctx.cell_vars:
-                # Phase 5a: heap cell (1-elem list) shared with closures.
-                cell = self.call(ctx, "misa_list_new", [], s, check=False)
-                self.call(ctx, "misa_list_push", [cell, v], s, check=False)
-                b.store(cell, a)
+            # P-2: Int-typed locals use raw i64 allocas (no per-access
+            # boxing). In int_mode any i64 value qualifies; in normal mode
+            # the declared/inferred type must be Int.
+            if ctx.int_mode:
+                is_int_local = (v.type == I64)
             else:
+                # Normal mode: explicit `: Int`, or an int-valued
+                # initializer (the checker rejects later type changes,
+                # so the i64 alloca stays sound). Excludes cell_vars
+                # (closure-captured vars stay boxed MVal*).
+                is_int_local = (s.name not in ctx.cell_vars
+                                and (self._te_is_int(s.ann)
+                                     or self._is_int_expr(val_node, ctx)))
+            int_local = is_int_local
+            if int_local:
+                save = b.block
+                b.position_at_start(ctx.fn.basic_blocks[0])
+                a = b.alloca(I64, name=f"i_{s.name}")
+                b.position_at_end(save)
+                # In normal mode v may be boxed (MVal*); unbox it.
+                if v.type != I64:
+                    v = self._unbox_int(b, v, name=f"init_{s.name}")
                 b.store(v, a)
-            ctx.scope.declare(s.name, a)
+                ctx.scope.declare(s.name, a)
+                ctx.int_vars.add(s.name)
+                ctx.raw_int_vars.add(s.name)
+            else:
+                a = self.alloca_var(ctx, s.name)
+                if s.name in ctx.cell_vars:
+                    # Phase 5a: heap cell (1-elem list) shared with closures.
+                    cell = self.call(ctx, "misa_list_new", [], s,
+                                     check=False)
+                    self.call(ctx, "misa_list_push", [cell, v], s,
+                              check=False)
+                    b.store(cell, a)
+                else:
+                    b.store(v, a)
+                ctx.scope.declare(s.name, a)
+            # P-2: track provably-Int variables for unboxing. Explicit
+            # `: Int` annotation, or `let` (immutable) with an int-valued
+            # initializer. (`var` without annotation is only trusted via
+            # annotation; later assignments re-evaluate below.)
+            if self._te_is_int(s.ann):
+                ctx.int_vars.add(s.name)
+            elif not s.mutable and self._is_int_expr(val_node, ctx):
+                ctx.int_vars.add(s.name)
         elif isinstance(s, A.AssignStmt):
             v = self.emit_expr(s.value, ctx)
             self.check(ctx, s)
@@ -967,10 +1099,25 @@ class Emitter:
                         line, col = self.loc(s)
                         zero = self.call(ctx, "misa_int",
                                          [self.const_i64(0)], s, check=False)
+                        # P-2: box raw i64 for the cell (cells hold MVal*).
+                        cv = self._ensure_mval(v, s.value, ctx)
                         self.call(ctx, "misa_index_set",
-                                  [cell, zero, v, line, col], s)
+                                  [cell, zero, cv, line, col], s)
                     else:
+                        # P-2: raw i64 vars store i64 directly; other
+                        # targets need a boxed MVal*.
+                        if tgt.name in ctx.raw_int_vars:
+                            if v.type != I64:
+                                v = self._unbox_int(
+                                    b, v, name=f"assign_{tgt.name}")
+                        else:
+                            v = self._ensure_mval(v, s.value, ctx)
                         b.store(v, a)
+                    # P-2: keep int_vars sound across assignments.
+                    if self._is_int_expr(s.value, ctx):
+                        ctx.int_vars.add(tgt.name)
+                    else:
+                        ctx.int_vars.discard(tgt.name)
             elif isinstance(tgt, A.Field):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
@@ -998,6 +1145,10 @@ class Emitter:
             if s.value is not None:
                 v = self.emit_expr(s.value, ctx)
                 self.check(ctx, s)
+                # P-2: box raw i64 returns in normal mode (int_mode
+                # functions return i64 natively).
+                if not ctx.int_mode:
+                    v = self._ensure_mval(v, s.value, ctx)
                 # Returning a Task transfers ownership to the caller:
                 # detach it from this scope so scope_exit doesn't cancel it.
                 if self._is_task_expr(s.value):
@@ -1025,10 +1176,24 @@ class Emitter:
 
     def emit_if(self, s: A.IfStmt, ctx: FnCtx):
         b = ctx.builder
-        c = self.emit_expr(s.cond, ctx)
-        self.check(ctx, s)
-        t = self.call(ctx, "misa_truthy", [c], s, check=False)
-        cond = b.icmp_unsigned("!=", t, self.const_i32(0), name="c")
+        # P-2: unbox integer comparisons directly to i1 (skips the
+        # misa_bool + misa_truthy round trip). Applies in both modes.
+        if isinstance(s.cond, A.BinOp) \
+                and s.cond.op in ("<", "<=", ">", ">=", "==", "!=") \
+                and self._is_int_expr(s.cond.left, ctx) \
+                and self._is_int_expr(s.cond.right, ctx):
+            li = self._to_i64(s.cond.left, ctx)
+            ri = self._to_i64(s.cond.right, ctx)
+            cond = b.icmp_signed(s.cond.op, li, ri, name="c")
+        else:
+            c = self.emit_expr(s.cond, ctx)
+            self.check(ctx, s)
+            if c.type == I64:
+                # int_mode: raw 0/1 boolean.
+                cond = b.icmp_signed("!=", c, self.const_i64(0), name="c")
+            else:
+                t = self.call(ctx, "misa_truthy", [c], s, check=False)
+                cond = b.icmp_unsigned("!=", t, self.const_i32(0), name="c")
         then_b = ctx.fn.append_basic_block("if.then")
         else_b = ctx.fn.append_basic_block("if.else")
         end_b = ctx.fn.append_basic_block("if.end")
@@ -1050,10 +1215,23 @@ class Emitter:
         end_b = ctx.fn.append_basic_block("while.end")
         b.branch(cond_b)
         b.position_at_end(cond_b)
-        c = self.emit_expr(s.cond, ctx)
-        self.check(ctx, s)
-        t = self.call(ctx, "misa_truthy", [c], s, check=False)
-        ok = b.icmp_unsigned("!=", t, self.const_i32(0), name="c")
+        # P-2: unbox integer comparisons directly to i1 (skips the
+        # misa_bool + misa_truthy round trip). Applies in both modes.
+        if isinstance(s.cond, A.BinOp) \
+                and s.cond.op in ("<", "<=", ">", ">=", "==", "!=") \
+                and self._is_int_expr(s.cond.left, ctx) \
+                and self._is_int_expr(s.cond.right, ctx):
+            li = self._to_i64(s.cond.left, ctx)
+            ri = self._to_i64(s.cond.right, ctx)
+            ok = b.icmp_signed(s.cond.op, li, ri, name="c")
+        else:
+            c = self.emit_expr(s.cond, ctx)
+            self.check(ctx, s)
+            if c.type == I64:
+                ok = b.icmp_signed("!=", c, self.const_i64(0), name="c")
+            else:
+                t = self.call(ctx, "misa_truthy", [c], s, check=False)
+                ok = b.icmp_unsigned("!=", t, self.const_i32(0), name="c")
         b.cbranch(ok, body_b, end_b)
         b.position_at_end(body_b)
         self.emit_block(s.body, ctx)
@@ -1065,6 +1243,8 @@ class Emitter:
         b = ctx.builder
         v = self.emit_expr(s.iter, ctx)
         self.check(ctx, s)
+        # P-2: box raw i64 iterables.
+        v = self._ensure_mval(v, s.iter, ctx)
         line, col = self.loc(s)
         it = self.call(ctx, "misa_iter_new", [v, line, col], s)
         loop_b = ctx.fn.append_basic_block("for.loop")
@@ -1117,6 +1297,9 @@ class Emitter:
 
     def emit_expr(self, e, ctx: FnCtx):
         b = ctx.builder
+        # P-2 Level 2: in int_mode, Int-typed expressions produce raw i64.
+        if ctx.int_mode and self._is_int_expr(e, ctx):
+            return self._emit_int(e, ctx)
         if isinstance(e, A.IntLit):
             return self.call(ctx, "misa_int",
                              [self.const_i64(e.value)], e, check=False)
@@ -1182,6 +1365,10 @@ class Emitter:
                     return self.emit_fn_value(e.name, e, ctx)
                 raise
             v = b.load(a, name=f"l_{e.name}")
+            # P-2: raw i64 locals stay unboxed (callers box via
+            # _ensure_mval when a boxed MVal* is required).
+            if e.name in ctx.raw_int_vars:
+                return v
             if e.name in ctx.cell_vars:
                 # Phase 5a: read through the shared heap cell.
                 v = self.call(ctx, "misa_list_get",
@@ -1214,8 +1401,10 @@ class Emitter:
         if isinstance(e, A.Index):
             obj = self.emit_expr(e.obj, ctx)
             self.check(ctx, e)
+            obj = self._ensure_mval(obj, e.obj, ctx)
             idx = self.emit_expr(e.idx, ctx)
             self.check(ctx, e)
+            idx = self._ensure_mval(idx, e.idx, ctx)
             line, col = self.loc(e)
             return self.call(ctx, "misa_index_get",
                              [obj, idx, line, col], e)
@@ -1224,6 +1413,7 @@ class Emitter:
             for it in e.items:
                 v = self.emit_expr(it, ctx)
                 self.check(ctx, e)
+                v = self._ensure_mval(v, it, ctx)
                 self.call(ctx, "misa_list_push", [l, v], e, check=False)
             return l
         if isinstance(e, A.RecordLit):
@@ -1231,6 +1421,7 @@ class Emitter:
             for fname, fv in e.fields:
                 v = self.emit_expr(fv, ctx)
                 self.check(ctx, e)
+                v = self._ensure_mval(v, fv, ctx)
                 self.call(ctx, "misa_record_set_cstr",
                           [r, self.cstr(fname), v], e, check=False)
             return r
@@ -1250,6 +1441,7 @@ class Emitter:
                                    [self.cstr(str(k))], e, check=False)
                 v = self.emit_expr(ve, ctx)
                 self.check(ctx, e)
+                v = self._ensure_mval(v, ve, ctx)
                 self.call(ctx, "misa_index_set",
                           [m, kv, v, line, col], e)
             return m
@@ -1275,9 +1467,13 @@ class Emitter:
             v = self.emit_expr(e.operand, ctx)
             self.check(ctx, e)
             if e.op == "not":
+                v = self._ensure_mval(v, e.operand, ctx)
                 return self.call(ctx, "misa_not", [v], e, check=False)
             if e.op == "-":
                 line, col = self.loc(e)
+                # P-2: raw i64 negation (no boxing).
+                if v.type == I64:
+                    return b.neg(v, name="ineg")
                 return self.call(ctx, "misa_neg", [v, line, col], e)
             raise AOTError("E600", f"unknown unary '{e.op}'",
                            e.line, e.col)
@@ -1296,9 +1492,179 @@ class Emitter:
             else:
                 pv = self.emit_expr(part, ctx)
                 self.check(ctx, e)
+                # P-2: box raw i64 interpolations.
+                pv = self._ensure_mval(pv, part, ctx)
             acc = self.call(ctx, "misa_text_concat", [acc, pv],
                             e, check=False)
         return acc
+
+    # -- int unboxing (perf gap P-2) -------------------------------------
+    # Type-directed unboxing: when the checker has proven both operands
+    # are Int, emit raw i64 arithmetic instead of tagged helper calls.
+    # Wrapping semantics are preserved (LLVM i64 ops wrap by definition).
+
+    @staticmethod
+    def _te_is_int(te) -> bool:
+        """True if a TypeExpr is exactly `Int` (not optional/list/etc)."""
+        return (te is not None and te.name == "Int" and not te.is_list
+                and not te.is_map and not te.is_func
+                and not te.optional and not te.type_args)
+
+    def _is_int_expr(self, e, ctx: FnCtx) -> bool:
+        """Conservative provability: is e definitely an Int value?"""
+        if isinstance(e, A.IntLit):
+            return True
+        if isinstance(e, A.Ident):
+            return e.name in ctx.int_vars
+        if isinstance(e, A.BinOp):
+            if e.op in ("+", "-", "*", "/", "%"):
+                return (self._is_int_expr(e.left, ctx)
+                        and self._is_int_expr(e.right, ctx))
+            return False
+        if isinstance(e, A.UnOp):
+            return e.op == "-" and self._is_int_expr(e.operand, ctx)
+        if isinstance(e, A.Call):
+            # `int(x)` / `len(x)` builtins return Int.
+            if e.name in ("int", "len") and e.callee is None:
+                return True
+            # Direct call to a known Int->Int function.
+            if e.callee is None and e.name in self.fn_decls:
+                decl = self.fn_decls[e.name]
+                if (not decl.type_params and self._te_is_int(decl.ret)
+                        and all(self._te_is_int(p[1])
+                                for p in decl.params)):
+                    return True
+            return False
+        return False
+
+    def _unbox_int(self, b, mval, name="unbox"):
+        """Unchecked i64 extraction from an MVal* known to be Int."""
+        p = b.bitcast(mval, _MVAL_T.as_pointer())
+        ptr = b.gep(p, [self.const_i32(0), self.const_i32(2)],
+                    name=f"{name}.ptr")
+        return b.load(ptr, name=name)
+
+    def _to_i64(self, e, ctx: FnCtx):
+        """Emit e and produce its i64 value (unboxing if boxed)."""
+        # Fast path: integer literals need no boxing at all.
+        if isinstance(e, A.IntLit):
+            return self.const_i64(e.value)
+        v = self.emit_expr(e, ctx)
+        if v.type == I64:
+            return v
+        return self._unbox_int(ctx.builder, v)
+
+    def _ensure_mval(self, v, e, ctx: FnCtx):
+        """Box a raw i64 to MVal* when a boxed value is required."""
+        if v.type == I64:
+            return self.call(ctx, "misa_int", [v], e, check=False)
+        return v
+
+    # -- Level 2: raw i64 function specialization ----------------------
+    # For `fn f(a: Int, b: Int) -> Int` with a restricted body, emit
+    # `misa_fn_f__int(i64, i64) -> i64` alongside the normal MVal*
+    # version. Recursive calls and int arithmetic stay unboxed end to
+    # end (no GC allocation in the hot path).
+
+    _INT_SIMPLE_STMTS = (A.LetStmt, A.AssignStmt, A.IfStmt, A.WhileStmt,
+                         A.ReturnStmt, A.ExprStmt)
+
+    def _is_int_fn(self, decl) -> bool:
+        """Can this function get a raw i64 specialization?"""
+        if decl.type_params:
+            return False
+        if not self._te_is_int(decl.ret):
+            return False
+        if not decl.params:
+            return False
+        if not all(self._te_is_int(p[1]) for p in decl.params):
+            return False
+        return self._is_simple_int_body(decl.body)
+
+    def _is_simple_int_body(self, stmts) -> bool:
+        """Restricted subset: no lambdas, no try/for/match/spawn."""
+        for s in stmts:
+            if not isinstance(s, self._INT_SIMPLE_STMTS):
+                return False
+            if self._subtree_has_lambda(s):
+                return False
+            # Also reject spawn/await/try expressions conservatively by
+            # checking statement kinds already covered; expressions are
+            # validated during emission (fallback to tagged on unknown).
+            if isinstance(s, A.IfStmt):
+                if not (self._is_simple_int_body(s.then)
+                        and self._is_simple_int_body(s.els)):
+                    return False
+            elif isinstance(s, A.WhileStmt):
+                if not self._is_simple_int_body(s.body):
+                    return False
+        return True
+
+    def _emit_int(self, e, ctx: FnCtx):
+        """Emit an Int-typed expression as raw i64 (int_mode only).
+
+        Caller must have verified `self._is_int_expr(e, ctx)`.
+        Comparisons produce i64 0/1 for uniformity.
+        """
+        b = ctx.builder
+        if isinstance(e, A.IntLit):
+            return self.const_i64(e.value)
+        if isinstance(e, A.Ident):
+            a = ctx.scope.lookup(e.name)
+            return b.load(a, name=f"i_{e.name}")
+        if isinstance(e, A.BinOp):
+            if e.op in ("+", "-", "*"):
+                l = self._emit_int(e.left, ctx)
+                r = self._emit_int(e.right, ctx)
+                return {"+": b.add, "-": b.sub, "*": b.mul}[e.op](l, r,
+                                                                 name="iop")
+            if e.op in ("<", "<=", ">", ">=", "==", "!="):
+                l = self._emit_int(e.left, ctx)
+                r = self._emit_int(e.right, ctx)
+                c = b.icmp_signed(e.op, l, r, name="icmp")
+                return b.zext(c, I64, name="bext")
+            if e.op in ("/", "%"):
+                l = self._emit_int(e.left, ctx)
+                r = self._emit_int(e.right, ctx)
+                # E300 on division by zero (matches misa_div/misa_mod).
+                is_zero = b.icmp_signed(
+                    "==", r, self.const_i64(0), name="zchk")
+                z_b = ctx.fn.append_basic_block("div.z")
+                c_b = ctx.fn.append_basic_block("div.c")
+                b.cbranch(is_zero, z_b, c_b)
+                b.position_at_end(z_b)
+                line, col = self.loc(e)
+                msg = ("division by zero" if e.op == "/"
+                       else "integer modulo by zero")
+                b.call(self.rt["misa_raise"],
+                       [self.cstr("E300"), self.cstr(msg), line, col])
+                self.check(ctx, e)
+                b.position_at_end(c_b)
+                return (b.sdiv if e.op == "/" else b.srem)(
+                    l, r, name="iop")
+        if isinstance(e, A.UnOp) and e.op == "-":
+            v = self._emit_int(e.operand, ctx)
+            return b.neg(v, name="ineg")
+        if isinstance(e, A.Call) and e.callee is None:
+            # Raw call to an int-function specialization.
+            if e.name in self.int_fns and all(
+                    self._is_int_expr(a, ctx) for a in e.args):
+                args = [self._emit_int(a, ctx) for a in e.args]
+                return b.call(self.int_fns[e.name], args,
+                              name=f"_raw_{e.name}")
+            # `int(x)` / `len(x)` on int values: identity/unbox.
+            if e.name in ("int", "len") and len(e.args) == 1 \
+                    and self._is_int_expr(e.args[0], ctx):
+                return self._emit_int(e.args[0], ctx)
+        # Fallback (should be unreachable for well-typed bodies):
+        # emit boxed with the fast path disabled, then unbox.
+        ctx.int_mode = False
+        try:
+            v = self.emit_expr(e, ctx)
+        finally:
+            ctx.int_mode = True
+        self.check(ctx, e)
+        return self._unbox_int(b, v)
 
     def emit_binop(self, e: A.BinOp, ctx: FnCtx):
         b = ctx.builder
@@ -1307,11 +1673,39 @@ class Emitter:
             return self.emit_shortcircuit(e, ctx, is_and=True)
         if op == "or":
             return self.emit_shortcircuit(e, ctx, is_and=False)
+        # P-2 (Level 1): both operands provably Int -> raw i64 arithmetic.
+        # Types are checker-proven, so the tagged helpers' E200 paths are
+        # unreachable; wrapping is preserved (LLVM i64 wraps).
+        # (Checked before emitting operands: each side is emitted once.)
+        # Returns raw i64; callers box via _ensure_mval when MVal* is needed.
+        if op in ("+", "-", "*") and self._is_int_expr(e.left, ctx) \
+                and self._is_int_expr(e.right, ctx):
+            li = self._to_i64(e.left, ctx)
+            self.check(ctx, e)
+            ri = self._to_i64(e.right, ctx)
+            self.check(ctx, e)
+            return {"+": b.add, "-": b.sub, "*": b.mul}[op](li, ri,
+                                                          name="iop")
+        if op in ("<", "<=", ">", ">=", "==", "!=") \
+                and self._is_int_expr(e.left, ctx) \
+                and self._is_int_expr(e.right, ctx):
+            li = self._to_i64(e.left, ctx)
+            self.check(ctx, e)
+            ri = self._to_i64(e.right, ctx)
+            self.check(ctx, e)
+            pred = {"<": "<", "<=": "<=", ">": ">", ">=": ">=",
+                    "==": "==", "!=": "!="}[op]  # llvmlite 0.50: no s-prefix
+            c = b.icmp_signed(pred, li, ri, name="icmp")
+            return self.call(ctx, "misa_bool",
+                             [b.zext(c, I32, name="bext")], e, check=False)
         l = self.emit_expr(e.left, ctx)
         self.check(ctx, e)
         r = self.emit_expr(e.right, ctx)
         self.check(ctx, e)
         line, col = self.loc(e)
+        # P-2: box raw i64 operands for the tagged helpers.
+        l = self._ensure_mval(l, e.left, ctx)
+        r = self._ensure_mval(r, e.right, ctx)
         table = {
             "+": "misa_add", "-": "misa_sub", "*": "misa_mul",
             "/": "misa_div", "%": "misa_mod",
@@ -1389,9 +1783,18 @@ class Emitter:
                 raise AOTError("E600",
                                f"fn '{name}' takes {len(decl.params)} "
                                f"args, got {len(e.args)}", e.line, e.col)
+            # P-2 Level 2: in int_mode, call the raw specialization
+            # directly when all args are int-valued (no boxing).
+            if ctx.int_mode and name in self.int_fns and all(
+                    self._is_int_expr(a, ctx) for a in e.args):
+                raw_args = [self._emit_int(a, ctx) for a in e.args]
+                return ctx.builder.call(
+                    self.int_fns[name], raw_args, name=f"_raw_{name}")
             args = []
             for a in e.args:
                 v = self.emit_expr(a, ctx)
+                # P-2: in int_mode, box raw i64 args for MVal* callees.
+                v = self._ensure_mval(v, a, ctx)
                 self.check(ctx, e)
                 args.append(v)
             return self.call(ctx, f"misa_fn_{name}", args, e,
@@ -1469,7 +1872,8 @@ class Emitter:
         def arg(i):
             v = self.emit_expr(e.args[i], ctx)
             self.check(ctx, e)
-            return v
+            # P-2: box raw i64 args for builtins (they take MVal*).
+            return self._ensure_mval(v, e.args[i], ctx)
 
         if name == "print":
             return self.call(ctx, "misa_print", [arg(0)], e)
@@ -1490,6 +1894,11 @@ class Emitter:
             m = arg(1) if len(e.args) > 1 else self.get_nil(ctx)
             return self.call(ctx, "misa_builtin_assert",
                              [c, m, line, col], e)
+        if name in ("assert_eq", "assert_ne"):
+            return self.call(ctx, "misa_builtin_" + name,
+                             [arg(0), arg(1), line, col], e)
+        if name == "argv":
+            return self.call(ctx, "misa_builtin_argv", [], e)
         if name == "env":
             v = arg(0)
             z = self.call(ctx, "misa_text_z", [v], e)
@@ -1602,11 +2011,31 @@ class Emitter:
         # defaults to an empty list.
         if name == "db.open":
             return self.call(ctx, "misa_db_open", [arg(0), line, col], e)
+        if name == "builder":
+            return self.call(ctx, "misa_builder_new", [], e, check=False)
+        if name == "builder.append":
+            return self.call(ctx, "misa_builder_append",
+                             [arg(0), arg(1), line, col], e)
+        if name == "builder.build":
+            return self.call(ctx, "misa_builder_build",
+                             [arg(0), line, col], e)
         if name == "db.exec":
             alist = arg(2) if len(e.args) > 2 else self.call(
                 ctx, "misa_list_new", [], e, check=False)
             return self.call(ctx, "misa_db_exec",
                              [arg(0), arg(1), alist, line, col], e)
+        if name == "db.exec_many":
+            return self.call(ctx, "misa_db_exec_many",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "db.begin":
+            return self.call(ctx, "misa_db_begin",
+                             [arg(0), line, col], e)
+        if name == "db.commit":
+            return self.call(ctx, "misa_db_commit",
+                             [arg(0), line, col], e)
+        if name == "db.rollback":
+            return self.call(ctx, "misa_db_rollback",
+                             [arg(0), line, col], e)
         if name == "db.query":
             alist = arg(2) if len(e.args) > 2 else self.call(
                 ctx, "misa_list_new", [], e, check=False)
@@ -1695,6 +2124,9 @@ class Emitter:
         for name, _ in names:
             a = ctx.scope.lookup(name)
             v = b.load(a, name=f"cap_{name}")
+            # P-2: box raw i64 captures.
+            if name in ctx.raw_int_vars:
+                v = self.call(ctx, "misa_int", [v], node, check=False)
             self.call(ctx, "misa_record_set_cstr",
                       [env, self.cstr(name), v], node, check=False)
         # 3. emit the body as misa_lambda_N(env, args).

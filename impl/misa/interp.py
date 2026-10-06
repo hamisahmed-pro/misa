@@ -50,6 +50,14 @@ class DbHandle:
     """Phase 5 (DB): an open SQLite connection (opaque `Db` value)."""
     path: str
     conn: Any  # sqlite3.Connection
+    # P-3: explicit-transaction state (db.begin/commit/rollback).
+    in_txn: bool = False
+
+
+@dataclass
+class TextBuilder:
+    """Text.Builder: amortized O(1) string building (perf gap P-1)."""
+    parts: list  # list[str]
 
 
 @dataclass
@@ -265,10 +273,14 @@ DEFAULT_TIMEOUT_S = 120.0
 
 class Interpreter:
     def __init__(self, *, mock_scripts: Optional[dict] = None,
-                 out=None, main_dir: Optional[str] = None):
+                 out=None, main_dir: Optional[str] = None,
+                 argv: Optional[list] = None):
         self.mock_scripts = mock_scripts or {}
         self.out = out if out is not None else sys.stdout
         self.main_dir = main_dir  # dir of the entry .misa file, if known
+        # Command-line arguments for the program (excluding the program
+        # name itself, like Python's sys.argv[1:]).
+        self.argv: list = list(argv) if argv else []
         self.file_of: Dict[int, str] = {}  # id(item) -> source file
         self._tokens_warned: set = set()
         self.reset()
@@ -281,6 +293,7 @@ class Interpreter:
         self.models: Dict[str, ast.ModelDecl] = {}
         self.screens: Dict[str, ast.ScreenDecl] = {}
         self.evals: Dict[str, ast.EvalDecl] = {}
+        self.tests: Dict[str, ast.TestDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
         # Screen state: the current screen frame (dict with name, args,
         # states, dirty, handlers) or None outside a screen.
@@ -391,6 +404,8 @@ class Interpreter:
                 self.screens[item.name] = item
             elif isinstance(item, ast.EvalDecl):
                 self.evals[item.name] = item
+            elif isinstance(item, ast.TestDecl):
+                self.tests[item.name] = item
             elif isinstance(item, ast.FnDecl):
                 self.fns[item.name] = item
             elif isinstance(item, ast.ExternDecl):
@@ -480,6 +495,12 @@ class Interpreter:
 
     def run(self, prog: ast.Program):
         self.load(prog)
+        self.exec_setup(prog)
+
+    def exec_setup(self, prog: ast.Program):
+        """Execute top-level statements (decls skipped, including
+        TestDecl/EvalDecl). Used by run() and by the `misa test` runner,
+        which needs setup without re-running the task-reaping tail."""
         # Phase 7: the program scope owns top-level spawns; run() waits
         # for outstanding tasks (bounded) when the program finishes.
         self._push_scope()
@@ -489,7 +510,8 @@ class Interpreter:
                                      ast.ModelsDecl, ast.TypeDecl,
                                      ast.TableDecl,
                                      ast.ModelDecl, ast.ScreenDecl,
-                                     ast.EvalDecl, ast.FnDecl,
+                                     ast.EvalDecl, ast.TestDecl,
+                                     ast.FnDecl,
                                      ast.ExternDecl,
                                      ast.ImportDecl)):
                     continue
@@ -506,6 +528,15 @@ class Interpreter:
                         col=getattr(item, "col", 0))
         finally:
             self._finish_tasks()
+
+    def run_one_test(self, tdecl: ast.TestDecl):
+        """Execute a single `test` block body in a fresh child env.
+        A bare `return` counts as a pass. Raises MisaError on failure."""
+        env = Env(self.global_env)
+        try:
+            self.exec_block(tdecl.body, env)
+        except _ReturnSignal:
+            pass  # early `return` = pass
 
     # -- statements ---------------------------------------------------
 
@@ -894,6 +925,13 @@ class Interpreter:
                     name = {"send": "chan.send", "recv": "chan.recv",
                             "close": "close"}[field]
                     args = [rv] + args
+                elif isinstance(rv, TextBuilder) \
+                        and field in ("append", "build"):
+                    # Text.Builder: `b.append(s)` / `b.build()` where the
+                    # variable holds a TextBuilder (checker rewrites the
+                    # checked AST; this covers ASTs that bypass checking).
+                    name = "builder." + field
+                    args = [rv] + args
         if name in self.models:
             return self.call_model(self.models[name], args, e)
         if name in self.screens:
@@ -989,11 +1027,36 @@ class Interpreter:
             return self.math_to_int("round", args[0], e,
                                     self._round_half_away)
         # -- Phase 5 (DB): SQLite bindings ------------------------------
+        if name == "builder":
+            return TextBuilder(parts=[])
+        if name == "builder.append":
+            b, s = args[0], args[1]
+            if not isinstance(b, TextBuilder):
+                raise TypeMismatch("builder.append needs a Builder "
+                                   "(from builder())",
+                                   line=e.line, col=e.col)
+            b.parts.append(render_value(s))
+            return None
+        if name == "builder.build":
+            b = args[0]
+            if not isinstance(b, TextBuilder):
+                raise TypeMismatch("builder.build needs a Builder "
+                                   "(from builder())",
+                                   line=e.line, col=e.col)
+            return "".join(b.parts)
         if name == "db.open":
             return self.db_open(args[0], e)
         if name == "db.exec":
             return self.db_exec(args[0], args[1],
                                 args[2] if len(args) > 2 else [], e)
+        if name == "db.exec_many":
+            return self.db_exec_many(args[0], args[1], args[2], e)
+        if name == "db.begin":
+            return self.db_begin(args[0], e)
+        if name == "db.commit":
+            return self.db_commit(args[0], e)
+        if name == "db.rollback":
+            return self.db_rollback(args[0], e)
         if name == "db.query":
             return self.db_query(args[0], args[1],
                                  args[2] if len(args) > 2 else [], e)
@@ -1527,11 +1590,70 @@ class Interpreter:
                  for i, a in enumerate(args)]
         try:
             cur = h.conn.execute(sql, bound)
-            h.conn.commit()
+            # P-3: don't autocommit inside an explicit transaction.
+            if not h.in_txn:
+                h.conn.commit()
             return cur.rowcount if cur.rowcount >= 0 else 0
         except sqlite3.Error as ex:
             raise IOError_(f"db.exec failed: {ex}",
                            line=node.line, col=node.col)
+
+    def db_exec_many(self, dbv, sql, rows, node: ast.Node) -> int:
+        # P-3: bulk inserts via executemany (single prepare).
+        h = self._db_handle(dbv, "db.exec_many", node)
+        if not isinstance(sql, str):
+            raise RuntimeError_("db.exec_many needs a text SQL statement",
+                                line=node.line, col=node.col)
+        if not isinstance(rows, list):
+            raise RuntimeError_("db.exec_many needs a list of rows",
+                                line=node.line, col=node.col)
+        bound_rows = []
+        for i, row in enumerate(rows):
+            if not isinstance(row, list):
+                raise RuntimeError_(
+                    f"db.exec_many: row {i} must be a list",
+                    line=node.line, col=node.col)
+            bound_rows.append(
+                [self._db_bind_arg(a, "db.exec_many", j + 1, node)
+                 for j, a in enumerate(row)])
+        try:
+            cur = h.conn.executemany(sql, bound_rows)
+            if not h.in_txn:
+                h.conn.commit()
+            return cur.rowcount if cur.rowcount >= 0 else 0
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.exec_many failed: {ex}",
+                           line=node.line, col=node.col)
+
+    def db_begin(self, dbv, node: ast.Node) -> None:
+        h = self._db_handle(dbv, "db.begin", node)
+        try:
+            h.conn.execute("BEGIN")
+            h.in_txn = True
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.begin failed: {ex}",
+                           line=node.line, col=node.col)
+        return None
+
+    def db_commit(self, dbv, node: ast.Node) -> None:
+        h = self._db_handle(dbv, "db.commit", node)
+        try:
+            h.conn.commit()
+            h.in_txn = False
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.commit failed: {ex}",
+                           line=node.line, col=node.col)
+        return None
+
+    def db_rollback(self, dbv, node: ast.Node) -> None:
+        h = self._db_handle(dbv, "db.rollback", node)
+        try:
+            h.conn.rollback()
+            h.in_txn = False
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.rollback failed: {ex}",
+                           line=node.line, col=node.col)
+        return None
 
     def db_query(self, dbv, sql, args, node: ast.Node) -> list:
         h = self._db_handle(dbv, "db.query", node)
@@ -1626,6 +1748,24 @@ class Interpreter:
                 raise AssertFailed(render_value(msg),
                                    line=node.line, col=node.col)
             return True
+        if name == "assert_eq":
+            # Same equality as the `==` operator (Python `==` on the
+            # underlying values); the rendered values are the message.
+            if not (args[0] == args[1]):
+                raise AssertFailed(
+                    f"assert_eq failed: {render_value(args[0])} != "
+                    f"{render_value(args[1])}",
+                    line=node.line, col=node.col)
+            return True
+        if name == "assert_ne":
+            if args[0] == args[1]:
+                raise AssertFailed(
+                    f"assert_ne failed: both are "
+                    f"{render_value(args[0])}",
+                    line=node.line, col=node.col)
+            return True
+        if name == "argv":
+            return list(self.argv)
         if name == "env":
             val = os.environ.get(args[0])
             if val is None:

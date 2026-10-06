@@ -627,6 +627,7 @@ static void render_into(Str *s, MVal *v) {
     case M_TAG_PTR: str_puts(s, "<ptr>"); break;
     case M_TAG_TASK: str_puts(s, "<task>"); break;
     case M_TAG_CHAN: str_puts(s, "<chan>"); break;
+    case M_TAG_BUILDER: str_puts(s, "<builder>"); break;
     default: str_puts(s, "<value>"); break;
     }
 }
@@ -638,12 +639,59 @@ MVal *misa_render(MVal *v) {
 }
 
 MVal *misa_text_concat(MVal *a, MVal *b) {
+    /* Fast path: both already Text — copy bytes directly, skipping the
+     * two misa_render() calls (each of which allocates + copies). */
+    if (a->tag == M_TAG_TEXT && b->tag == M_TAG_TEXT) {
+        Str s = {0};
+        str_putn(&s, a->u.text.data, a->u.text.len);
+        str_putn(&s, b->u.text.data, b->u.text.len);
+        return misa_text(s.buf ? s.buf : "", s.len);
+    }
     Str s = {0};
     MVal *ra = misa_render(a), *rb = misa_render(b);
     /* render() of Text is identity content-wise; use raw bytes */
     str_putn(&s, ra->u.text.data, ra->u.text.len);
     str_putn(&s, rb->u.text.data, rb->u.text.len);
     return misa_text(s.buf ? s.buf : "", s.len);
+}
+
+/* ---------------- Text.Builder ------------------ */
+/* Amortized O(1) appends via the exponential-overallocation Str.
+ * This is the fast path for building large strings in a loop;
+ * `s = s + x` is O(n^2) by construction (fresh value each time). */
+
+MVal *misa_builder_new(void) {
+    MVal *x = val_new(M_TAG_BUILDER);
+    Str *s = (Str *)misa_alloc(sizeof(Str));
+    s->buf = NULL; s->len = 0; s->cap = 0;
+    x->u.ptr = s;
+    return x;
+}
+
+static Str *builder_str(MVal *b, int line, int col, const char *op) {
+    if (b->tag != M_TAG_BUILDER) {
+        misa_raise("E200", "builder.append/build needs a Builder "
+                   "(from builder())", line, col);
+        return NULL;
+    }
+    return (Str *)b->u.ptr;
+}
+
+void misa_builder_append(MVal *b, MVal *v, int line, int col) {
+    Str *s = builder_str(b, line, col, "append");
+    if (!s) return;
+    if (v->tag == M_TAG_TEXT) {
+        str_putn(s, v->u.text.data, v->u.text.len);
+    } else {
+        MVal *r = misa_render(v);
+        str_putn(s, r->u.text.data, r->u.text.len);
+    }
+}
+
+MVal *misa_builder_build(MVal *b, int line, int col) {
+    Str *s = builder_str(b, line, col, "build");
+    if (!s) return NULL;
+    return misa_text(s->buf ? s->buf : "", s->len);
 }
 
 /* code-point indexed single char */
@@ -1152,6 +1200,29 @@ MVal *misa_builtin_assert(MVal *cond, MVal *msg, int line, int col) {
     return misa_bool(1);
 }
 
+MVal *misa_builtin_assert_eq(MVal *a, MVal *b, int line, int col) {
+    if (misa_pending()) return NULL;
+    MVal *eq = misa_eq(a, b);
+    if (!misa_truthy(eq)) {
+        misa_raise_fmt("E301", line, col, "assert_eq failed: %s != %s",
+                       misa_text_z(misa_render(a)),
+                       misa_text_z(misa_render(b)));
+        return NULL;
+    }
+    return misa_bool(1);
+}
+
+MVal *misa_builtin_assert_ne(MVal *a, MVal *b, int line, int col) {
+    if (misa_pending()) return NULL;
+    MVal *eq = misa_eq(a, b);
+    if (misa_truthy(eq)) {
+        misa_raise_fmt("E301", line, col, "assert_ne failed: both are %s",
+                       misa_text_z(misa_render(a)));
+        return NULL;
+    }
+    return misa_bool(1);
+}
+
 MVal *misa_builtin_env(const char *name, int line, int col) {
     /* P3: web/mobile have no process environment; the platform reads
      * an app-supplied config table instead. */
@@ -1162,6 +1233,25 @@ MVal *misa_builtin_env(const char *name, int line, int col) {
         return NULL;
     }
     return misa_text_cstr(v);
+}
+
+/* ---------------- argv ------------------ */
+/* Hosted targets stash argc/argv from main(); Android/iOS/web never
+ * call misa_argv_init, so argv() is [] there (documented in STDLIB.md). */
+static int g_argc = 0;
+static char **g_argv = NULL;
+
+void misa_argv_init(int argc, char **argv) {
+    g_argc = argc;
+    g_argv = argv;
+}
+
+MVal *misa_builtin_argv(void) {
+    MVal *list = misa_list_new();
+    /* Skip argv[0] (the program name), like Python's sys.argv[1:]. */
+    for (int i = 1; i < g_argc; i++)
+        misa_list_push(list, misa_text_cstr(g_argv[i]));
+    return list;
 }
 
 MVal *misa_builtin_media(int kind, MVal *path, int line, int col) {

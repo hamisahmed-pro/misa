@@ -134,7 +134,7 @@ fn get_env_or(name: Text, default: Text) -> Text {
   return out
 }
 
-fn db_path() -> Text {
+fn db_path() -> Text throws E226 {
   let home = getenv("HOME")
   if home == nil {
     return "/tmp/.misa-tasks.db"
@@ -185,14 +185,14 @@ fn parse_id(s: Text) -> Result<Int> {
 }
 
 // --- Database ---------------------------------------------------------------
-fn open_db() -> Db {
+fn open_db() -> Db throws E226, E303 {
   let db = db.open(db_path())
   db.exec(db, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL)")
   return db
 }
 
 // Convert typed query rows into named Task records.
-fn load_tasks(db: Db) -> [Task] {
+fn load_tasks(db: Db) -> [Task] throws E303 {
   let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
   var out: [Task] = []
   for r in rows {
@@ -202,7 +202,7 @@ fn load_tasks(db: Db) -> [Task] {
 }
 
 // --- Commands ----------------------------------------------------------------
-fn cmd_add(db: Db, title: Text) -> Void {
+fn cmd_add(db: Db, title: Text) -> Void throws E300, E303 {
   let trimmed = str.trim(title)
   if trimmed == "" {
     print("Error: task title is empty")
@@ -219,7 +219,7 @@ fn cmd_add(db: Db, title: Text) -> Void {
   }
 }
 
-fn cmd_list(db: Db) -> Void {
+fn cmd_list(db: Db) -> Void throws E300, E303 {
   let tasks = load_tasks(db)
   if len(tasks) == 0 {
     print("No tasks yet. Add one with TASKS_CMD=add TASKS_ARG=\"<title>\"")
@@ -240,12 +240,12 @@ fn cmd_list(db: Db) -> Void {
   print("— " + str(len(open)) + " open of " + str(len(tasks)))
 }
 
-fn apply_status(db: Db, id: Int, s: Status) -> Void {
+fn apply_status(db: Db, id: Int, s: Status) -> Void throws E303 {
   db.exec(db, "UPDATE tasks SET status = ? WHERE id = ?", [status_to_text(s), str(id)])
   print("Task " + str(id) + " -> " + status_to_text(s))
 }
 
-fn cmd_set_status(db: Db, id_text: Text, s: Status) -> Void {
+fn cmd_set_status(db: Db, id_text: Text, s: Status) -> Void throws E303 {
   // find<T> locates the task first, so a bad id gets a clean message
   // instead of a silent no-op.
   match parse_id(id_text) {
@@ -254,7 +254,7 @@ fn cmd_set_status(db: Db, id_text: Text, s: Status) -> Void {
   }
 }
 
-fn check_then_apply(db: Db, id: Int, s: Status) -> Void {
+fn check_then_apply(db: Db, id: Int, s: Status) -> Void throws E303 {
   let tasks = load_tasks(db)
   match find(tasks, |t: Task| t.id == id) {
     Result.Err(_) => say("Error: no task with id " + str(id)),
@@ -262,7 +262,7 @@ fn check_then_apply(db: Db, id: Int, s: Status) -> Void {
   }
 }
 
-fn cmd_export(db: Db) -> Void {
+fn cmd_export(db: Db) -> Void throws E300, E303 {
   let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
   print(json.stringify(rows))
 }
@@ -318,7 +318,7 @@ fn report_import(db: Db, arg_text: Text) -> Void {
   }
 }
 
-fn dispatch(db: Db, c: Cmd, arg_text: Text) -> Void {
+fn dispatch(db: Db, c: Cmd, arg_text: Text) -> Void throws E300, E303 {
   match c {
     Cmd.Add => cmd_add(db, arg_text),
     Cmd.List => cmd_list(db),
