@@ -31,12 +31,17 @@ def load(main_path: str):
     errors: List[dict] = []
     stack: List[str] = []
 
-    def visit(path: str):
+    def visit(path: str, item=None):
+        # L-1: the importing ImportDecl's position is threaded through so
+        # E111/E112 point at the offending `import` line, not <unknown>.
         ap = os.path.abspath(path)
+        iline = item.line if item is not None else 0
+        icol = item.col if item is not None else 0
         if ap in stack:
             cycle = " -> ".join(
                 [os.path.basename(p) for p in stack] + [os.path.basename(ap)])
-            errors.append(_err("E111", f"circular import: {cycle}", 0, 0,
+            errors.append(_err("E111", f"circular import: {cycle}",
+                               iline, icol,
                                hint="imports must form a DAG"))
             return
         if ap in seen:
@@ -46,7 +51,8 @@ def load(main_path: str):
                 src = f.read()
         except OSError:
             errors.append(_err("E112", f"cannot read import '{path}'",
-                               0, 0, hint="path is relative to the importing file"))
+                               iline, icol,
+                               hint="path is relative to the importing file"))
             return
         try:
             prog = parse_source(src, ap)
@@ -79,7 +85,7 @@ def load(main_path: str):
                             item.line, item.col, hint=e.hint))
                         continue
                 item.resolved = ipath
-                visit(ipath)
+                visit(ipath, item)
         stack.pop()
         seen[ap] = prog
         order.append(ap)

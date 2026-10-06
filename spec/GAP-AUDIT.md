@@ -249,14 +249,23 @@ print(json.stringify({"shape": s}))
 
 ## LOW
 
+All 8 LOW items cleared 2026-10-06 (commit pending parent push):
+
 - **L-1.** 12 E-codes report `<unknown>` position with an obvious source location (E111/E112/E300-int/E301/E303/E304/E305/E400/E401/E500/E503). AOT binaries report *better* positions than the interpreter for identical faults. (errors F10)
+  > **FIXED:** interpreter now threads call-site/decl positions through all of these (loader passes the `ImportDecl`; `call_builtin`/`eval_call`/`eval_expr` use the node in scope; model/budget/stream errors use the decl; E503 from lazy provider loads is re-stamped via `_at`). 7 new regression tests assert exact line:col.
 - **L-2.** E206's documented `'id:' needs a plain name` branch is **dead code** (parser rejects with E001 first). (errors F4)
+  > **FIXED:** dead branch removed from `checker.py`; `spec/ERRORS.md` E206 row updated to match reality.
 - **L-3.** E113 documented "(reserved)" but actively raised for bad `misa.pkg` manifests. (errors F3)
+  > **FIXED:** `spec/ERRORS.md` E113 row now documents its real meaning (bad `misa.pkg` manifest).
 - **L-4.** E212's message describes an `Error ({code, message})` shape that can't be assigned to a declared `Error` (nominal → E200). (errors F6)
+  > **FIXED:** message rewritten (checker + interp) to `'throw' needs an Error value: a { code: Text, message: Text } record literal or a caught error`; ERRORS.md updated. Regression test asserts the new wording.
 - **L-5.** E401 vs E600 split for missing on-device model file (run vs build); E303 message text differs interp vs AOT (same code). (errors F11/F12)
+  > **FIXED:** (a) split documented as intentional in ERRORS.md (E401 = misconfigured provider block at run; E600 = missing build asset at build); (b) interp `fs.read`/`fs.write` E303 text unified to the AOT wording (`fs.read failed: cannot open '<path>'`) — byte-identical modulo the path. Regression test asserts exact text.
 - **L-6.** E219's canonical trigger also emits a leading E211. (errors F7)
+  > **FIXED:** `checker.py` return-check skips E211 when both the declared return and the inferred type are bare type variables of the enclosing generic fn (the call site reports E219/E220). `fn f<T,K>(x: T) -> K` + `f(1)` now yields E219 alone; genuine mismatches (`-> Int` vs `T`) still E211. Two regression tests.
 - **L-7.** `strcmp` returning negative → `4294967295` on both backends (consistent; C-`int`→Misa-`Int` width footgun, user error per spec mapping). (fuzz)
-- **L-8.** Interpreter ~1000× slower than AOT on print-heavy loops (perf note, not a bug). (fuzz)
+  > **DOCUMENTED:** `spec/PHASE7-FFI.md` now warns (verified: C `-1` → `4294967295` on both backends, zero-extended) and gives the normalization patterns. No code change — behavior is consistent.
+- **L-8.** Interpreter ~1000× slower than AOT on print-heavy loops. **NOTED (no fix):** this is a known characteristic of the tree-walking interpreter, not a defect — use `misa build` for performance-sensitive code. (fuzz)
 
 ## Meta-finding: green suites that miss everything
 

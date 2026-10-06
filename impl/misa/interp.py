@@ -396,8 +396,10 @@ class Interpreter:
             v = self.eval_expr(s.value, env)
             if not isinstance(v, dict) or "code" not in v \
                     or "message" not in v:
-                raise RuntimeError_("throw needs { code: Text, "
-                                    "message: Text }")
+                raise RuntimeError_("throw needs an Error value: a "
+                                    "{ code: Text, message: Text } record "
+                                    "literal or a caught error",
+                                    line=s.line, col=s.col)
             raise ThrownError(str(v["code"]), str(v["message"]),
                              line=s.line, col=s.col)
         elif isinstance(s, ast.OnStmt):
@@ -505,20 +507,24 @@ class Interpreter:
                     if v is None:
                         raise RuntimeError_(
                             f"unknown variant '{e.field}' of sum type "
-                            f"'{decl.name}'")
+                            f"'{decl.name}'",
+                            line=e.line, col=e.col)
                     if v.fields:
                         raise RuntimeError_(
                             f"variant '{decl.name}.{v.name}' needs "
                             f"payload; use "
-                            f"'{decl.name}.{v.name}(...)'")
+                            f"'{decl.name}.{v.name}(...)'",
+                            line=e.line, col=e.col)
                     return SumValue(decl.name, v.name, [])
             obj = self.eval_expr(e.obj, env)
             if isinstance(obj, dict):
                 if e.field not in obj:
-                    raise RuntimeError_(f"no field '{e.field}'")
+                    raise RuntimeError_(f"no field '{e.field}'",
+                                            line=e.line, col=e.col)
                 return obj[e.field]
             raise RuntimeError_("cannot access field on "
-                                f"{type(obj).__name__}")
+                                f"{type(obj).__name__}",
+                                line=e.line, col=e.col)
         if isinstance(e, ast.Match):
             return self.eval_match(e, env)
         if isinstance(e, ast.Index):
@@ -527,13 +533,16 @@ class Interpreter:
             if isinstance(obj, MapValue):
                 if idx in obj.data:
                     return obj.data[idx]
-                raise MapKeyError(f"missing map key {idx!r}")
+                raise MapKeyError(f"missing map key {idx!r}",
+                                    line=e.line, col=e.col)
             if isinstance(obj, (list, str)) and isinstance(idx, int):
                 try:
                     return obj[idx]
                 except IndexError:
-                    raise RuntimeError_("index out of range")
-            raise RuntimeError_("cannot index here")
+                    raise RuntimeError_("index out of range",
+                                            line=e.line, col=e.col)
+            raise RuntimeError_("cannot index here",
+                                    line=e.line, col=e.col)
         if isinstance(e, ast.ListLit):
             return [self.eval_expr(i, env) for i in e.items]
         if isinstance(e, ast.MapLit):
@@ -552,11 +561,13 @@ class Interpreter:
                 return not self.truthy(v)
             if e.op == "-":
                 return wrap_i64(-v) if isinstance(v, int) else -v
-            raise RuntimeError_(f"unknown unary {e.op}")
+            raise RuntimeError_(f"unknown unary {e.op}",
+                                    line=e.line, col=e.col)
         if isinstance(e, ast.Await):
             handle = self.eval_expr(e.operand, env)
             if not isinstance(handle, TokenStreamHandle):
-                raise RuntimeError_("'await' needs a stream")
+                raise RuntimeError_("'await' needs a stream",
+                                        line=e.line, col=e.col)
             return self.drain_stream(handle, env)
         if isinstance(e, ast.StreamDecl):
             handle = self.make_stream(e.call, env, e)
@@ -732,16 +743,18 @@ class Interpreter:
                 with open(args[0], encoding="utf-8") as f:
                     return f.read()
             except OSError as ex:
-                raise IOError_(f"fs.read failed: {ex}")
+                raise IOError_(f"fs.read failed: cannot open '{args[0]}'",
+                               line=e.line, col=e.col)
         if name == "fs.write":
             try:
                 with open(args[0], "w", encoding="utf-8") as f:
                     f.write(args[1])
                 return None
             except OSError as ex:
-                raise IOError_(f"fs.write failed: {ex}")
+                raise IOError_(f"fs.write failed: cannot open '{args[0]}'",
+                               line=e.line, col=e.col)
         if name == "http.get":
-            return self.http_get(args[0])
+            return self.http_get(args[0], e)
         # -- Phase 5 (stdlib2): JSON, HTTP POST, time, math --------------
         if name == "json.parse":
             return self.json_parse(args[0], e)
@@ -862,18 +875,22 @@ class Interpreter:
         if not isinstance(cmd, list) or not cmd \
                 or not all(isinstance(c, str) for c in cmd):
             raise RuntimeError_(
-                "process.run([Text]) needs a non-empty text list")
+                "process.run([Text]) needs a non-empty text list",
+                line=node.line, col=node.col)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=300)
             return {"code": r.returncode, "stdout": r.stdout,
                     "stderr": r.stderr}
         except FileNotFoundError:
-            raise IOError_(f"process.run: command not found: {cmd[0]}")
+            raise IOError_(f"process.run: command not found: {cmd[0]}",
+                           line=node.line, col=node.col)
         except subprocess.TimeoutExpired:
-            raise IOError_(f"process.run timed out (300s): {cmd[0]}")
+            raise IOError_(f"process.run timed out (300s): {cmd[0]}",
+                           line=node.line, col=node.col)
         except OSError as ex:
-            raise IOError_(f"process.run failed: {ex}")
+            raise IOError_(f"process.run failed: {ex}",
+                           line=node.line, col=node.col)
 
     def call_fn(self, decl: ast.FnDecl, args: list, node: ast.Node) -> Any:
         local = Env(self.global_env)
@@ -885,34 +902,40 @@ class Interpreter:
             return r.value
         return None
 
-    def http_get(self, url: str) -> str:
+    def http_get(self, url: str, node: ast.Node) -> str:
+        # L-1: thread the call-site position (was <unknown>).
+        lc = {"line": node.line, "col": node.col}
         if not isinstance(url, str) or not url.startswith(
                 ("http://", "https://")):
-            raise HTTPError_(f"http.get needs an http(s) URL, got {url!r}")
+            raise HTTPError_(f"http.get needs an http(s) URL, got {url!r}",
+                             **lc)
         req = urllib.request.Request(
             url, headers={"User-Agent": "misa/0.2"})
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status < 200 or resp.status >= 300:
                     raise HTTPError_(
-                        f"http.get {url} -> HTTP {resp.status}")
+                        f"http.get {url} -> HTTP {resp.status}", **lc)
                 raw = resp.read()
         except urllib.error.HTTPError as ex:
-            raise HTTPError_(f"http.get {url} -> HTTP {ex.code}")
+            raise HTTPError_(f"http.get {url} -> HTTP {ex.code}", **lc)
         except urllib.error.URLError as ex:
-            raise HTTPError_(f"http.get failed: {ex.reason}")
+            raise HTTPError_(f"http.get failed: {ex.reason}", **lc)
         except TimeoutError:
-            raise HTTPError_(f"http.get timed out: {url}")
+            raise HTTPError_(f"http.get timed out: {url}", **lc)
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
-            raise HTTPError_(f"http.get {url}: body is not UTF-8 text")
+            raise HTTPError_(f"http.get {url}: body is not UTF-8 text", **lc)
 
     def http_post(self, url: str, body: str, content_type: str,
                   node: ast.Node) -> str:
+        # L-1: thread the call-site position (was <unknown>).
+        lc = {"line": node.line, "col": node.col}
         if not isinstance(url, str) or not url.startswith(
                 ("http://", "https://")):
-            raise HTTPError_(f"http.post needs an http(s) URL, got {url!r}")
+            raise HTTPError_(f"http.post needs an http(s) URL, got {url!r}",
+                             **lc)
         req = urllib.request.Request(
             url, data=body.encode("utf-8"),
             headers={"User-Agent": "misa/0.2",
@@ -921,18 +944,18 @@ class Interpreter:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status < 200 or resp.status >= 300:
                     raise HTTPError_(
-                        f"http.post {url} -> HTTP {resp.status}")
+                        f"http.post {url} -> HTTP {resp.status}", **lc)
                 raw = resp.read()
         except urllib.error.HTTPError as ex:
-            raise HTTPError_(f"http.post {url} -> HTTP {ex.code}")
+            raise HTTPError_(f"http.post {url} -> HTTP {ex.code}", **lc)
         except urllib.error.URLError as ex:
-            raise HTTPError_(f"http.post failed: {ex.reason}")
+            raise HTTPError_(f"http.post failed: {ex.reason}", **lc)
         except TimeoutError:
-            raise HTTPError_(f"http.post timed out: {url}")
+            raise HTTPError_(f"http.post timed out: {url}", **lc)
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
-            raise HTTPError_(f"http.post {url}: body is not UTF-8 text")
+            raise HTTPError_(f"http.post {url}: body is not UTF-8 text", **lc)
 
     # -- Phase 5 (stdlib2): JSON ---------------------------------------
 
@@ -1179,7 +1202,8 @@ class Interpreter:
             try:
                 v = int(a)
             except (ValueError, TypeError, OverflowError):
-                raise RuntimeError_(f"cannot parse int from {a!r}")
+                raise RuntimeError_(f"cannot parse int from {a!r}",
+                                    line=node.line, col=node.col)
             return wrap_i64(v) if isinstance(v, int) else v
         if name == "float":
             try:
@@ -1189,7 +1213,8 @@ class Interpreter:
         if name == "assert":
             msg = args[1] if len(args) > 1 else "assertion failed"
             if not self.truthy(args[0]):
-                raise AssertFailed(render_value(msg))
+                raise AssertFailed(render_value(msg),
+                                   line=node.line, col=node.col)
             return True
         if name == "env":
             val = os.environ.get(args[0])
@@ -1268,19 +1293,36 @@ class Interpreter:
 
     # -- model calls --------------------------------------------------
 
+    @staticmethod
+    def _at(err, node):
+        """L-1: stamp a source position onto an error that was raised
+        without one (e.g. deep inside providers.py). Never clobbers a
+        position that is already set."""
+        if err.line == 0 and node is not None:
+            err.line, err.col = node.line, node.col
+        return err
+
     def get_provider(self, decl: ast.ModelDecl) -> tuple:
+        # L-1: model errors carry the model-decl position (was <unknown>).
+        lc = {"line": decl.line, "col": decl.col}
         if decl.alias not in self.aliases:
-            raise ModelError(f"unknown model alias '{decl.alias}'")
+            raise ModelError(f"unknown model alias '{decl.alias}'", **lc)
         prov_name, model_id = self.aliases[decl.alias]
         if prov_name not in self.providers:
-            raise ModelError(f"unknown provider '{prov_name}'")
+            raise ModelError(f"unknown provider '{prov_name}'", **lc)
         pdecl = self.providers[prov_name]
         if pdecl.model_file:
             # on-device: the file (not the name) selects the runtime
             mpath = self._resolve_model_file(pdecl)
             key = (prov_name, decl.alias, mpath)
             if key not in self.provider_cache:
-                self.provider_cache[key] = OnDeviceProvider(mpath)
+                try:
+                    self.provider_cache[key] = OnDeviceProvider(mpath)
+                except (OnDeviceRuntimeUnavailable,
+                        ProviderConfigError) as ex:
+                    # E503/E401 from provider construction (e.g. CoreML
+                    # on non-Apple hardware, missing model file).
+                    raise self._at(ex, decl)
             return self.provider_cache[key], model_id
         key = (prov_name, decl.alias)
         if key not in self.provider_cache:
@@ -1308,7 +1350,8 @@ class Interpreter:
                 return c
         raise ProviderConfigError(
             f"on-device model file not found: '{rel}'",
-            hint="checked: " + ", ".join(cands))
+            hint="checked: " + ", ".join(cands),
+            line=pdecl.line, col=pdecl.col)
 
     def render_prompt(self, decl: ast.ModelDecl,
                       arg_values: list) -> tuple:
@@ -1335,7 +1378,8 @@ class Interpreter:
         # fallback: evaluate with a tiny env of raw values is overkill;
         # identifiers are the sane case in v0.1
         raise ModelError("prompt interpolation supports parameter "
-                         "names only in v0.1")
+                         "names only in v0.1",
+                         line=e.line, col=e.col)
 
     def call_model(self, decl: ast.ModelDecl, arg_values: list,
                    node: ast.Node) -> Any:
@@ -1345,7 +1389,8 @@ class Interpreter:
                 f"got {len(arg_values)}")
         provider, model_id = self.get_provider(decl)
         if isinstance(provider, OnDeviceProvider):
-            return self.call_ondevice(provider, decl, model_id, arg_values)
+            return self.call_ondevice(provider, decl, model_id, arg_values,
+                                       node)
         prompt_text, images = self.render_prompt(decl, arg_values)
         timeout_s = DEFAULT_TIMEOUT_S
         if decl.budget and decl.budget.latency_ms:
@@ -1374,18 +1419,20 @@ class Interpreter:
             raise SchemaValidationError(
                 f"model '{decl.name}' returned invalid data after "
                 f"3 attempts", validation_errors=errors,
-                hint="check the return type declaration")
+                hint="check the return type declaration",
+                line=node.line, col=node.col)
         if value is None and errors:
             raise SchemaValidationError(
                 f"model '{decl.name}' returned invalid data",
-                validation_errors=errors)
+                validation_errors=errors,
+                line=node.line, col=node.col)
         latency_ms = int((time.monotonic() - t0) * 1000)
         self.check_budget(decl, usage, latency_ms, model_id)
         return value
 
     def call_ondevice(self, provider: OnDeviceProvider,
                       decl: ast.ModelDecl, model_id: str,
-                      arg_values: list) -> Any:
+                      arg_values: list, node: ast.Node) -> Any:
         """Single-shot local inference: no prompt rendering, no repair
         retries. The provider returns the first model output as JSON;
         the declared return type is validated as usual."""
@@ -1400,20 +1447,27 @@ class Interpreter:
         if decl.budget and decl.budget.latency_ms:
             timeout_s = min(timeout_s, decl.budget.latency_ms / 1000.0)
         t0 = time.monotonic()
-        comp = provider.complete(model_id=model_id, prompt="", images=[],
-                                 timeout_s=timeout_s, args=arg_values,
-                                 params=decl.params, ret=decl.ret)
+        try:
+            comp = provider.complete(model_id=model_id, prompt="", images=[],
+                                     timeout_s=timeout_s, args=arg_values,
+                                     params=decl.params, ret=decl.ret)
+        except OnDeviceRuntimeUnavailable as ex:
+            # L-1: E503 from lazy runtime load (e.g. missing onnxruntime
+            # at first inference) gets the call-site position.
+            raise self._at(ex, node)
         try:
             data = json.loads(comp.text)
         except json.JSONDecodeError:
             raise SchemaValidationError(
-                f"on-device model '{decl.name}' returned invalid data")
+                f"on-device model '{decl.name}' returned invalid data",
+                line=node.line, col=node.col)
         value, errors = self.validate(data, decl.ret, "$")
         if errors:
             raise SchemaValidationError(
                 f"on-device model '{decl.name}' returned invalid data",
                 validation_errors=errors,
-                hint="check the return type declaration")
+                hint="check the return type declaration",
+                line=node.line, col=node.col)
         latency_ms = int((time.monotonic() - t0) * 1000)
         # token/cost budgets are vacuous (usage is zero); latency is real
         self.check_budget(decl, comp.usage, latency_ms, model_id)
@@ -1430,20 +1484,22 @@ class Interpreter:
         b = decl.budget
         if not b:
             return
+        # L-1: budget errors point at the model decl (was <unknown>).
+        lc = {"line": decl.line, "col": decl.col}
         if b.tokens is not None and usage.total_tokens > b.tokens:
             raise BudgetExceeded(
                 f"token budget exceeded: used {usage.total_tokens}, "
-                f"budget {b.tokens}")
+                f"budget {b.tokens}", **lc)
         if b.latency_ms is not None and latency_ms > b.latency_ms:
             raise BudgetExceeded(
                 f"latency budget exceeded: took {latency_ms}ms, "
-                f"budget {b.latency_ms}ms")
+                f"budget {b.latency_ms}ms", **lc)
         if b.cost_usd is not None:
             cost = estimate_cost_usd(model_id, usage)
             if cost > b.cost_usd:
                 raise BudgetExceeded(
                     f"cost budget exceeded: ~${cost:.4f}, "
-                    f"budget ${b.cost_usd:.4f} (estimated)")
+                    f"budget ${b.cost_usd:.4f} (estimated)", **lc)
 
     # -- validation ---------------------------------------------------
 
@@ -1568,7 +1624,9 @@ class Interpreter:
                 for h in handle.handlers:
                     self.invoke_lambda(h, [token], env)
         except Exception as e:
-            raise ModelError(f"stream failed: {e}")
+            # L-1: stream failures point at the model decl (was <unknown>).
+            raise ModelError(f"stream failed: {e}",
+                             line=handle.decl.line, col=handle.decl.col)
         # validate like a normal call (single repair via complete if needed)
         try:
             data = json.loads(text)

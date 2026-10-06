@@ -27,7 +27,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E110 | Duplicate definition across imported files (same name, different files). |
 | E111 | Circular import. |
 | E112 | Import cannot be resolved / not a `.misa` file. |
-| E113 | (reserved) |
+| E113 | Bad `misa.pkg` manifest (`invalid TOML in misa.pkg: …`). Raised by the package resolver (L-3: was documented "(reserved)" but actively used). |
 
 ## E2xx — static types
 
@@ -39,13 +39,13 @@ Every Misa diagnostic carries a code. Ranges:
 | E203 | `eval given` keys do not match the model's parameters. |
 | E204 | `eval expect` is not a Bool expression. |
 | E205 | `await`/`on`/`stream` misused (needs a TokenStream / model call). |
-| E206 | Screen DSL misuse (`'id:' needs a plain name`, handler arity). |
+| E206 | Screen DSL misuse (unknown component, children on a leaf component, handler arity). (L-2: the documented `'id:' needs a plain name` branch was dead code — the parser rejects a non-identifier `id:` with E001 first — and has been removed.) |
 | E207 | Duplicate component id. |
 | E208 | Unknown type name in an annotation. |
 | E209 | Unknown provider / model alias / on-device model problem at check time. |
 | E210 | Duplicate definition in one file (`duplicate function 'f'`, `redefinition of 'x'`). |
 | E211 | Argument/return type mismatch (`argument 'x' wants Int, got Text`). |
-| E212 | `throw` of a non-`Error` value. |
+| E212 | `throw` of a non-`Error` value. Accepts a `{ code: Text, message: Text }` record *literal* or a caught error — a plain record cannot be assigned to the nominal `Error` type (E200). |
 | E213 | **(Phase 5a)** Cannot infer a lambda parameter's type — annotate it (`\|x: Int\|`) or use the lambda where a function type is expected. |
 | E214 | **(Phase 5a)** A builtin (`print`, `str`, `fs.read`, …) used as a value. Builtins are not first-class. **(M-7)** Also fires for an `extern` (FFI) function used as a value — extern functions are not first-class either. |
 | E215 | **(Phase 5a)** Calling a value that is not a function (`'x' has type 'Int' and is not callable`). |
@@ -77,7 +77,7 @@ Every Misa diagnostic carries a code. Ranges:
 | Code | Meaning |
 |---|---|
 | E400 | Model call failed (transport, malformed response, schema validation). |
-| E401 | Provider configuration error (bad key, unknown provider). |
+| E401 | Provider configuration error (bad key, unknown provider). A missing on-device model file is E401 under `misa run` (the provider block is misconfigured), but E600 under `misa build` (the file is a build asset that cannot be staged — a packaging failure, not a config check). The split is intentional. |
 | E402 | Streaming unsupported in this context (AOT). |
 
 ## E5xx — budgets / on-device
@@ -94,7 +94,7 @@ Every Misa diagnostic carries a code. Ranges:
 
 | Code | Meaning |
 |---|---|
-| E600 | AOT/build failure (link errors, unsupported construct for the target). |
+| E600 | AOT/build failure (link errors, unsupported construct for the target, missing on-device model asset — see E401 for the intentional run/build split). |
 
 ## Catching
 

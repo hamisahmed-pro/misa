@@ -38,6 +38,19 @@ let n = strlen("hello")   // 5
 **v1 limits:** no structs by value, no callbacks (Misa fn → C function
 pointer), no varargs. These are Phase 8+.
 
+**C-`int` width footgun (L-7):** Misa `Int` maps to C `long` (64-bit), so a
+C function declared to return `int` (32-bit) has its 32-bit result
+zero-extended into the 64-bit Misa `Int`. A negative C `int` therefore
+arrives as a large positive number — e.g. `strcmp("a", "b")` returns C
+`-1`, which surfaces in Misa as `4294967295`, not `-1` (verified
+identical on interpreter and AOT). It is consistent — but it is *your*
+bug if you compare the result against `-1` or test `< 0`. Patterns:
+- Never test the raw result with `< 0`; it will never be true.
+- Wrap the call in a tiny C shim that normalizes to `0`/`1` (or another
+  unambiguous encoding) and declare the shim in the `extern` block.
+- For C APIs whose contract is "negative on error / non-negative on
+  success", normalize through a shim returning `Bool` before branching.
+
 ## Semantics
 
 - Text arguments are null-terminated copies; the C side must not retain

@@ -2360,6 +2360,95 @@ def _():
     eq(out, "caught E302\n")
 
 
+# ---------------------------------------------------------------- LOW audit
+# fixes (2026-10-06)
+
+@test("L-1: E300 int-parse carries the call-site position")
+def _():
+    e = raises_code(lambda: run_src('print(int("abc"))\n'), "E300")
+    eq((e.line, e.col), (1, 7), f"got {e.line}:{e.col}")
+
+
+@test("L-1: E301 assert carries the assert position")
+def _():
+    e = raises_code(lambda: run_src('assert(false)\n'), "E301")
+    eq((e.line, e.col), (1, 1), f"got {e.line}:{e.col}")
+
+
+@test("L-1+L-5: E303 fs.read position and AOT-identical message text")
+def _():
+    e = raises_code(lambda: run_src('print(fs.read("nope-xyz.txt"))\n'),
+                    "E303")
+    eq((e.line, e.col), (1, 9), f"got {e.line}:{e.col}")
+    # L-5b: identical to the AOT runtime's wording.
+    eq(e.message, "fs.read failed: cannot open 'nope-xyz.txt'")
+
+
+@test("L-1: E305 missing map key carries the index position")
+def _():
+    src = ('let m = {"a": 1}\n'
+           'print(m["zz"])\n')
+    e = raises_code(lambda: run_src(src), "E305")
+    eq((e.line, e.col), (2, 8), f"got {e.line}:{e.col}")
+
+
+@test("L-1: E304 http.get bad URL carries the call-site position")
+def _():
+    e = raises_code(lambda: run_src('print(http.get("notaurl"))\n'), "E304")
+    eq((e.line, e.col), (1, 11), f"got {e.line}:{e.col}")
+
+
+@test("L-1: E112 missing import points at the import line")
+def _():
+    d = _write_files({"main.misa": 'import "nope.misa"\n'})
+    errs = check_file(os.path.join(d, "main.misa"))
+    e112 = [e for e in errs if e["code"] == "E112"]
+    assert e112, errs
+    eq((e112[0]["line"], e112[0]["col"]), (1, 1))
+
+
+@test("L-1: E111 circular import points at the import line")
+def _():
+    d = _write_files({
+        "a.misa": 'import "b.misa"\n',
+        "b.misa": 'import "a.misa"\n',
+    })
+    errs = check_file(os.path.join(d, "a.misa"))
+    e111 = [e for e in errs if e["code"] == "E111"]
+    assert e111, errs
+    assert e111[0]["line"] == 1, e111[0]
+
+
+@test("L-4: E212 message no longer promises Error-shape assignment")
+def _():
+    src = 'throw 42\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E212" for e in errs), errs
+    msg = [e for e in errs if e["code"] == "E212"][0]["message"]
+    assert "record literal" in msg, msg
+
+
+@test("L-6: E219 fires alone, no leading E211")
+def _():
+    src = ('fn f<T, K>(x: T) -> K {\n'
+           '  return x\n'
+           '}\n'
+           'let a = f(1)\n')
+    errs = check_source(src)
+    codes = [e["code"] for e in errs]
+    assert "E219" in codes, errs
+    assert "E211" not in codes, errs
+
+
+@test("L-6: genuine return mismatch in generic fn still E211s")
+def _():
+    src = ('fn f<T>(x: T) -> Int {\n'
+           '  return x\n'
+           '}\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

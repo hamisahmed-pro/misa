@@ -425,10 +425,11 @@ class Checker:
                        c.line, c.col)
         for an, val in c.args:
             if an == "id":
-                if not isinstance(val, ast.Ident):
-                    self.error("E206", "'id:' needs a plain name",
-                               val.line, val.col)
-                elif val.name in seen_ids:
+                # L-2: the parser (expect_ident) already rejects a
+                # non-identifier id: with E001, so `val` is always an
+                # Ident here — the old "'id:' needs a plain name" branch
+                # was dead code.
+                if val.name in seen_ids:
                     self.error("E207",
                                f"duplicate component id '{val.name}'",
                                val.line, val.col)
@@ -590,9 +591,17 @@ class Checker:
                     self.error("E211", "cannot return a value from "
                                "a Void function", s.line, s.col)
                 elif t != "unknown" and not self._assignable(fn_ret, t):
-                    self.error("E211",
-                               f"return wants {fn_ret}, got {t}",
-                               s.line, s.col)
+                    # L-6: inside a generic fn, `return x` (x: T) against
+                    # `-> K` is not a definition-site error — both are
+                    # unbound type variables settled at the call site
+                    # (E219/E220). Emitting E211 here produced a spurious
+                    # leading error before the real E219.
+                    if fn_ret in self._tparams and t in self._tparams:
+                        pass
+                    else:
+                        self.error("E211",
+                                   f"return wants {fn_ret}, got {t}",
+                                   s.line, s.col)
         elif isinstance(s, ast.TryStmt):
             self._check_block(s.body, dict(scope), fn_ret,
                                    _ret_collect=_ret_collect)
@@ -602,8 +611,13 @@ class Checker:
                               _ret_collect=_ret_collect)
         elif isinstance(s, ast.ThrowStmt):
             if not self._is_error_value(s.value, scope):
-                self.error("E212", "'throw' needs an Error "
-                           "({ code: Text, message: Text })",
+                # L-4: the old message ("an Error ({ code: Text,
+                # message: Text })") promised a shape that cannot be
+                # assigned to the nominal Error type (E200). `throw`
+                # takes a record *literal* or a caught error value.
+                self.error("E212", "'throw' needs an Error value: a "
+                           "{ code: Text, message: Text } record literal "
+                           "or a caught error",
                            s.line, s.col)
         elif isinstance(s, ast.OnStmt):
             t = self._infer(s.stream, scope)
