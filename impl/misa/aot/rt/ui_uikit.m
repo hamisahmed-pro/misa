@@ -267,15 +267,19 @@ static void misa_camera_present(MisaUI *ui, MisaWidget w) {
 MisaWidget misa_ui_begin_screen(MisaUI *ui, const char *name) {
     (void)name;
     /* Fresh widget namespace per screen. */
+    NSLog(@"misa: begin_screen entry");
     [ui->views removeAllObjects];
     [ui->views addObject:[NSNull null]];
     ui->nw = 0;
-    return misa_ui_begin_comp(ui, 0, "__screen__");
+    MisaWidget r = misa_ui_begin_comp(ui, 0, "__screen__");
+    NSLog(@"misa: begin_screen exit");
+    return r;
 }
 
 MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
                               const char *kind) {
     __block MisaWidget w = 0;
+    NSLog(@"misa: begin_comp entry kind=%s", kind ? kind : "(null)");
     ui_main_sync(^{
         ui_grow_meta(ui);
         UIView *v = nil;
@@ -344,6 +348,7 @@ MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
                 [p addSubview:v];
         }
     });
+    NSLog(@"misa: begin_comp exit kind=%s", kind ? kind : "(null)");
     return w;
 }
 
