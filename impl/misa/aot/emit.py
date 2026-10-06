@@ -183,6 +183,14 @@ class Emitter:
         self.SUM_TAG = "__tag"
         self.SUM_FIELDS = "__fields"
         self.SUM_DISP = "__sum_disp"
+        # Phase 5c: generics — lazy monomorphization. (name, arg-tuple)
+        # -> ir.Function. Type args are erased at runtime (all MVal*),
+        # so specializations share code shape; the mangled symbols keep
+        # them distinct and future-proof for unboxed representations.
+        self.mono_fns = {}
+        self._mono_subst = {}  # type var -> concrete type (current spec)
+        self._mono_depth = 0
+        self._MONO_MAX_DEPTH = 32
         self.fn_decls = {}
         self.model_decls = {}
         self.screen_decls = {}
@@ -254,7 +262,10 @@ class Emitter:
         self.declare_runtime()
         self.check_no_streaming(self.prog)
         # declare Misa functions first (recursion)
+        # Phase 5c: generic fns are monomorphized lazily on first use.
         for name, decl in self.fn_decls.items():
+            if decl.type_params:
+                continue
             fty = ir.FunctionType(PTR, [PTR] * len(decl.params))
             self.fns[name] = ir.Function(
                 self.mod, fty, name=f"misa_fn_{name}")
@@ -265,6 +276,8 @@ class Emitter:
             self.screens[name] = ir.Function(
                 self.mod, fty, name=f"misa_screen_{name}")
         for name, decl in self.fn_decls.items():
+            if decl.type_params:
+                continue
             self.emit_fn_body(name, decl)
         for name, decl in self.screen_decls.items():
             self.emit_screen_body(name, decl)
@@ -393,6 +406,9 @@ class Emitter:
 
     def emit_fn_body(self, name: str, decl: A.FnDecl):
         fn = self.fns[name]
+        self.emit_fn_body_direct(fn, decl)
+
+    def emit_fn_body_direct(self, fn, decl: A.FnDecl):
         ctx = self.new_fn_ctx(fn)
         # Phase 5a: cell-allocate `var`s captured by nested lambdas.
         ctx.cell_vars = self._cell_vars_for(decl.body)
@@ -408,6 +424,121 @@ class Emitter:
         # reposition after allocas: builder is at end of entry already
         self.emit_block(decl.body, ctx)
         self.finish_fn_ctx(ctx)
+
+    # -- Phase 5c: monomorphization ------------------------------------
+
+    def _te_str(self, te) -> str:
+        """Render a TypeExpr to a canonical string (for mangling)."""
+        if te.is_func:
+            ps = ", ".join(self._te_str(p) for p in te.func_params)
+            r = self._te_str(te.func_ret) if te.func_ret else "Void"
+            s = f"({ps}) -> {r}"
+        elif te.is_list:
+            if te.list_elem is not None:
+                s = f"[{self._te_str(te.list_elem)}]"
+            else:
+                s = f"[{te.name}]"
+        elif te.is_map:
+            s = (f"Map<{self._te_str(te.map_key)}, "
+                 f"{self._te_str(te.map_val)}>")
+        elif te.type_args:
+            inner = ", ".join(self._te_str(a) for a in te.type_args)
+            s = f"{te.name}<{inner}>"
+        else:
+            s = te.name
+        if te.optional:
+            s += "?"
+        return s
+
+    @staticmethod
+    def _mangle(s: str) -> str:
+        """Make a type string symbol-safe, preserving structure."""
+        out = []
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch.isalnum() or ch == "_":
+                out.append(ch)
+            elif ch == "[":
+                out.append("L")
+            elif ch == "<":
+                out.append("_")
+            elif ch in ", ":
+                if out and out[-1] != "_":
+                    out.append("_")
+            elif ch == "(":
+                out.append("F")
+            elif ch == "?":
+                out.append("Q")
+            elif ch == "-" and s[i:i + 2] == "->":
+                out.append("R")
+                i += 1
+            # drop: ] > ) and stray chars
+            i += 1
+        return "".join(out).strip("_")
+
+    def _get_mono_fn(self, name: str, decl, arg_strs: tuple,
+                     node) -> object:
+        """Return the monomorphized ir.Function for a generic fn,
+        emitting its body on first use (lazy)."""
+        key = (name, arg_strs)
+        if key in self.mono_fns:
+            return self.mono_fns[key]
+        if self._mono_depth >= self._MONO_MAX_DEPTH:
+            raise AOTError("E223",
+                           f"monomorphization depth exceeded for "
+                           f"'{name}' (recursive generic instantiation)",
+                           node.line, node.col)
+        mangled = "__".join([name] + [self._mangle(a)
+                                      for a in arg_strs])
+        fty = ir.FunctionType(PTR, [PTR] * len(decl.params))
+        fn = ir.Function(self.mod, fty, name=f"misa_fn_{mangled}")
+        # register before emitting the body (recursive calls)
+        self.mono_fns[key] = fn
+        saved_subst = self._mono_subst
+        self._mono_subst = dict(zip(decl.type_params, arg_strs))
+        self._mono_depth += 1
+        try:
+            self.emit_fn_body_direct(fn, decl)
+        finally:
+            self._mono_subst = saved_subst
+            self._mono_depth -= 1
+        return fn
+
+    def _resolve_targs(self, type_args) -> tuple:
+        """Render call-site type args to concrete strings, substituting
+        the current specialization's type variables."""
+        import re
+        out = []
+        for ta in type_args:
+            s = self._te_str(ta)
+            for var, concrete in self._mono_subst.items():
+                s = re.sub(r"\b" + re.escape(var) + r"\b", concrete, s)
+            out.append(s)
+        return tuple(out)
+
+    def emit_mono_call(self, name: str, decl, e, ctx):
+        """Phase 5c: emit a call to a generic fn via monomorphization."""
+        if not e.type_args:
+            raise AOTError("E600",
+                           f"generic fn '{name}' has no type arguments "
+                           f"(checker should have inferred them)",
+                           e.line, e.col)
+        arg_strs = self._resolve_targs(e.type_args)
+        if len(arg_strs) != len(decl.type_params):
+            raise AOTError("E600",
+                           f"generic fn '{name}' takes "
+                           f"{len(decl.type_params)} type args, got "
+                           f"{len(arg_strs)}", e.line, e.col)
+        fn = self._get_mono_fn(name, decl, arg_strs, e)
+        args = []
+        for a in e.args:
+            v = self.emit_expr(a, ctx)
+            self.check(ctx, e)
+            args.append(v)
+        v = ctx.builder.call(fn, args, name=f"_mono_{name}")
+        self.check(ctx, e)
+        return v
 
     def emit_main_fn(self):
         fty = ir.FunctionType(PTR, [])
@@ -903,6 +1034,10 @@ class Emitter:
             self.check(ctx, e)
             return self.emit_closure_call(e, ctx, clos)
         name = e.name
+        # Phase 5c: generic fns go through monomorphization.
+        if name in self.fn_decls and self.fn_decls[name].type_params:
+            return self.emit_mono_call(name, self.fn_decls[name], e,
+                                       ctx)
         if name in self.fns:
             decl = self.fn_decls[name]
             if len(e.args) != len(decl.params):
@@ -936,6 +1071,24 @@ class Emitter:
                 target = None
             if target is not None:
                 return self.emit_closure_call_var(e, ctx, name, target)
+        # Phase 5c: generic record construction `Box<Int>(42)`.
+        # Erasure: just build the record; type args are checking-time.
+        if name in self.type_decls:
+            tdecl = self.type_decls[name]
+            if tdecl.type_params and not tdecl.is_sum:
+                if len(e.args) != len(tdecl.fields):
+                    raise AOTError("E600",
+                                   f"'{name}' takes {len(tdecl.fields)} "
+                                   f"field arg(s), got {len(e.args)}",
+                                   e.line, e.col)
+                r = self.call(ctx, "misa_record_new", [], e,
+                              check=False)
+                for (fname, _), a in zip(tdecl.fields, e.args):
+                    v = self.emit_expr(a, ctx)
+                    self.check(ctx, e)
+                    self.call(ctx, "misa_record_set_cstr",
+                              [r, self.cstr(fname), v], e, check=False)
+                return r
         # Phase 5b: sum variant construction `Type.Variant(args)`.
         if "." in name:
             head, _, var = name.partition(".")
@@ -1189,6 +1342,14 @@ class Emitter:
 
     def emit_fn_value(self, name: str, node: A.Node, ctx: FnCtx):
         """A closure value wrapping an `fn` declaration."""
+        # Phase 5c: generic fns as values need a specialization context;
+        # v1 AOT rejects them (the interpreter supports `let g = first`).
+        decl = self.fn_decls.get(name)
+        if decl is not None and decl.type_params:
+            raise AOTError("E600",
+                           f"generic fn '{name}' used as a value is not "
+                           f"supported in AOT v1 (call it directly)",
+                           node.line, node.col)
         tramp = self.emit_fn_trampoline(name)
         b = ctx.builder
         clos = self.call(ctx, "misa_record_new", [], node, check=False)

@@ -71,7 +71,10 @@ class Formatter:
             self.ind -= 1
             self.w("}")
         elif isinstance(item, ast.TypeDecl):
-            self.w(f"type {item.name} {{")
+            # Phase 5c: type parameters.
+            tp = f"<{', '.join(item.type_params)}>" if item.type_params \
+                else ""
+            self.w(f"type {item.name}{tp} {{")
             self.ind += 1
             if item.is_sum:
                 # Phase 5b: sum variants.
@@ -134,7 +137,10 @@ class Formatter:
         elif isinstance(item, ast.FnDecl):
             params = ", ".join(f"{n}: {self.fmt_type(t)}"
                                for n, t in item.params)
-            head = f"fn {item.name}({params})"
+            # Phase 5c: type parameters.
+            tp = f"<{', '.join(item.type_params)}>" \
+                if item.type_params else ""
+            head = f"fn {item.name}{tp}({params})"
             if item.ret is not None:
                 head += f" -> {self.fmt_type(item.ret)}"
             self.w(head + " {")
@@ -172,10 +178,18 @@ class Formatter:
             return s
         s = te.name
         if te.is_list:
-            s = f"[{s}]"
+            # Phase 5c: full inner structure when preserved.
+            if te.list_elem is not None:
+                s = f"[{self.fmt_type(te.list_elem)}]"
+            else:
+                s = f"[{s}]"
         elif te.is_map:
             s = (f"Map<{self.fmt_type(te.map_key)}, "
                  f"{self.fmt_type(te.map_val)}>")
+        elif te.type_args:
+            # Phase 5c: applied generic types.
+            args = ", ".join(self.fmt_type(a) for a in te.type_args)
+            s = f"{s}<{args}>"
         if te.optional:
             s += "?"
         return s
@@ -365,7 +379,18 @@ class Formatter:
             return e.name
         if isinstance(e, ast.Call):
             args = ", ".join(self.fmt_expr(a) for a in e.args)
-            return f"{e.name}({args})"
+            # Phase 5c: explicit type arguments. For `Result<Int>.Ok`,
+            # they belong on the head.
+            ta = ""
+            name = e.name
+            if e.type_args:
+                ta = "<" + ", ".join(self.fmt_type(a)
+                                     for a in e.type_args) + ">"
+                if "." in name:
+                    head, _, rest = name.partition(".")
+                    name = f"{head}{ta}.{rest}"
+                    ta = ""
+            return f"{name}{ta}({args})"
         if isinstance(e, ast.Field):
             return f"{self.fmt_expr(e.obj, 9)}.{e.field}"
         if isinstance(e, ast.Index):

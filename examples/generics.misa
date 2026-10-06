@@ -1,0 +1,42 @@
+// Phase 5c: generics — generic functions, generic types, and generic sums.
+fn first<T>(xs: [T]) -> T {
+  return xs[0]
+}
+
+fn map<T, K>(xs: [T], f: (T) -> K) -> [K] {
+  var out: [K] = []
+  for x in xs {
+    out = out + [f(x)]
+  }
+  return out
+}
+
+type Box<T> {
+  value: T,
+}
+
+type Result<T> { Ok(T), Err(Text) }
+
+fn unwrap<T>(r: Result<T>, d: T) -> T {
+  return match r {
+    Result.Ok(v) => v,
+    Result.Err(_) => d,
+  }
+}
+
+// inference across Int and Text
+print(first([10, 20, 30]))
+print(first(["a", "b"]))
+// explicit pinning
+print(first<Float>([1.5]))
+// higher-order generic
+print(map([1, 2, 3], |x: Int| x * 10))
+print(map(["a", "bb"], |s| s + "!"))
+// generic records
+let b: Box<Int> = Box<Int>(7)
+print(b.value * 2)
+// generic sums
+let ok: Result<Text> = Result.Ok("fine")
+let bad: Result<Text> = Result.Err("oops")
+print(unwrap(ok, "dflt"))
+print(unwrap(bad, "dflt"))

@@ -176,6 +176,10 @@ class Parser:
     def parse_type_decl(self) -> ast.TypeDecl:
         t = self.expect("type", "'type'")
         name = self.expect_ident("type name").value
+        # Phase 5c: type parameters, e.g. `type Box<T> { value: T }`.
+        type_params = []
+        if self.at("<"):
+            type_params = self._parse_type_params_decl()
         self.expect("{", "'{'")
         fields = []
         variants = []
@@ -214,7 +218,8 @@ class Parser:
                     self.skip_semis()
         self.expect("}", "'}'")
         return ast.TypeDecl(name=name, fields=fields, is_sum=is_sum,
-                            variants=variants, line=t.line, col=t.col)
+                            variants=variants, type_params=type_params,
+                            line=t.line, col=t.col)
 
     def _finish_variant(self, vname: str) -> ast.VariantDecl:
         """Parse the optional `(fields)` after a variant name. Fields may
@@ -289,24 +294,35 @@ class Parser:
             if self.at("?"):
                 self.advance()
                 opt = True
-            return ast.TypeExpr(name=inner.name,
-                                is_list=True, optional=opt,
-                                line=t.line, col=t.col)
-        # Map<K, V> — the only generic type in v0.2
-        if self.at("IDENT") and self.peek().value == "Map" \
-                and self.peek(1).kind == "<":
+            te = ast.TypeExpr(name=inner.name,
+                              is_list=True, optional=opt,
+                              line=t.line, col=t.col)
+            # Phase 5c: preserve full inner structure for `[Box<Int>]`,
+            # `[[T]]`, etc. Plain inners keep the legacy flattened form.
+            if inner.is_list or inner.is_map or inner.is_func \
+                    or inner.type_args:
+                te.list_elem = inner
+            return te
+        # Phase 5c: applied generic types `Name<A, B>`. `Map<K, V>` keeps
+        # its dedicated is_map form (it was the only generic type in
+        # v0.2); everything else lands in type_args.
+        if self.at("IDENT") and self.peek(1).kind == "<":
+            name = self.peek().value
             self.advance()
-            self.advance()  # <
-            key = self.parse_type_expr()
-            self.expect(",", "','")
-            val = self.parse_type_expr()
-            self.expect_gt()
+            args = self._parse_type_args()
             opt = False
             if self.at("?"):
                 self.advance()
                 opt = True
-            return ast.TypeExpr(name="Map", is_map=True,
-                                map_key=key, map_val=val, optional=opt,
+            if name == "Map":
+                if len(args) != 2:
+                    raise ParseError(
+                        f"Map takes 2 type arguments, got {len(args)}",
+                        t.line, t.col)
+                return ast.TypeExpr(name="Map", is_map=True,
+                                    map_key=args[0], map_val=args[1],
+                                    optional=opt, line=t.line, col=t.col)
+            return ast.TypeExpr(name=name, type_args=args, optional=opt,
                                 line=t.line, col=t.col)
         name = self.expect_ident("type name").value
         opt = False
@@ -634,6 +650,10 @@ class Parser:
     def parse_fn_decl(self) -> ast.FnDecl:
         t = self.expect("fn", "'fn'")
         name = self.expect_ident("function name").value
+        # Phase 5c: type parameters, e.g. `fn first<T>(xs: [T]) -> T`.
+        type_params = []
+        if self.at("<"):
+            type_params = self._parse_type_params_decl()
         params = self.parse_params()
         ret = None
         if self.at("->"):
@@ -641,7 +661,42 @@ class Parser:
             ret = self.parse_type_expr()
         body = self.parse_block()
         return ast.FnDecl(name=name, params=params, ret=ret, body=body,
+                          type_params=type_params,
                           line=t.line, col=t.col)
+
+    def _parse_type_params_decl(self) -> List[str]:
+        """Phase 5c: parse `<T, K>` after a fn/type name. Returns names."""
+        self.expect("<", "'<'")
+        params = []
+        seen = set()
+        if not self.at(">"):
+            while True:
+                pn = self.expect_ident("type parameter").value
+                if pn in seen:
+                    raise ParseError(f"duplicate type parameter '{pn}'",
+                                     self.peek().line, self.peek().col)
+                seen.add(pn)
+                params.append(pn)
+                if self.at(","):
+                    self.advance()
+                    continue
+                break
+        self.expect_gt()
+        return params
+
+    def _parse_type_args(self) -> List[ast.TypeExpr]:
+        """Phase 5c: parse `<E1, E2>` type arguments. Returns TypeExprs."""
+        self.expect("<", "'<'")
+        args = []
+        if not self.at(">"):
+            while True:
+                args.append(self.parse_type_expr())
+                if self.at(","):
+                    self.advance()
+                    continue
+                break
+        self.expect_gt()
+        return args
 
     def parse_import_decl(self) -> ast.ImportDecl:
         t = self.expect("import", "'import'")
@@ -778,7 +833,10 @@ class Parser:
                 f = self.expect_ident("field name").value
                 if self.at("(") and isinstance(node, ast.Ident):
                     # fs.read("x") -> Call(name="fs.read"); only one level
-                    node = self.finish_call(f"{node.name}.{f}", t)
+                    # Phase 5c: `Result<Int>.Ok(42)` carries type_args.
+                    ta = getattr(node, "type_args", None) or None
+                    node = self.finish_call(f"{node.name}.{f}", t,
+                                           type_args=ta)
                 else:
                     node = ast.Field(obj=node, field=f,
                                      line=t.line, col=t.col)
@@ -889,8 +947,28 @@ class Parser:
             return ast.NilLit(line=t.line, col=t.col)
         if t.kind == "IDENT":
             self.advance()
+            # Phase 5c: explicit type arguments — `first<Text>(["x"])`,
+            # `Box<Int>(42)`, `Result<Int>.Ok(42)`. Speculative: only a
+            # `<...>` followed by `(` or `.` is generic; otherwise it's
+            # a comparison (`a < b`) and we backtrack.
+            type_args = None
+            if self.at("<"):
+                saved = self.i
+                try:
+                    type_args = self._parse_type_args()
+                    if not (self.at("(") or self.at(".")):
+                        raise ParseError("not a generic application",
+                                         t.line, t.col)
+                except ParseError:
+                    self.i = saved
+                    type_args = None
             if self.at("("):
-                return self.finish_call(t.value, t)
+                return self.finish_call(t.value, t, type_args=type_args)
+            if type_args is not None:
+                # `Result<Int>.Ok(...)` — stash for parse_postfix.
+                node = ast.Ident(name=t.value, line=t.line, col=t.col)
+                node.type_args = type_args
+                return node
             return ast.Ident(name=t.value, line=t.line, col=t.col)
         if t.kind in ("navigate", "env"):
             self.advance()
@@ -941,9 +1019,12 @@ class Parser:
         raise ParseError(f"unexpected {t.kind} ({t.value!r}) in expression",
                          t.line, t.col)
 
-    def finish_call(self, name: str, t: Token) -> ast.Call:
+    def finish_call(self, name: str, t: Token,
+                  type_args: Optional[list] = None) -> ast.Call:
         args = self.parse_call_args()
-        return ast.Call(name=name, args=args, line=t.line, col=t.col)
+        return ast.Call(name=name, args=args,
+                        type_args=type_args or [],
+                        line=t.line, col=t.col)
 
     def parse_record_fields_rest(self) -> list:
         fields = []

@@ -499,6 +499,17 @@ class Interpreter:
                 return SumValue(head, var, args)
         if name in self.fns:
             return self.call_fn(self.fns[name], args, e)
+        # Phase 5c: generic record construction `Box<Int>(42)`.
+        # Erasure: type args are checking-time only; the value is a
+        # plain record dict like any other.
+        if name in self.types:
+            decl = self.types[name]
+            if decl.type_params and not decl.is_sum:
+                if len(args) != len(decl.fields):
+                    raise RuntimeError_(
+                        f"'{name}' takes {len(decl.fields)} field "
+                        f"arg(s), got {len(args)}")
+                return {fn: a for (fn, _), a in zip(decl.fields, args)}
         if name == "navigate":
             return self.do_navigate(args, e)
         if name in ("Photo", "Audio", "Video", "Document"):

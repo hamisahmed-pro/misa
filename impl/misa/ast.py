@@ -25,6 +25,12 @@ class TypeExpr(Node):
     is_func: bool = False
     func_params: List["TypeExpr"] = field(default_factory=list)
     func_ret: Optional["TypeExpr"] = None
+    # Phase 5c: applied generic types, e.g. `Box<Int>`.
+    type_args: List["TypeExpr"] = field(default_factory=list)
+    # Phase 5c: full inner expr for list types, preserving structure
+    # (`[Box<Int>]`, `[[T]]`). When None, `name`+`is_list` carry the
+    # (possibly flattened) form as before.
+    list_elem: Optional["TypeExpr"] = None
 
 
 # ---------------------------------------------------------------- program
@@ -64,6 +70,8 @@ class TypeDecl(Node):
     # `variants` holds the variant list instead.
     is_sum: bool = False
     variants: List["VariantDecl"] = field(default_factory=list)
+    # Phase 5c: type parameters, e.g. `type Box<T> { value: T }`.
+    type_params: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -142,6 +150,8 @@ class FnDecl(Node):
     params: List[Tuple[str, TypeExpr]] = field(default_factory=list)
     ret: Optional[TypeExpr] = None  # None = Void
     body: List[Node] = field(default_factory=list)
+    # Phase 5c: type parameters, e.g. `fn first<T>(xs: [T]) -> T`.
+    type_params: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -255,6 +265,9 @@ class MoneyLit(Node):
 @dataclass
 class Ident(Node):
     name: str = ""
+    # Phase 5c: transient — type args parsed on `Result<Int>.Ok(...)`;
+    # consumed by parse_postfix into the Call node.
+    type_args: List[TypeExpr] = field(default_factory=list)
 
 
 @dataclass
@@ -264,6 +277,9 @@ class Call(Node):
     # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
     # When callee is not None, `name` is unused.
     callee: Optional[Node] = None
+    # Phase 5c: explicit type arguments, e.g. `first<Text>(["x"])`,
+    # `Box<Int>(42)`, `Result<Int>.Ok(42)`.
+    type_args: List[TypeExpr] = field(default_factory=list)
 
 
 @dataclass

@@ -1,0 +1,47 @@
+// a15_generics: Phase 5c generics — AOT parity vs interpreter.
+fn first<T>(xs: [T]) -> T {
+  return xs[0]
+}
+
+fn wrap<T>(x: T) -> [T] {
+  return [x]
+}
+
+fn pair<K, V>(k: K, v: V) -> [K] {
+  return [k]
+}
+
+type Box<T> {
+  value: T,
+}
+
+type Result<T> { Ok(T), Err(Text) }
+
+fn or_default<T>(r: Result<T>, d: T) -> T {
+  return match r {
+    Result.Ok(v) => v,
+    Result.Err(_) => d,
+  }
+}
+
+// inference: Int and Text specializations of `first`
+print(first([1, 2, 3]))
+print(first(["a", "b"]))
+// explicit pinning
+print(first<Text>(["x"]))
+// generic type construction + field access
+let b: Box<Int> = Box<Int>(42)
+print(b.value)
+let bs = Box("hi")
+print(bs.value)
+// generic sum + match
+let r: Result<Int> = Result.Ok(41)
+print(or_default(r, 0))
+let r2: Result<Int> = Result.Err("boom")
+print(or_default(r2, 99))
+// nested generics
+print(wrap([1, 2]))
+print(first(wrap("nested")))
+// multiple type params
+print(pair(1, "one"))
+print(pair<Text, Int>("two", 2))

@@ -65,6 +65,9 @@ class Checker:
         # Phase 4 (M4): id: name -> component kind for the screen whose
         # handler body is currently being checked (None elsewhere).
         self._cur_id_kinds: Optional[Dict[str, str]] = None
+        # Phase 5c: type parameters in scope while checking a generic
+        # fn or type decl (e.g. `T` in `fn first<T>(...)`).
+        self._tparams: List[str] = []
 
     # -- diagnostics ----------------------------------------------------
 
@@ -140,27 +143,48 @@ class Checker:
             self._check_eval(item)
         elif isinstance(item, ast.FnDecl):
             self._check_fn(item)
+        elif isinstance(item, ast.TypeDecl):
+            self._check_type_decl(item)
         elif isinstance(item, (ast.AppDecl, ast.ProviderDecl,
-                               ast.ModelsDecl, ast.TypeDecl,
+                               ast.ModelsDecl,
                                ast.ImportDecl)):
             pass
         else:
             self._check_block([item], scope)
 
+    def _check_type_decl(self, decl: ast.TypeDecl):
+        """Phase 5c: validate a type decl's field/variant types. For
+        generic decls, the type parameters are in scope (unbound names
+        are E222). Non-generic decls keep prior behavior (no validation
+        was done before 5c, so only validate when there is something
+        to check — generic decls always validate)."""
+        if not decl.type_params and not decl.is_sum:
+            return
+        saved_tparams, self._tparams = self._tparams, list(decl.type_params)
+        try:
+            if decl.is_sum:
+                for v in decl.variants:
+                    for _, fte in v.fields:
+                        self._check_te(fte, fte.line, fte.col)
+            else:
+                for _, fte in decl.fields:
+                    self._check_te(fte, fte.line, fte.col)
+        finally:
+            self._tparams = saved_tparams
+
     def _check_fn(self, fn: ast.FnDecl):
         seen_params = set()
+        # Phase 5c: type parameters are in scope for the signature.
+        saved_tparams, self._tparams = self._tparams, list(fn.type_params)
         for pn, te in fn.params:
             if pn in seen_params:
                 self.error("E210", f"duplicate parameter '{pn}'",
                            te.line, te.col)
             seen_params.add(pn)
-            if not self._known_type(te):
-                self.error("E208", f"unknown type '{self._tname(te)}'",
-                           te.line, te.col)
+            self._check_te(te, te.line, te.col)
         ret_name = self._tname(fn.ret) if fn.ret else "Void"
-        if fn.ret and not self._known_type(fn.ret):
-            self.error("E208", f"unknown type '{self._tname(fn.ret)}'",
-                       fn.ret.line, fn.ret.col)
+        if fn.ret:
+            self._check_te(fn.ret, fn.ret.line, fn.ret.col)
         scope = {pn: (self._tname(te), False) for pn, te in fn.params}
         self._check_block(fn.body, scope, fn_ret=ret_name)
         if ret_name != "Void" and not self._block_returns(fn.body):
@@ -169,6 +193,7 @@ class Checker:
                        f"returning {ret_name}",
                        fn.line, fn.col,
                        hint="every code path must end in 'return'")
+        self._tparams = saved_tparams
 
     @staticmethod
     def _block_returns(stmts: list) -> bool:
@@ -214,14 +239,14 @@ class Checker:
                            f"alias '{m.alias}' belongs to provider "
                            f"'{prov}', not '{m.provider}'",
                            m.line, m.col)
-        if not self._known_type(m.ret):
+        if m.ret is not None:
+            self._check_te(m.ret, m.line, m.col)
+        elif not self._known_type(m.ret):
             self.error("E208",
                        f"unknown return type '{self._tname(m.ret)}'",
                        m.line, m.col)
         for _, te in m.params:
-            if not self._known_type(te):
-                self.error("E208", f"unknown type '{self._tname(te)}'",
-                           te.line, te.col)
+            self._check_te(te, te.line, te.col)
         # prompt interpolations may only reference params
         scope = {pn: (self._tname(te), False) for pn, te in m.params}
         for part in m.prompt:
@@ -230,9 +255,7 @@ class Checker:
 
     def _check_screen(self, s: ast.ScreenDecl):
         for pn, te in s.params:
-            if not self._known_type(te):
-                self.error("E208", f"unknown type '{self._tname(te)}'",
-                           te.line, te.col)
+            self._check_te(te, te.line, te.col)
         scope = {pn: (self._tname(te), False) for pn, te in s.params}
         seen_ids = set()
         # Phase 4 (M4): ordered id: binding table (name -> component
@@ -508,24 +531,35 @@ class Checker:
             return False
         if te.name not in self.types:
             return False
+        # Phase 5c: bindings for generic record literals
+        # (`let b: Box<Int> = { value: 42 }`).
+        bindings: Dict[str, str] = {}
+        decl0 = self.types[te.name]
+        if decl0.type_params and te.type_args \
+                and len(te.type_args) == len(decl0.type_params):
+            bindings = {p: self._tname(a)
+                        for p, a in zip(decl0.type_params, te.type_args)}
         if te.is_list and isinstance(value, ast.ListLit):
             for item in value.items:
                 if isinstance(item, ast.RecordLit):
-                    self._check_record_fields(te.name, item, scope)
+                    self._check_record_fields(te.name, item, scope,
+                                              bindings)
                 else:
                     self.error("E202",
                                f"expected {te.name} record in list",
                                item.line, item.col)
             return True
         if not te.is_list and isinstance(value, ast.RecordLit):
-            self._check_record_fields(te.name, value, scope)
+            self._check_record_fields(te.name, value, scope, bindings)
             return True
         return False
 
     def _check_record_fields(self, type_name: str, rec: ast.RecordLit,
-                             scope: dict):
+                             scope: dict,
+                             bindings: Optional[Dict[str, str]] = None):
         decl = self.types[type_name]
         declared = {fn: fte for fn, fte in decl.fields}
+        bindings = bindings or {}
         seen = set()
         for fn, fv in rec.fields:
             seen.add(fn)
@@ -535,6 +569,9 @@ class Checker:
                            fv.line, fv.col)
                 continue
             fte = declared[fn]
+            # Phase 5c: substitute generic bindings.
+            if bindings:
+                fte = self._subst_te(fte, bindings)
             # contextual typing: nested record literal against a declared
             # record type checks recursively instead of inferring "record"
             if isinstance(fv, ast.RecordLit) and not fte.is_list \
@@ -641,6 +678,10 @@ class Checker:
                 # function type `(params) -> ret`.
                 if e.name in self.fns:
                     fn = self.fns[e.name]
+                    # Phase 5c: generic fns keep a marker so calls
+                    # through the variable still infer.
+                    if fn.type_params:
+                        return f"generic({fn.name})"
                     ps = ", ".join(self._tname(te)
                                    for _, te in fn.params)
                     r = self._tname(fn.ret) if fn.ret else "Void"
@@ -660,7 +701,7 @@ class Checker:
                 return "unknown"
             return scope[e.name][0]
         if isinstance(e, ast.Call):
-            return self._infer_call(e, scope)
+            return self._infer_call(e, scope, expected)
         if isinstance(e, ast.Field):
             # Phase 4 (M4): `<id>.text` readback inside handler bodies.
             # Only TextInput.text exists in the first slice.
@@ -689,7 +730,8 @@ class Checker:
             if isinstance(e.obj, ast.Ident):
                 decl = self.types.get(e.obj.name)
                 if decl is not None and decl.is_sum:
-                    return self._check_bare_variant(decl, e)
+                    # Phase 5c: thread expected for generic nil.
+                    return self._check_bare_variant(decl, e, expected)
             # Error.code / Error.message on the builtin error type
             if isinstance(e.obj, ast.Ident) and e.obj.name in scope \
                     and scope[e.obj.name][0] == "Error" \
@@ -698,11 +740,16 @@ class Checker:
             ot = self._infer(e.obj, scope)
             if ot == "Error" and e.field in ("code", "message"):
                 return "Text"
-            decl = self.types.get(ot)
+            # Phase 5c: field access on applied generic types.
+            base, args = self._split_applied(ot)
+            decl = self.types.get(base)
             if decl:
+                bindings: Dict[str, str] = {}
+                if decl.type_params and len(args) == len(decl.type_params):
+                    bindings = dict(zip(decl.type_params, args))
                 for fn, fte in decl.fields:
                     if fn == e.field:
-                        return self._tname(fte)
+                        return self._tname(self._subst_te(fte, bindings))
                 self.error("E101",
                            f"type '{ot}' has no field '{e.field}'",
                            e.line, e.col)
@@ -803,8 +850,13 @@ class Checker:
             lscope[pn] = (pt, False)
         if lam.expr_body is not None:
             body_t = self._infer(lam.expr_body, lscope)
-            ret = exp_ret if exp_ret is not None else body_t
-            if exp_ret is not None and body_t != "unknown" \
+            # Phase 5c: "unknown" expected return means "infer it".
+            if exp_ret is not None and exp_ret != "unknown":
+                ret = exp_ret
+            else:
+                ret = body_t
+            if exp_ret is not None and exp_ret != "unknown" \
+                    and body_t != "unknown" \
                     and not self._assignable(exp_ret, body_t):
                 self.error("E211",
                            f"lambda returns {body_t}, expected {exp_ret}",
@@ -827,7 +879,8 @@ class Checker:
         ps = ", ".join(ptypes)
         return f"({ps}) -> {ret}"
 
-    def _infer_call(self, e: ast.Call, scope: dict) -> str:
+    def _infer_call(self, e: ast.Call, scope: dict,
+                    expected: Optional[str] = None) -> str:
         # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
         if e.callee is not None:
             ct = self._infer(e.callee, scope)
@@ -856,12 +909,22 @@ class Checker:
                                    f"argument wants {want_t}, got {at}",
                                    a.line, a.col)
             return fret
+        # Phase 5c: generic fn — inference/pinning lives in
+        # _infer_generic_call (handles its own expected types).
+        if e.name in self.fns and self.fns[e.name].type_params:
+            return self._infer_generic_call(self.fns[e.name], e, scope)
         # Phase 5a: per-arg expected types so lambdas infer untyped
         # params from the callee's function type.
         # Phase 5b: sum variant payload types serve the same role.
+        # Phase 5c: a variable holding a generic fn value, `let g = f`.
         exp_ts = None
         if e.name in self.fns:
             exp_ts = [self._tname(te) for _, te in self.fns[e.name].params]
+        elif e.name in scope and scope[e.name][0].startswith("generic("):
+            gname = scope[e.name][0][len("generic("):-1]
+            if gname in self.fns:
+                return self._infer_generic_call(self.fns[gname], e,
+                                                scope)
         elif e.name in scope:
             fp = self._func_parts(scope[e.name][0])
             if fp is not None:
@@ -894,7 +957,7 @@ class Checker:
             decl = self.types.get(head)
             if decl is not None and decl.is_sum:
                 return self._check_variant_construct(decl, var, e, scope,
-                                                     arg_ts)
+                                                     arg_ts, expected)
         if e.name in self.fns:
             fn = self.fns[e.name]
             want = len(fn.params)
@@ -960,6 +1023,11 @@ class Checker:
                            f"{e.name}(path) takes 1 arg, "
                            f"got {len(e.args)}", e.line, e.col)
             return e.name
+        # Phase 5c: generic record construction `Box<Int>(42)`.
+        if e.name in self.types and not self.types[e.name].is_sum \
+                and self.types[e.name].type_params:
+            return self._check_generic_construct(self.types[e.name], e,
+                                                scope)
         if e.name in self.types:
             self.error("E101",
                        f"type '{e.name}' is not callable "
@@ -985,8 +1053,10 @@ class Checker:
 
     def _check_variant_construct(self, decl: ast.TypeDecl, var: str,
                                  e: ast.Call, scope: dict,
-                                 arg_ts: list) -> str:
-        """Check `Type.Variant(args)`; return the sum type name."""
+                                 arg_ts: list,
+                                 expected: Optional[str] = None) -> str:
+        """Check `Type.Variant(args)`; return the sum type name
+        (Phase 5c: the applied name, e.g. `Result<Int>`)."""
         v = self._variant_of(decl, var)
         if v is None:
             self.error("E218",
@@ -999,6 +1069,11 @@ class Checker:
                        f"{len(v.fields)} args, got {len(e.args)}",
                        e.line, e.col)
             return decl.name
+        # Phase 5c: generic sum — bind type args from explicit pinning,
+        # payload unification, and/or the expected type.
+        if decl.type_params:
+            return self._check_generic_variant(decl, v, e, scope,
+                                               arg_ts, expected)
         for (fn, fte), a, at in zip(v.fields, e.args, arg_ts):
             want_t = self._tname(fte)
             if at != "unknown" and want_t != "unknown" \
@@ -1008,8 +1083,72 @@ class Checker:
                            f"got {at}", a.line, a.col)
         return decl.name
 
+    def _check_generic_variant(self, decl: ast.TypeDecl,
+                               v: ast.VariantDecl, e: ast.Call,
+                               scope: dict, arg_ts: list,
+                               expected: Optional[str]) -> str:
+        """Phase 5c: `Result.Ok(42)` / `Result<Int>.Ok(42)`. Returns the
+        applied type string, e.g. `Result<Int>`."""
+        tparams = decl.type_params
+        bindings: Dict[str, str] = {}
+        if e.type_args:
+            if len(e.type_args) != len(tparams):
+                self.error("E221",
+                           f"'{decl.name}' takes {len(tparams)} type "
+                           f"argument(s), got {len(e.type_args)}",
+                           e.line, e.col)
+                return "unknown"
+            for p, a in zip(tparams, e.type_args):
+                self._check_te(a, a.line, a.col)
+                bindings[p] = self._tname(a)
+        for (fn, fte), a, at in zip(v.fields, e.args, arg_ts):
+            err = self._unify_te(fte, self._parse_tstr(at), tparams,
+                                 bindings)
+            if err:
+                self.error("E220", err, a.line, a.col)
+        # The expected type (`let r: Result<Int> = ...`) can bind any
+        # remaining variables.
+        if expected:
+            base, args = self._split_applied(expected)
+            if base == decl.name and len(args) == len(tparams):
+                for p, a in zip(tparams, args):
+                    if p not in bindings:
+                        bindings[p] = a
+        for p in tparams:
+            if p not in bindings:
+                self.error("E219",
+                           f"cannot infer type argument '{p}' for "
+                           f"'{decl.name}.{v.name}'; give explicit type "
+                           f"arguments ('{decl.name}<{p}>.{v.name}(...)' ) "
+                           f"or annotate the binding", e.line, e.col)
+                return "unknown"
+        # Phase 5c: annotate for AOT monomorphization.
+        e.type_args = [self._parse_tstr(bindings[p]) for p in tparams]
+        for (fn, fte), a, at in zip(v.fields, e.args, arg_ts):
+            want_t = self._tname(self._subst_te(fte, bindings))
+            if at == "unknown":
+                continue
+            # Phase 5c: a bare nil of a generic sum (`L.Nil`, or `L<T>`
+            # with unbound vars, as the payload of `L<Int>`) is
+            # compatible — it carries no T.
+            wbase, _ = self._split_applied(want_t)
+            abase, aargs = self._split_applied(at)
+            gdecl = self.types.get(wbase)
+            if gdecl is not None and gdecl.type_params \
+                    and abase == wbase \
+                    and (not aargs or all(x in gdecl.type_params
+                                          for x in aargs)):
+                continue
+            if not self._assignable(want_t, at):
+                self.error("E211",
+                           f"variant payload '{fn}' wants {want_t}, "
+                           f"got {at}", a.line, a.col)
+        args = ", ".join(bindings[p] for p in tparams)
+        return f"{decl.name}<{args}>"
+
     def _check_bare_variant(self, decl: ast.TypeDecl,
-                            e: ast.Field) -> str:
+                            e: ast.Field,
+                            expected: Optional[str] = None) -> str:
         """Check a bare `Type.Variant` field access (no payload)."""
         v = self._variant_of(decl, e.field)
         if v is None:
@@ -1023,16 +1162,32 @@ class Checker:
                        f"{len(v.fields)} payload arg(s); construct it as "
                        f"'{decl.name}.{v.name}(...)'", e.line, e.col)
             return "unknown"
+        # Phase 5c: a bare nil of a generic sum takes the expected
+        # applied type when available (`let x: L<Int> = L.Nil`).
+        if decl.type_params and expected:
+            base, args = self._split_applied(expected)
+            if base == decl.name and len(args) == len(decl.type_params):
+                return expected
         return decl.name
 
     def _infer_match(self, e: ast.Match, scope: dict) -> str:
         st = self._infer(e.scrutinee, scope)
-        decl = self.types.get(st)
+        # Phase 5c: applied sum types — `match` on `Result<Int>`.
+        base, args = self._split_applied(st)
+        decl = self.types.get(base)
         if decl is None or not decl.is_sum:
             self.error("E218",
                        f"match scrutinee must be a sum type, got '{st}'",
                        e.scrutinee.line, e.scrutinee.col)
             return "unknown"
+        bindings: Dict[str, str] = {}
+        if decl.type_params:
+            if len(args) != len(decl.type_params):
+                # Scrutinee type isn't fully applied; bindings stay empty
+                # and field types keep their variables (best effort).
+                pass
+            else:
+                bindings = dict(zip(decl.type_params, args))
         seen = set()
         has_wildcard = False
         arm_ts = []
@@ -1064,7 +1219,9 @@ class Checker:
                            arm.line, arm.col)
             child = dict(scope)
             for bname, (fn, fte) in zip(arm.binds, v.fields):
-                child[bname] = (self._tname(fte), False)
+                # Phase 5c: substitute the scrutinee's type arguments.
+                bt = self._tname(self._subst_te(fte, bindings))
+                child[bname] = (bt, False)
             seen.add(arm.variant)
             arm_ts.append(self._infer(arm.body, child))
         if not has_wildcard:
@@ -1103,9 +1260,17 @@ class Checker:
             return s
         s = te.name
         if te.is_list:
-            s = f"[{s}]"
+            # Phase 5c: full inner structure when preserved.
+            if te.list_elem is not None:
+                s = f"[{self._tname(te.list_elem)}]"
+            else:
+                s = f"[{s}]"
         elif te.is_map:
             s = f"Map<{self._tname(te.map_key)}, {self._tname(te.map_val)}>"
+        elif te.type_args:
+            # Phase 5c: applied generic types render `Box<Int>`.
+            args = ", ".join(self._tname(a) for a in te.type_args)
+            s = f"{s}<{args}>"
         if te.optional:
             s += "?"
         return s
@@ -1123,9 +1288,441 @@ class Checker:
                     and te.map_key.name in ("Text", "Int")
                     and not te.map_key.is_list and not te.map_key.is_map
                     and self._known_type(te.map_val))
+        if te.is_list:
+            # Phase 5c: full inner structure when preserved.
+            if te.list_elem is not None:
+                return self._known_type(te.list_elem)
+            return self._known_type(ast.TypeExpr(name=te.name))
+        # Phase 5c: applied generic types `Box<Int>`.
+        if te.type_args:
+            decl = self.types.get(te.name)
+            if decl is None or not decl.type_params:
+                return False
+            if len(te.type_args) != len(decl.type_params):
+                return False
+            return all(self._known_type(a) for a in te.type_args)
         base = te.name
+        # Phase 5c: type parameters in scope are known types.
+        if base in self._tparams:
+            return True
         return (base in PRIMITIVES or base in MEDIA or base in SPECIAL
                 or base in self.types)
+
+    def _check_te(self, te: Optional[ast.TypeExpr], line: int,
+                  col: int) -> bool:
+        """Phase 5c: validate a type expression, emitting precise errors:
+        E221 for type-argument arity mismatch, E222 for unbound type
+        variables (inside a generic decl), E208 otherwise. Returns True
+        when valid."""
+        if te is None:
+            return True
+        if self._known_type(te):
+            return True
+        # Phase 5c: applied generic type with wrong arity.
+        if te.type_args:
+            decl = self.types.get(te.name)
+            if decl is not None and decl.type_params \
+                    and len(te.type_args) != len(decl.type_params):
+                self.error(
+                    "E221",
+                    f"'{te.name}' takes {len(decl.type_params)} type "
+                    f"argument(s), got {len(te.type_args)}", line, col)
+                return False
+        # Phase 5c: bare unknown name inside a generic decl → unbound
+        # type variable (E222); otherwise E208.
+        if not te.is_list and not te.is_map and not te.is_func \
+                and not te.type_args and te.name:
+            if self._tparams:
+                self.error("E222",
+                           f"unbound type variable '{te.name}'",
+                           line, col)
+                return False
+        # Recurse to find nested problems (so `[Box<Int, Text>]`
+        # reports E221, not E208).
+        if te.is_func:
+            ok = True
+            for p in te.func_params:
+                ok = self._check_te(p, line, col) and ok
+            if te.func_ret is not None:
+                ok = self._check_te(te.func_ret, line, col) and ok
+            return ok
+        if te.is_map:
+            ok = self._check_te(te.map_key, line, col)
+            return self._check_te(te.map_val, line, col) and ok
+        if te.is_list and te.list_elem is not None:
+            return self._check_te(te.list_elem, line, col)
+        if te.type_args:
+            ok = True
+            for a in te.type_args:
+                ok = self._check_te(a, line, col) and ok
+            return ok
+        self.error("E208", f"unknown type '{self._tname(te)}'",
+                   line, col)
+        return False
+
+    # -- Phase 5c: generics -------------------------------------------
+
+    def _parse_tstr(self, s: str) -> ast.TypeExpr:
+        """Parse a checker type string (e.g. `[Box<Int>]`, `(T) -> K`)
+        back into a TypeExpr for structural unification."""
+        toks = self._tstr_toks(s)
+        te, pos = self._tstr_expr(toks, 0)
+        return te
+
+    @staticmethod
+    def _tstr_toks(s: str):
+        toks, i = [], 0
+        while i < len(s):
+            c = s[i]
+            if c.isspace():
+                i += 1
+            elif c in "[],()<>?":
+                toks.append(c)
+                i += 1
+            elif c == "-" and s[i:i + 2] == "->":
+                toks.append("->")
+                i += 2
+            else:
+                j = i
+                while j < len(s) and (s[j].isalnum() or s[j] == "_"):
+                    j += 1
+                toks.append(s[i:j])
+                i = j
+        return toks
+
+    def _tstr_expr(self, toks, pos):
+        """Parse one type; returns (TypeExpr, new_pos)."""
+        if toks[pos] == "(":
+            # function type `(A, B) -> C`
+            pos += 1
+            params = []
+            if toks[pos] != ")":
+                while True:
+                    p, pos = self._tstr_expr(toks, pos)
+                    params.append(p)
+                    if toks[pos] == ",":
+                        pos += 1
+                        continue
+                    break
+            pos += 1  # )
+            assert toks[pos] == "->"
+            pos += 1
+            ret, pos = self._tstr_expr(toks, pos)
+            te = ast.TypeExpr(is_func=True, func_params=params,
+                              func_ret=ret)
+        elif toks[pos] == "[":
+            pos += 1
+            inner, pos = self._tstr_expr(toks, pos)
+            assert toks[pos] == "]"
+            pos += 1
+            te = ast.TypeExpr(name=inner.name, is_list=True)
+            # preserve structure like the source parser does
+            if inner.is_list or inner.is_map or inner.is_func \
+                    or inner.type_args:
+                te.list_elem = inner
+            else:
+                # copy inner flags for plain names
+                te.name = inner.name
+        else:
+            name = toks[pos]
+            pos += 1
+            if name == "Map" and pos < len(toks) and toks[pos] == "<":
+                pos += 1
+                k, pos = self._tstr_expr(toks, pos)
+                assert toks[pos] == ","
+                pos += 1
+                v, pos = self._tstr_expr(toks, pos)
+                assert toks[pos] == ">"
+                pos += 1
+                te = ast.TypeExpr(name="Map", is_map=True,
+                                  map_key=k, map_val=v)
+            elif pos < len(toks) and toks[pos] == "<":
+                pos += 1
+                args = []
+                while True:
+                    a, pos = self._tstr_expr(toks, pos)
+                    args.append(a)
+                    if toks[pos] == ",":
+                        pos += 1
+                        continue
+                    break
+                assert toks[pos] == ">"
+                pos += 1
+                te = ast.TypeExpr(name=name, type_args=args)
+            else:
+                te = ast.TypeExpr(name=name)
+        if pos < len(toks) and toks[pos] == "?":
+            te.optional = True
+            pos += 1
+        return te, pos
+
+    def _is_tvar(self, te: ast.TypeExpr, tparams) -> bool:
+        """Is this TypeExpr a bare type variable?"""
+        return (te.name in tparams and not te.is_list and not te.is_map
+                and not te.is_func and not te.type_args
+                and not te.optional)
+
+    def _unify_te(self, pte: ast.TypeExpr, ate: ast.TypeExpr,
+                  tparams, bindings: dict) -> Optional[str]:
+        """Unify a parameter TypeExpr (possibly with type variables)
+        against an argument TypeExpr. Binds variables in `bindings`
+        ({name: type_string}). Returns an error string on conflict,
+        else None."""
+        # "unknown" (cascading from a prior error) carries no info.
+        if self._tname(ate) == "unknown":
+            return None
+        if self._is_tvar(pte, tparams):
+            name = pte.name
+            at = self._tname(ate)
+            # "unknown" (prior error) or self-reference carries no info.
+            if at == "unknown" or at == name:
+                return None
+            if name in bindings:
+                if bindings[name] != at:
+                    return (f"conflicting types for '{name}': "
+                            f"'{bindings[name]}' vs '{at}'")
+            else:
+                bindings[name] = at
+            return None
+        if pte.is_list and ate.is_list:
+            pe = (pte.list_elem if pte.list_elem is not None
+                  else ast.TypeExpr(name=pte.name))
+            ae = (ate.list_elem if ate.list_elem is not None
+                  else ast.TypeExpr(name=ate.name))
+            return self._unify_te(pe, ae, tparams, bindings)
+        if pte.is_map and ate.is_map:
+            e = self._unify_te(pte.map_key, ate.map_key, tparams,
+                               bindings)
+            if e:
+                return e
+            return self._unify_te(pte.map_val, ate.map_val, tparams,
+                                  bindings)
+        if pte.is_func and ate.is_func \
+                and len(pte.func_params) == len(ate.func_params):
+            for pp, ap in zip(pte.func_params, ate.func_params):
+                e = self._unify_te(pp, ap, tparams, bindings)
+                if e:
+                    return e
+            if pte.func_ret is not None and ate.func_ret is not None:
+                return self._unify_te(pte.func_ret, ate.func_ret,
+                                      tparams, bindings)
+            return None
+        if pte.type_args and ate.type_args and pte.name == ate.name \
+                and len(pte.type_args) == len(ate.type_args):
+            for pa, aa in zip(pte.type_args, ate.type_args):
+                e = self._unify_te(pa, aa, tparams, bindings)
+                if e:
+                    return e
+            return None
+        # Concrete types: no binding; mismatches are E211 elsewhere.
+        return None
+
+    def _subst_te(self, te: ast.TypeExpr,
+                  bindings: Dict[str, str]) -> ast.TypeExpr:
+        """Substitute type variables using {name: type_string}."""
+        import copy
+        if self._is_tvar(te, bindings.keys()):
+            return self._parse_tstr(bindings[te.name])
+        te = copy.copy(te)
+        if te.is_func:
+            te.func_params = [self._subst_te(p, bindings)
+                              for p in te.func_params]
+            if te.func_ret is not None:
+                te.func_ret = self._subst_te(te.func_ret, bindings)
+        elif te.is_map:
+            te.map_key = self._subst_te(te.map_key, bindings)
+            te.map_val = self._subst_te(te.map_val, bindings)
+        elif te.is_list:
+            elem = te.list_elem if te.list_elem is not None \
+                else ast.TypeExpr(name=te.name)
+            new_elem = self._subst_te(elem, bindings)
+            if (not new_elem.is_list and not new_elem.is_map
+                    and not new_elem.is_func and not new_elem.type_args
+                    and not new_elem.optional):
+                # plain name: keep the legacy flattened form
+                te.name = new_elem.name
+                te.list_elem = None
+            else:
+                te.list_elem = new_elem
+        elif te.type_args:
+            te.type_args = [self._subst_te(a, bindings)
+                            for a in te.type_args]
+        return te
+
+    def _split_applied(self, t: str):
+        """Split an applied type string `Box<Int>` into (base, [args]).
+        Returns (t, []) when not applied."""
+        if "<" not in t or not t.endswith(">"):
+            # handle optional: `Box<Int>?`
+            if t.endswith("?"):
+                base, args = self._split_applied(t[:-1])
+                return base, args
+            return t, []
+        depth, start = 0, -1
+        for i, ch in enumerate(t):
+            if ch == "<":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == ">":
+                depth -= 1
+        if start < 0:
+            return t, []
+        base = t[:start]
+        inner = t[start + 1:-1]
+        args, depth, cur = [], 0, ""
+        for ch in inner:
+            if ch in "<([":
+                depth += 1
+            elif ch in ">)]":
+                depth -= 1
+            if ch == "," and depth == 0:
+                args.append(cur.strip())
+                cur = ""
+            else:
+                cur += ch
+        args.append(cur.strip())
+        return base, args
+
+    def _infer_generic_call(self, fn: ast.FnDecl, e: ast.Call,
+                            scope: dict) -> str:
+        """Phase 5c: call a generic fn. Type arguments come from explicit
+        `f<T>(...)` pinning or are inferred by unifying argument types
+        against parameter types (E219 ambiguity / E220 conflict)."""
+        tparams = fn.type_params
+        bindings: Dict[str, str] = {}
+        had_conflict = False
+        explicit = bool(e.type_args)
+        if e.type_args:
+            if len(e.type_args) != len(tparams):
+                self.error("E221",
+                           f"'{fn.name}' takes {len(tparams)} type "
+                           f"argument(s), got {len(e.type_args)}",
+                           e.line, e.col)
+                return "unknown"
+            for p, a in zip(tparams, e.type_args):
+                self._check_te(a, a.line, a.col)
+                bindings[p] = self._tname(a)
+        # Infer argument types. Non-lambda args first (they ground the
+        # bindings); lambda args then get substituted expected types.
+        # (Skipped when the caller pinned types explicitly — bindings
+        # are fixed, so we go straight to the assignability check.)
+        arg_ts: list = [None] * len(e.args)
+        lam_idx = {i for i, a in enumerate(e.args)
+                   if isinstance(a, ast.Lambda)}
+        for i, a in enumerate(e.args):
+            if i not in lam_idx:
+                arg_ts[i] = self._infer(a, scope)
+        if not explicit:
+            for i, a in enumerate(e.args):
+                if i in lam_idx or i >= len(fn.params):
+                    continue
+                _, pte = fn.params[i]
+                err = self._unify_te(pte, self._parse_tstr(arg_ts[i]),
+                                     tparams, bindings)
+                if err:
+                    self.error("E220", err, a.line, a.col)
+                    had_conflict = True
+            for i in sorted(lam_idx):
+                if i >= len(fn.params):
+                    continue
+                _, pte = fn.params[i]
+                exp_te = self._subst_te(pte, bindings)
+                # Phase 5c: if the expected return is an unbound type var,
+                # let the lambda infer its own return (unification binds the
+                # var afterwards) instead of E211-ing here.
+                if exp_te.is_func and exp_te.func_ret is not None \
+                        and self._is_tvar(exp_te.func_ret, tparams):
+                    import copy
+                    exp_te = copy.copy(exp_te)
+                    exp_te.func_ret = ast.TypeExpr(name="unknown")
+                exp = self._tname(exp_te)
+                arg_ts[i] = self._infer(e.args[i], scope, expected=exp)
+                err = self._unify_te(pte, self._parse_tstr(arg_ts[i]),
+                                     tparams, bindings)
+                if err:
+                    self.error("E220", err, e.args[i].line,
+                               e.args[i].col)
+                    had_conflict = True
+        else:
+            # Explicit pinning: lambdas still get expected types.
+            for i in sorted(lam_idx):
+                if i >= len(fn.params):
+                    continue
+                _, pte = fn.params[i]
+                exp = self._tname(self._subst_te(pte, bindings))
+                arg_ts[i] = self._infer(e.args[i], scope, expected=exp)
+        if len(e.args) != len(fn.params):
+            self.error("E102",
+                       f"function '{fn.name}' takes {len(fn.params)} "
+                       f"args, got {len(e.args)}", e.line, e.col)
+            return "unknown"
+        for p in tparams:
+            if p not in bindings:
+                self.error("E219",
+                           f"cannot infer type argument '{p}' for "
+                           f"'{fn.name}'; pin it explicitly "
+                           f"('{fn.name}<{p}>(...)' or annotate the "
+                           f"lambda parameters)", e.line, e.col)
+                return "unknown"
+        # Phase 5c: annotate the call with concrete type args for AOT
+        # monomorphization (explicit pinning already set them).
+        e.type_args = [self._parse_tstr(bindings[p]) for p in tparams]
+        for (pn, pte), a, at in zip(fn.params, e.args, arg_ts):
+            want_t = self._tname(self._subst_te(pte, bindings))
+            if not had_conflict and at != "unknown" \
+                    and not self._assignable(want_t, at):
+                self.error("E211",
+                           f"argument '{pn}' wants {want_t}, got {at}",
+                           a.line, a.col)
+        if fn.ret:
+            return self._tname(self._subst_te(fn.ret, bindings))
+        return "Void"
+
+    def _check_generic_construct(self, decl: ast.TypeDecl, e: ast.Call,
+                                 scope: dict) -> str:
+        """Phase 5c: construct a generic record type — `Box<Int>(42)`
+        or `Box(42)` with inference. Returns the applied type string."""
+        tparams = decl.type_params
+        bindings: Dict[str, str] = {}
+        if e.type_args:
+            if len(e.type_args) != len(tparams):
+                self.error("E221",
+                           f"'{decl.name}' takes {len(tparams)} type "
+                           f"argument(s), got {len(e.type_args)}",
+                           e.line, e.col)
+                return "unknown"
+            for p, a in zip(tparams, e.type_args):
+                self._check_te(a, a.line, a.col)
+                bindings[p] = self._tname(a)
+        if len(e.args) != len(decl.fields):
+            self.error("E102",
+                       f"'{decl.name}' takes {len(decl.fields)} field "
+                       f"arg(s), got {len(e.args)}", e.line, e.col)
+            return "unknown"
+        arg_ts = [self._infer(a, scope) for a in e.args]
+        for (fn, fte), a, at in zip(decl.fields, e.args, arg_ts):
+            err = self._unify_te(fte, self._parse_tstr(at), tparams,
+                                 bindings)
+            if err:
+                self.error("E220", err, a.line, a.col)
+        for p in tparams:
+            if p not in bindings:
+                self.error("E219",
+                           f"cannot infer type argument '{p}' for "
+                           f"'{decl.name}'; give explicit type arguments "
+                           f"('{decl.name}<{p}>(...)' )", e.line, e.col)
+                return "unknown"
+        # Phase 5c: annotate for AOT monomorphization.
+        e.type_args = [self._parse_tstr(bindings[p]) for p in tparams]
+        for (fn, fte), a, at in zip(decl.fields, e.args, arg_ts):
+            want_t = self._tname(self._subst_te(fte, bindings))
+            if at != "unknown" and not self._assignable(want_t, at):
+                self.error("E211",
+                           f"field '{fn}' wants {want_t}, got {at}",
+                           a.line, a.col)
+        args = ", ".join(bindings[p] for p in tparams)
+        return f"{decl.name}<{args}>"
 
     @staticmethod
     def _func_parts(t: str):

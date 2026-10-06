@@ -1269,6 +1269,262 @@ def _():
     eq(format_source(out, "f.misa"), out)
 
 
+# ---------------------------------------------------------------- Phase 5c: generics
+
+@test("5c parser: generic fn decl")
+def _():
+    p = parse_source('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n',
+                     "f.misa")
+    d = p.items[0]
+    assert isinstance(d, last.FnDecl), d
+    eq(d.type_params, ["T"])
+    eq(d.params[0][1].name, "T")
+    assert d.params[0][1].is_list
+
+
+@test("5c parser: multiple type params")
+def _():
+    p = parse_source('fn f<K, V>(k: K, v: V) -> Int {\n  return 1\n}\n',
+                     "f.misa")
+    eq(p.items[0].type_params, ["K", "V"])
+
+
+@test("5c parser: generic type decl")
+def _():
+    p = parse_source('type Box<T> {\n  value: T,\n}\n', "f.misa")
+    d = p.items[0]
+    assert isinstance(d, last.TypeDecl), d
+    eq(d.type_params, ["T"])
+    eq(d.fields[0][1].name, "T")
+
+
+@test("5c parser: type application in annotation")
+def _():
+    p = parse_source('let b: Box<Int> = Box<Int>(42)\n', "f.misa")
+    ann = p.items[0].ann
+    eq(ann.name, "Box")
+    eq([a.name for a in ann.type_args], ["Int"])
+
+
+@test("5c parser: explicit type args on call")
+def _():
+    p = parse_source('let b = first<Text>(["x"])\n', "f.misa")
+    c = p.items[0].value
+    assert isinstance(c, last.Call), c
+    eq(c.name, "first")
+    eq([a.name for a in c.type_args], ["Text"])
+
+
+@test("5c parser: generic variant construction")
+def _():
+    p = parse_source('let e = Result<Int>.Ok(42)\n', "f.misa")
+    c = p.items[0].value
+    assert isinstance(c, last.Call), c
+    eq(c.name, "Result.Ok")
+    eq([a.name for a in c.type_args], ["Int"])
+
+
+@test("5c parser: comparison not misparsed as generics")
+def _():
+    p = parse_source('let x = a < b\n', "f.misa")
+    assert isinstance(p.items[0].value, last.BinOp)
+
+
+@test("5c checker: inference binds T")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let a = first([1, 2, 3])\n'
+           'let b: Int = a\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: explicit pinning")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let b = first<Text>(["x"])\n'
+           'let c: Text = b\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: nested generics [[T]]")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let a = first([[1, 2], [3]])\n'
+           'let b: [Int] = a\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: multiple type params")
+def _():
+    src = ('fn pair<K, V>(k: K, v: V) -> K {\n  return k\n}\n'
+           'let a = pair(1, "x")\n'
+           'let b: Int = a\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: generic type construction")
+def _():
+    src = ('type Box<T> {\n  value: T,\n}\n'
+           'let b: Box<Int> = Box<Int>(42)\n'
+           'let v: Int = b.value\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: generic record literal")
+def _():
+    src = ('type Box<T> {\n  value: T,\n}\n'
+           'let b: Box<Int> = { value: 42 }\n'
+           'let v: Int = b.value\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: Result<T> with match")
+def _():
+    src = ('type Result<T> { Ok(T), Err(Text) }\n'
+           'let e: Result<Int> = Result.Ok(42)\n'
+           'let x = match e {\n'
+           '  Result.Ok(v) => v + 1,\n'
+           '  Result.Err(_) => 0,\n}\n'
+           'let y: Int = x\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: generic fn calling generic fn")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'fn second<T>(xs: [T]) -> T {\n  return first<T>(xs)\n}\n'
+           'let a = second([1, 2])\n'
+           'let b: Int = a\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: generic fn as value")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let g = first\n'
+           'let a = g([1, 2])\n'
+           'let b: Int = a\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: higher-order generic with lambda")
+def _():
+    src = ('fn map<T, K>(xs: [T], f: (T) -> K) -> [K] {\n'
+           '  var out: [K] = []\n'
+           '  for x in xs {\n    out = out + [f(x)]\n  }\n'
+           '  return out\n}\n'
+           'let r = map([1, 2], |x: Int| x * 2)\n'
+           'let s: [Int] = r\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5c checker: E219 ambiguity")
+def _():
+    src = ('fn f<T, K>(x: T) -> K {\n  return x\n}\n'
+           'let a = f(1)\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E219" for e in errs), errs
+
+
+@test("5c checker: E220 conflict")
+def _():
+    src = ('fn f<T>(x: T, y: T) -> T {\n  return x\n}\n'
+           'let a = f(1, "s")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E220" for e in errs), errs
+
+
+@test("5c checker: E221 type arity mismatch")
+def _():
+    src = ('type Box<T> {\n  value: T,\n}\n'
+           'let b: Box<Int, Text> = Box<Int, Text>(1)\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E221" for e in errs), errs
+
+
+@test("5c checker: E221 fn type-arg arity")
+def _():
+    src = ('fn f<T>(x: T) -> T {\n  return x\n}\n'
+           'let a = f<Int, Text>(1)\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E221" for e in errs), errs
+
+
+@test("5c checker: E222 unbound type variable")
+def _():
+    src = 'fn f<T>(x: T) -> K {\n  return 1\n}\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E222" for e in errs), errs
+
+
+@test("5c checker: E222 unbound in type decl")
+def _():
+    src = 'type Box<T> {\n  value: T,\n  other: K,\n}\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E222" for e in errs), errs
+
+
+@test("5c checker: E211 on substituted mismatch")
+def _():
+    # pinned T=Text, but the arg is [Int]
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let a = first<Text>([1, 2])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("5c interp: generics end to end")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'type Box<T> {\n  value: T,\n}\n'
+           'type Result<T> { Ok(T), Err(Text) }\n'
+           'print(first([1, 2, 3]))\n'
+           'print(first(["a", "b"]))\n'
+           'let b = Box<Int>(41)\n'
+           'print(b.value + 1)\n'
+           'let e: Result<Int> = Result.Ok(41)\n'
+           'print(match e { Result.Ok(v) => v, Result.Err(_) => 0 })\n')
+    eq(run_src(src), "1\na\n42\n41\n")
+
+
+@test("5c interp: generic fn as value")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'let g = first\n'
+           'print(g([7, 8]))\n')
+    eq(run_src(src), "7\n")
+
+
+
+
+
+@test("5c formatter: generics round-trip")
+def _():
+    src = ('fn first<T>(xs: [T]) -> T {\n  return xs[0]\n}\n'
+           'type Box<T> {\n  value: T,\n}\n'
+           'let b = first<Text>(["x"])\n')
+    out = format_source(src, "f.misa")
+    assert "fn first<T>" in out, out
+    assert "type Box<T>" in out, out
+    assert 'first<Text>(["x"])' in out, out
+    eq(format_source(out, "f.misa"), out)
+
+
+
+
+@test("5c interp: recursive generic sum")
+def _():
+    src = ('type L<T> { Nil, Cons(T, L<T>) }\n'
+           'fn len<T>(l: L<T>) -> Int {\n'
+           '  return match l {\n'
+           '    L.Nil => 0,\n'
+           '    L.Cons(_, rest) => 1 + len<T>(rest),\n  }\n}\n'
+           'let l: L<Int> = L.Cons(1, L.Cons(2, L.Nil))\n'
+           'print(len(l))\n'
+           'print(len<Text>(L.Cons("a", L.Nil)))\n')
+    eq(run_src(src), "2\n1\n")
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

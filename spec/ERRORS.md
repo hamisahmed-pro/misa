@@ -52,6 +52,11 @@ Every Misa diagnostic carries a code. Ranges:
 | E216 | **(Phase 5b)** Non-exhaustive `match` — lists the missing variants (`non-exhaustive match on 'Shape'; missing: Rect`). Add the missing arms or a `_` wildcard. |
 | E217 | **(Phase 5b)** `match` arms yield different types (`match arms yield different types ('Int' vs 'Text')`). |
 | E218 | **(Phase 5b)** Sum-type misuse: unknown variant, payload arity mismatch on a pattern, bare use of a payload-carrying variant, `match` on a non-sum scrutinee, or an arm targeting a different sum type. |
+| E219 | **(Phase 5c)** Cannot infer a type argument (`cannot infer type argument 'T' for 'first'`). Pin it explicitly (`first<Int>(...)`) or annotate lambda parameters. |
+| E220 | **(Phase 5c)** Conflicting types for a type variable (`conflicting types for 'T': 'Int' vs 'Text'`). |
+| E221 | **(Phase 5c)** Type-argument arity mismatch (`'Box' takes 1 type argument(s), got 2`). |
+| E222 | **(Phase 5c)** Unbound type variable — a name used as a type inside a generic declaration that is not one of its type parameters (`unbound type variable 'K'`). |
+| E223 | **(Phase 5c)** Monomorphization depth exceeded — recursive generic instantiation in AOT (`f<T>` calling `f<[T]>`); restructure to avoid infinite specialization. |
 
 ## E3xx — runtime
 
