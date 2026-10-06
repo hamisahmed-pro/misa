@@ -129,8 +129,8 @@ networking disabled and still diagnoses. That is the exit proof.
 3. In Xcode: add the `.mlpackage` to the MisaApp target's Copy Bundle
    Resources (or `ios/MisaApp/model/` + target membership).
 4. Run on the simulator: the app must print the same probabilities as
-   the interpreter's offline run (bit-identical doubles, modulo the
-   `%.17g` rendering note in M2).
+   the interpreter's offline run (bit-identical doubles; float rendering
+   is byte-identical across backends since the H-1 audit fix).
 5. Negative paths on device: wrong-length `[Float]` → E501;
    non-numeric model → E502; missing .mlpackage → E400 with the
    resolved path in the message.

@@ -1,0 +1,47 @@
+{
+  "generated_at": "2026-10-06T13:02:53.213361+00:00",
+  "n_runs": 15,
+  "metric": "startup=min of 15 runs, ms",
+  "rows": [
+    {
+      "name": "hello",
+      "lang": "misa-aot",
+      "build_ok": true,
+      "artifact_bytes": 732400,
+      "startup_ms_min15": 9.09,
+      "run_rc": 0
+    },
+    {
+      "name": "tasks.misa",
+      "lang": "misa-aot",
+      "build_ok": true,
+      "artifact_bytes": 1892896,
+      "startup_ms_min15": 32.03,
+      "run_rc": 0
+    },
+    {
+      "name": "diary.misa",
+      "lang": "misa-aot",
+      "build_ok": true,
+      "artifact_bytes": 1843112,
+      "startup_ms_min15": 20.98,
+      "run_rc": 0
+    },
+    {
+      "name": "hello.py",
+      "lang": "python",
+      "build_ok": true,
+      "artifact_bytes": 15,
+      "startup_ms_min15": 65.8,
+      "run_rc": 0
+    },
+    {
+      "name": "hello.misa",
+      "lang": "misa-interp",
+      "build_ok": true,
+      "artifact_bytes": 15,
+      "startup_ms_min15": 215.36,
+      "run_rc": 0
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+// Probe 1: env unset is catchable
+var cmd = "fallback"
+try {
+    cmd = env("TASKMAN_CMD_PROBE_NOPE")
+} catch e {
+    print("p1 caught: {e.code}")
+}
+print("p1 cmd=[{cmd}]")
+
+// Probe 2: db open/exec/query with typed table
+table tasks {
+    id: Int @primary,
+    title: Text,
+    status: Text,
+    created: Text,
+}
+let dbh = db.open("/tmp/probe-tm.db")
+db.exec(dbh, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL)")
+db.exec(dbh, "DELETE FROM tasks")
+let n = db.exec(dbh, "INSERT INTO tasks (title, status, created) VALUES (?, ?, ?)", ["hi", "todo", "2026-01-01"])
+print("p2 inserted rows={n}")
+let rows = db.query(dbh, "SELECT id, title, status, created FROM tasks ORDER BY id")
+for r in rows {
+    print("p2 row id={r.id} status={r.status} title={r.title}")
+}
+db.close(dbh)
+
+// Probe 3: json.parse bad json catchable; non-array detection
+try {
+    let v = json.parse("not json")
+    print("p3 parsed?!")
+} catch e {
+    print("p3 caught: {e.code}")
+}
+let v2 = json.parse("{{\"a\": 1}")
+print("p3 v2={v2}")
+
+// Probe 4: dynamic record field access
+let item = json.parse("{{\"title\": \"x\", \"n\": 5}")
+print("p4 title={item.title}")
+try {
+    print("p4 missing={item.nope}")
+} catch e {
+    print("p4 caught missing: {e.code}")
+}
+try {
+    let bad: Text = item.n
+    print("p4 n as text?! {bad}")
+} catch e {
+    print("p4 caught nontype: {e.code}")
+}

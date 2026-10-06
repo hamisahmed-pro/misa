@@ -32,9 +32,10 @@ handles. There is no unboxing in v0.3: arithmetic, comparison, and
 field access all go through runtime helpers. Correctness first;
 representation optimization is future work.
 
-`Int` is 64-bit two's-complement (wrapping). The interpreter uses
-arbitrary precision; programs that need more than 64 bits must check
-before relying on AOT builds.
+`Int` is 64-bit two's-complement (wrapping) on both backends
+(C-1 audit decision, 2026-10-06): literals, arithmetic, and `int()`
+parsing all wrap identically in the interpreter and AOT. Out-of-range
+`Float`→`Int` conversion is E300. See `SEMANTICS.md`.
 
 ## Memory management
 
@@ -119,8 +120,7 @@ Each is a documented improvement, not a gap:
   `TypeError`.
 - **Uncaught errors carry the source line and column** (`12:3: E305:
   …`) where the interpreter prints `<unknown>`.
-- **`Int` is 64-bit wrapping** in AOT vs arbitrary precision in the
-  interpreter.
+- **`Int` is 64-bit wrapping** on both backends (C-1 audit decision).
 - **Prompt interpolation** in `model` blocks accepts parameter names
   only (same as the interpreter).
 - **First-class lambdas** (`let f = (x) => x`) are rejected with

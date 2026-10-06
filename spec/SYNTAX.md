@@ -54,7 +54,7 @@ An explicit `;` is also legal but the formatter never emits one.
 program     := item*
 item        := appDecl | providerDecl | modelsDecl | typeDecl
              | modelDecl | screenDecl | evalDecl | fnDecl | importDecl
-             | statement
+             | tableDecl | externDecl | statement
 
 appDecl     := "app" IDENT "{" appField* "}"
 appField    := IDENT ":" literal ","?
@@ -66,15 +66,29 @@ providerField := ( "key" ":" "env" "(" STRING ")"
 modelsDecl  := "models" "{" modelsField* "}"
 modelsField := IDENT ":" IDENT "(" STRING ")" ","?
 
-typeDecl    := "type" IDENT "{" typeField* "}"
+typeDecl    := "type" IDENT typeParams? "{" (typeField | sumVariant)* "}"
+typeParams  := "<" IDENT ("," IDENT)* ">"
 typeField   := IDENT ":" typeExpr ","?
+sumVariant  := IDENT "(" (IDENT ":" typeExpr ("," IDENT ":" typeExpr)*)? ")" ","?
+              // Phase 5b: sum types, e.g. type Shape { Circle(radius: Float), None, }
+
+tableDecl   := "table" IDENT "{" tableField* "}"
+tableField  := IDENT ":" typeExpr ("@" IDENT)? ","?
+              // Phase 5 (DB): e.g. table users { id: Int @primary, name: Text, }
+
+externDecl  := "extern" STRING "{" externFn* "}"
+externFn    := "fn" IDENT "(" params? ")" ("->" typeExpr)? ","?
+              // Phase 7 (FFI): e.g. extern "c" { fn strlen(s: Text) -> Int }
 
 typeExpr    := IDENT "?"? | "[" typeExpr "]" "?"?
              | "Map" "<" typeExpr "," typeExpr ">" "?"?
+             | IDENT "<" typeExpr ("," typeExpr)* ">" "?"?
+             // Phase 5c: generic instantiation, e.g. Box<Int>, Result<Text>
              | "(" (typeExpr ("," typeExpr)*)? ")" "->" typeExpr "?"?
              // Phase 5a: function types, e.g. (Int, Text) -> Bool
 
-fnDecl      := "fn" IDENT "(" params? ")" ("->" typeExpr)? "{" statement* "}"
+fnDecl      := "fn" IDENT typeParams? "(" params? ")" ("->" typeExpr)? "{" statement* "}"
+             // Phase 5c: generic functions, e.g. fn first<T>(xs: [T]) -> T
 importDecl  := "import" STRING
 
 modelDecl   := "model" IDENT "(" params ")" "->" typeExpr
@@ -127,7 +141,13 @@ unary       := ("-" | "not") unary | awaitExpr | primary
 awaitExpr   := "await" unary
 primary     := literal | IDENT | callExpr | fieldAccess | indexExpr
              | listLit | recordLit | mapLit | lambda | "(" expr ")"
-             | "stream" IDENT "=" expr
+             | "stream" IDENT "=" expr | matchExpr | sumCtor
+             // Phase 5b: match expressions and sum constructors
+matchExpr   := "match" expr "{" matchArm* "}"
+matchArm    := (IDENT "." IDENT "(" (IDENT ("," IDENT)*)? ")" | IDENT | "_")
+               "=>" (expr | "{" statement* "}") ","?
+sumCtor     := IDENT "." IDENT "(" (expr ("," expr)*)? ")"
+             // e.g. Shape.Circle(1.0)
 callExpr    := IDENT "(" callArgs? ")"
 callArgs    := expr ("," expr)*
 fieldAccess := primary "." IDENT

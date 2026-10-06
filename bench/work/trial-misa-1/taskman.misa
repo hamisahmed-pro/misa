@@ -1,0 +1,187 @@
+table tasks {
+  id: Int @primary,
+  title: Text,
+  status: Text,
+  created: Text,
+}
+
+fn getenv(name: Text) -> Text {
+  var v = ""
+  try {
+    v = env(name)
+  } catch e {
+    v = ""
+  }
+  return v
+}
+
+fn fail(msg: Text) {
+  print(msg)
+  throw { code: "E300", message: msg }
+}
+
+fn now_iso() -> Text {
+  return time.format(time.now(), "%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn print_usage() {
+  print("Usage: taskman")
+  print("Driven by TASKMAN_CMD, TASKMAN_ARG, TASKMAN_DB environment variables.")
+  print("  add <title>     add a new task")
+  print("  list            list all tasks")
+  print("  doing <id>      mark a task as doing")
+  print("  done <id>       mark a task as done")
+  print("  delete <id>     delete a task")
+  print("  export <file>   export tasks to a JSON file")
+  print("  import <file>   import tasks from a JSON file")
+}
+
+fn parse_id(s: Text) -> Int {
+  var id = 0
+  var ok = true
+  try {
+    id = int(s)
+  } catch e {
+    ok = false
+  }
+  if not ok or id <= 0 {
+    fail("Error: bad id '{s}'")
+  }
+  return id
+}
+
+fn cmd_add(db: Db, arg: Text) {
+  if arg == "" {
+    fail("Error: title required")
+  }
+  db.exec(db, "INSERT INTO tasks (title, status, created) VALUES (?, ?, ?)", [arg, "todo", now_iso()])
+  let rows = db.query(db, "SELECT id FROM tasks ORDER BY id DESC LIMIT 1")
+  let newid = rows[0].id
+  print("Added #{newid}: {arg}")
+}
+
+fn cmd_list(db: Db) {
+  let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
+  if len(rows) == 0 {
+    print("No tasks.")
+  }
+  for r in rows {
+    print("#{r.id} [{r.status}] {r.title}")
+  }
+}
+
+fn cmd_set_status(db: Db, cmd: Text, arg: Text) {
+  let id = parse_id(arg)
+  let changed = db.exec(db, "UPDATE tasks SET status = ? WHERE id = ?", [cmd, str(id)])
+  if changed == 0 {
+    fail("Error: no task #{id}")
+  }
+  print("Marked #{id} as {cmd}")
+}
+
+fn cmd_delete(db: Db, arg: Text) {
+  let id = parse_id(arg)
+  let changed = db.exec(db, "DELETE FROM tasks WHERE id = ?", [str(id)])
+  if changed == 0 {
+    fail("Error: no task #{id}")
+  }
+  print("Deleted #{id}")
+}
+
+fn cmd_export(db: Db, arg: Text) {
+  if arg == "" {
+    fail("Error: file required")
+  }
+  let rows = db.query(db, "SELECT id, title, status, created FROM tasks ORDER BY id")
+  fs.write(arg, json.stringify(rows))
+  print("Exported {len(rows)} tasks to {arg}")
+}
+
+fn cmd_import(db: Db, arg: Text) {
+  var content = ""
+  try {
+    content = fs.read(arg)
+  } catch e {
+    fail("Error: cannot read {arg}")
+  }
+  if not str.starts_with(str.trim(content), "[") {
+    fail("Error: bad JSON in {arg}")
+  }
+  var data = json.parse("[]")
+  try {
+    data = json.parse(content)
+  } catch e {
+    fail("Error: bad JSON in {arg}")
+  }
+  var n = 0
+  for item in data {
+    var title = ""
+    try {
+      title = item.title
+    } catch e {
+      fail("Error: bad item in {arg}")
+    }
+    var status = "todo"
+    var has_status = true
+    var s = ""
+    try {
+      s = item.status
+    } catch e {
+      has_status = false
+    }
+    if has_status {
+      if s == "todo" or s == "doing" or s == "done" {
+        status = s
+      } else {
+        fail("Error: bad status '{s}'")
+      }
+    }
+    db.exec(db, "INSERT INTO tasks (title, status, created) VALUES (?, ?, ?)", [title, status, now_iso()])
+    n = n + 1
+  }
+  print("Imported {n} tasks from {arg}")
+}
+
+var dbpath = getenv("TASKMAN_DB")
+if dbpath == "" {
+  dbpath = "./tasks.db"
+}
+let cmd = getenv("TASKMAN_CMD")
+let arg = getenv("TASKMAN_ARG")
+
+let db = db.open(dbpath)
+db.exec(db, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL)")
+
+if cmd == "" or cmd == "help" {
+  print_usage()
+} else {
+  if cmd == "add" {
+    cmd_add(db, arg)
+  } else {
+    if cmd == "list" {
+      cmd_list(db)
+    } else {
+      if cmd == "doing" or cmd == "done" {
+        cmd_set_status(db, cmd, arg)
+      } else {
+        if cmd == "delete" {
+          cmd_delete(db, arg)
+        } else {
+          if cmd == "export" {
+            cmd_export(db, arg)
+          } else {
+            if cmd == "import" {
+              cmd_import(db, arg)
+            } else {
+              print("Error: unknown command '{cmd}'")
+              print_usage()
+              throw { code: "E300", message: "unknown command '{cmd}'" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+db.close(db)

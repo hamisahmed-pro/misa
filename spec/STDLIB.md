@@ -90,8 +90,8 @@ SQLite, zero dependencies. `Db` is an opaque handle type.
 | Function | Signature | Description |
 |---|---|---|
 | `db.open` | `db.open(path: Text) -> Db` | Open (creating if needed) a SQLite database; `":memory:"` for transient DBs. |
-| `db.exec` | `db.exec(db: Db, sql: Text, args: [Text]?) -> Int` | Run a statement; returns rows changed. `?` placeholders bound from `args`. |
-| `db.query` | `db.query(db: Db, sql: Text, args: [Text]?) -> [record]` | Run a SELECT; returns a list of records (column name → value). INTEGER→Int, REAL→Float, TEXT→Text, NULL→nil; BLOB is an E303 error in v1. |
+| `db.exec` | `db.exec(db: Db, sql: Text, args: [any]?) -> Int` | Run a statement; returns rows changed. `?` placeholders bound from `args` (Int/Float/Bool/Text/nil). |
+| `db.query` | `db.query(db: Db, sql: Text, args: [any]?) -> [record]` | Run a SELECT; returns a list of records (column name → value). INTEGER→Int, REAL→Float, TEXT→Text, NULL→nil; BLOB is an E303 error in v1. |
 | `db.close` | `db.close(db: Db) -> Void` | Close the handle. |
 
 All four throw `Error{code: "E303"}` on SQLite failures.

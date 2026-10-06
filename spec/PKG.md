@@ -121,13 +121,13 @@ deferred to the public phase.
 `<misa-home>/stdlib/` ships packages maintained with the toolchain,
 importable as `import "std/..."`:
 
-| Package | Contents (seed) |
+| Package | Contents (shipped 2026-10-06 — aspirational entries removed) |
 |---|---|
-| `std/strings` | `trim`, `split`, `join`, `starts_with`, `ends_with`, `contains`, `repeat`, `pad_left`, `pad_right` |
-| `std/lists` | `map`, `filter`, `fold`, `any`, `all`, `flatten`, `zip`, `range` |
-| `std/json` | `stringify_pretty`, `get_path` (safe nested lookup returning a default) |
-| `std/http` | `get_json` (http.get + JSON parse with catchable errors), `post_json` |
-| `std/result` | `ok`/`err` helpers and `unwrap_or` over the `Error` type |
+| `std/strings` | `trim`, `split`, `join`, `starts_with`, `ends_with`, `contains`, `repeat`, `pad_left`, `pad_right` (plus private `is_space`, `starts_at`) |
+| `std/lists` | `range`, `any`, `all`, `sum` — `map`/`filter`/`fold`/`flatten`/`zip` not yet implemented |
+| `std/json` | `escape`, `quoted` (internal helpers) — `stringify_pretty`/`get_path` not yet implemented; use the `json` builtin namespace |
+| `std/http` | `get_text` — `get_json`/`post_json` not yet implemented; use `http.get`/`http.post_json` builtins |
+| `std/result` | `throw_err` — `ok`/`err`/`unwrap_or` helpers not yet implemented |
 
 Rules for stdlib:
 - Pure Misa only (no native code); must pass `misa test` in CI.

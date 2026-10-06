@@ -230,8 +230,8 @@ bound components expose typed props (`text` for `TextInput`,
 
 `misa run` prints the component tree of each screen navigated to.
 `navigate(Name(args))` switches the current screen. Native rendering
-is Phase 4; the tree printed by v0.1 is exactly what Phase 4 will
-render, so screen code written today keeps working.
+shipped in Phase 4 (Android Views driver, UIKit driver, DOM driver);
+the printed tree is exactly what native targets render.
 
 ## 11. Uncaught errors
 

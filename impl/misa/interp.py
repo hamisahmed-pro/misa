@@ -623,12 +623,14 @@ class Interpreter:
             try:
                 return l / r
             except ZeroDivisionError:
-                raise RuntimeError_("division by zero")
+                raise RuntimeError_("division by zero",
+                                     line=e.line, col=e.col)
         if op == "%":
             try:
                 return l % r
             except ZeroDivisionError:
-                raise RuntimeError_("integer modulo by zero")
+                raise RuntimeError_("integer modulo by zero",
+                                     line=e.line, col=e.col)
         if op == "==":
             return l == r
         if op == "!=":

@@ -58,7 +58,7 @@ hello Ada
 errors, unknown names, and bad SQL (see `docs/stdlib.md`):
 
 ```bash
-misa check hello.misa   # silent = clean
+misa check hello.misa   # prints "hello.misa: OK" when clean
 ```
 
 **`misa run`** — runs the program with the interpreter. Best for
