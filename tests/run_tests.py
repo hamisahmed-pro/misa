@@ -1005,6 +1005,270 @@ def _():
     eq(format_source(out, "f.misa"), out)
 
 
+# ---------------------------------------------------------------- Phase 5b: sum types + match
+
+@test("5b parser: sum type decl")
+def _():
+    p = parse_source('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n', "f.misa")
+    d = p.items[0]
+    assert isinstance(d, last.TypeDecl) and d.is_sum, d
+    assert [v.name for v in d.variants] == ["Circle", "Rect"]
+    assert d.variants[0].fields[0][0] == "radius"
+    assert d.variants[1].fields[1][0] == "h"
+
+
+@test("5b parser: positional variant fields")
+def _():
+    p = parse_source('type Opt { None, Some(Int) }\n', "f.misa")
+    d = p.items[0]
+    assert d.is_sum
+    assert d.variants[0].fields == []
+    assert len(d.variants[1].fields) == 1
+    assert d.variants[1].fields[0][1].name == "Int"
+
+
+@test("5b parser: record type still parses")
+def _():
+    p = parse_source('type Point { x: Float, y: Float }\n', "f.misa")
+    d = p.items[0]
+    assert not d.is_sum and [f for f, _ in d.fields] == ["x", "y"]
+
+
+@test("5b parser: match expression")
+def _():
+    src = ('let a = match s {\n'
+           '  Shape.Circle(r) => r * 2.0,\n'
+           '  _ => 0.0,\n}\n')
+    p = parse_source(src, "f.misa")
+    m = p.items[0].value
+    assert isinstance(m, last.Match), m
+    assert len(m.arms) == 2
+    a0, a1 = m.arms
+    assert (a0.type_name, a0.variant, a0.binds) == ("Shape", "Circle", ["r"])
+    assert a1.wildcard
+
+
+@test("5b checker: construction types as the sum")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let s: Shape = Shape.Circle(1.0)\n'
+           'let t = Shape.Rect(2.0, 3.0)\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5b checker: bare none variant")
+def _():
+    src = 'type Opt { None, Some(Int) }\nlet n: Opt = Opt.None\n'
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5b checker: payload type mismatch E211")
+def _():
+    src = ('type Opt { None, Some(Int) }\n'
+           'let x = Opt.Some("s")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("5b checker: arity mismatch E102")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let x = Shape.Rect(1.0)\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("5b checker: unknown variant E218")
+def _():
+    src = 'type Opt { None, Some(Int) }\nlet x = Opt.Bogus\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E218" for e in errs), errs
+
+
+@test("5b checker: bare payload variant E218")
+def _():
+    src = 'type Opt { None, Some(Int) }\nlet x = Opt.Some\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E218" for e in errs), errs
+
+
+@test("5b checker: non-exhaustive match E216")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let s = Shape.Circle(1.0)\n'
+           'let a = match s {\n  Shape.Circle(r) => r,\n}\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E216" for e in errs), errs
+
+
+@test("5b checker: wildcard satisfies exhaustiveness")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let s = Shape.Circle(1.0)\n'
+           'let a = match s {\n  Shape.Circle(r) => r,\n  _ => 0.0,\n}\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5b checker: arm type mismatch E217")
+def _():
+    src = ('type Opt { None, Some(Int) }\n'
+           'let n = Opt.None\n'
+           'let a = match n {\n  Opt.Some(x) => "s",\n  Opt.None => 0,\n}\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E217" for e in errs), errs
+
+
+@test("5b checker: match on non-sum E218")
+def _():
+    src = 'let x = 5\nlet a = match x { _ => 1 }\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E218" for e in errs), errs
+
+
+@test("5b checker: wrong pattern type E218")
+def _():
+    src = ('type A { X }\ntype B { Y }\n'
+           'let a = A.X\n'
+           'let r = match a { B.Y => 1, _ => 0 }\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E218" for e in errs), errs
+
+
+@test("5b checker: bind count mismatch E218")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let s = Shape.Rect(1.0, 2.0)\n'
+           'let a = match s {\n  Shape.Rect(w) => w,\n  _ => 0.0,\n}\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E218" for e in errs), errs
+
+
+@test("5b checker: match binds payload types")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'fn area(s: Shape) -> Float {\n'
+           '  return match s {\n'
+           '    Shape.Circle(r) => r * 3.14,\n'
+           '    Shape.Rect(w, h) => w * h,\n'
+           '  }\n'
+           '}\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5b interp: construction and match")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let s = Shape.Circle(1.0)\n'
+           'print(match s {\n'
+           '  Shape.Circle(r) => r * 2.0,\n'
+           '  Shape.Rect(w, h) => w * h,\n})\n'
+           'print(match Shape.Rect(2.0, 3.0) {\n'
+           '  Shape.Circle(r) => r,\n'
+           '  Shape.Rect(w, h) => w + h,\n})\n')
+    eq(run_src(src), "2.0\n5.0\n")
+
+
+@test("5b interp: none/some idiom with wildcard")
+def _():
+    src = ('type Opt { None, Some(Int) }\n'
+           'fn or_zero(o: Opt) -> Int {\n'
+           '  return match o {\n'
+           '    Opt.Some(x) => x,\n'
+           '    _ => 0,\n'
+           '  }\n'
+           '}\n'
+           'print(or_zero(Opt.Some(41)))\n'
+           'print(or_zero(Opt.None))\n')
+    eq(run_src(src), "41\n0\n")
+
+
+@test("5b interp: nested match")
+def _():
+    src = ('type AB { A, B }\n'
+           'type XY { X, Y }\n'
+           'let r = match AB.A {\n'
+           '  AB.A => match XY.Y {\n'
+           '    XY.X => "x",\n'
+           '    XY.Y => "y",\n'
+           '  },\n'
+           '  AB.B => "b",\n'
+           '}\n'
+           'print(r)\n')
+    eq(run_src(src), "y\n")
+
+
+@test("5b interp: match as expression value")
+def _():
+    src = ('type Opt { None, Some(Int) }\n'
+           'let o = Opt.Some(7)\n'
+           'let doubled = match o { Opt.Some(x) => x * 2, _ => 0 }\n'
+           'print(doubled)\n')
+    eq(run_src(src), "14\n")
+
+
+@test("5b interp: recursive sum type")
+def _():
+    src = ('type Tree { Leaf(v: Int), Node(l: Tree, r: Tree) }\n'
+           'fn count(t: Tree) -> Int {\n'
+           '  return match t {\n'
+           '    Tree.Leaf(v) => 1,\n'
+           '    Tree.Node(l, r) => count(l) + count(r),\n'
+           '  }\n'
+           '}\n'
+           'let t = Tree.Node(Tree.Leaf(1), Tree.Leaf(2))\n'
+           'print(count(t))\n')
+    eq(run_src(src), "2\n")
+
+
+@test("5b interp: sums in lists and records")
+def _():
+    src = ('type Opt { None, Some(Int) }\n'
+           'type Wrap { fst: Opt }\n'
+           'let xs = [Opt.Some(1), Opt.None, Opt.Some(3)]\n'
+           'var total = 0\n'
+           'for o in xs {\n'
+           '  total = total + match o { Opt.Some(x) => x, _ => 0 }\n'
+           '}\n'
+           'print(total)\n'
+           'let r: Wrap = { fst: Opt.Some(9) }\n'
+           'print(match r.fst { Opt.Some(x) => x, _ => 0 })\n')
+    eq(run_src(src), "4\n9\n")
+
+
+@test("5b interp: variant payload holds a closure")
+def _():
+    src = ('type H { Fn(f: (Int) -> Int), Val(n: Int) }\n'
+           'fn run(h: H) -> Int {\n'
+           '  return match h {\n'
+           '    H.Fn(f) => f(10),\n'
+           '    H.Val(n) => n,\n'
+           '  }\n'
+           '}\n'
+           'print(run(H.Fn(|x: Int| x * 3)))\n'
+           'print(run(H.Val(5)))\n')
+    eq(run_src(src), "30\n5\n")
+
+
+@test("5b interp: sum value rendering")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'type Opt { None, Some(Int) }\n'
+           'print(Shape.Circle(1.5))\n'
+           'print(Opt.None)\n'
+           'print(Opt.Some(2))\n')
+    eq(run_src(src), "Shape.Circle(1.5)\nOpt.None\nOpt.Some(2)\n")
+
+
+@test("5b formatter: sum types and match round-trip")
+def _():
+    src = ('type Shape {\n  Circle(radius: Float),\n  Rect(w: Float, h: Float),\n}\n'
+           'let a = match s {\n  Shape.Circle(r) => r,\n  _ => 0.0,\n}\n')
+    out = format_source(src, "f.misa")
+    assert "Circle(radius: Float)" in out, out
+    assert "Shape.Circle(r) => r" in out, out
+    eq(format_source(out, "f.misa"), out)
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

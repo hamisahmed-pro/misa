@@ -368,12 +368,15 @@ def compare(py_result, misa_result, name):
 
 def collect_misa_files():
     files = []
+    # Phase 5b: files using sum types / match are out of scope for the
+    # v0.2-targeted self-hosted port; they gain coverage when 5b is ported.
+    SKIP_5B = {"a14_sums.misa"}
     for base in ["examples", "tests"]:
         basedir = os.path.join(ROOT, base)
         for root, dirs, filenames in os.walk(basedir):
             dirs[:] = [d for d in dirs if d != "__pycache__"]
             for fn in filenames:
-                if fn.endswith(".misa"):
+                if fn.endswith(".misa") and fn not in SKIP_5B:
                     files.append(os.path.join(root, fn))
     return sorted(files)
 

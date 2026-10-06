@@ -1,0 +1,56 @@
+// a14_sums: Phase 5b sum types + match — AOT parity vs interpreter.
+type Shape {
+  Circle(radius: Float),
+  Rect(w: Float, h: Float),
+}
+type Opt { None, Some(Int) }
+type Tree { Leaf(v: Int), Node(l: Tree, r: Tree) }
+
+fn area(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) => r * 2.0,
+    Shape.Rect(w, h) => w * h,
+  }
+}
+
+fn or_zero(o: Opt) -> Int {
+  return match o {
+    Opt.Some(x) => x,
+    _ => 0,
+  }
+}
+
+fn count(t: Tree) -> Int {
+  return match t {
+    Tree.Leaf(v) => 1,
+    Tree.Node(l, r) => count(l) + count(r),
+  }
+}
+
+print(area(Shape.Circle(1.0)))
+print(area(Shape.Rect(2.0, 3.0)))
+print(or_zero(Opt.Some(41)))
+print(or_zero(Opt.None))
+let t = Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))
+print(count(t))
+print(Shape.Circle(2.5))
+print(Opt.None)
+
+// match as an expression value, nested, in a loop
+let xs = [Opt.Some(1), Opt.None, Opt.Some(3)]
+var total = 0
+for o in xs {
+  total = total + match o { Opt.Some(x) => x * 10, _ => 1 }
+}
+print(total)
+
+// closure payload (Phase 5a interaction)
+type H { Fn(f: (Int) -> Int), Val(n: Int) }
+fn run(h: H) -> Int {
+  return match h {
+    H.Fn(f) => f(10),
+    H.Val(n) => n,
+  }
+}
+print(run(H.Fn(|x: Int| x * 3)))
+print(run(H.Val(5)))

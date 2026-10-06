@@ -73,8 +73,19 @@ class Formatter:
         elif isinstance(item, ast.TypeDecl):
             self.w(f"type {item.name} {{")
             self.ind += 1
-            for fn, fte in item.fields:
-                self.w(f"{fn}: {self.fmt_type(fte)},")
+            if item.is_sum:
+                # Phase 5b: sum variants.
+                for v in item.variants:
+                    if v.fields:
+                        fs = ", ".join(
+                            f"{fn}: {self.fmt_type(fte)}"
+                            for fn, fte in v.fields)
+                        self.w(f"{v.name}({fs}),")
+                    else:
+                        self.w(f"{v.name},")
+            else:
+                for fn, fte in item.fields:
+                    self.w(f"{fn}: {self.fmt_type(fte)},")
             self.ind -= 1
             self.w("}")
         elif isinstance(item, ast.ModelDecl):
@@ -381,6 +392,18 @@ class Formatter:
             return f"{op}{self.fmt_expr(e.operand, 7)}"
         if isinstance(e, ast.Await):
             return f"await {self.fmt_expr(e.operand, 7)}"
+        if isinstance(e, ast.Match):
+            # Phase 5b: `match` expression.
+            arms = []
+            for a in e.arms:
+                if a.wildcard:
+                    pat = "_"
+                else:
+                    bs = f"({', '.join(a.binds)})" if a.binds else ""
+                    pat = f"{a.type_name}.{a.variant}{bs}"
+                arms.append(f"{pat} => {self.fmt_expr(a.body)}")
+            return (f"match {self.fmt_expr(e.scrutinee)} {{ "
+                    + ", ".join(arms) + " }")
         if isinstance(e, ast.StreamDecl):
             return f"stream {e.name} = {self.fmt_expr(e.call)}"
         raise ValueError(f"cannot format {type(e).__name__}")

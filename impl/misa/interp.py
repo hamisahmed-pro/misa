@@ -41,6 +41,14 @@ class FnValue:
 
 
 @dataclass
+class SumValue:
+    """Phase 5b: a constructed sum-type variant value."""
+    type_name: str
+    variant: str
+    fields: list  # positional payload values
+
+
+@dataclass
 class TokenStreamHandle:
     decl: ast.ModelDecl
     arg_values: list
@@ -119,6 +127,11 @@ def render_value(v: Any) -> str:
         return "<lambda>"
     if isinstance(v, FnValue):
         return f"<function {v.decl.name}>"
+    if isinstance(v, SumValue):
+        if not v.fields:
+            return f"{v.type_name}.{v.variant}"
+        inner = ", ".join(render_value(x) for x in v.fields)
+        return f"{v.type_name}.{v.variant}({inner})"
     return str(v)
 
 
@@ -331,6 +344,22 @@ class Interpreter:
         if isinstance(e, ast.Call):
             return self.eval_call(e, env)
         if isinstance(e, ast.Field):
+            # Phase 5b: bare zero-payload variant, e.g. `Opt.None`.
+            if isinstance(e.obj, ast.Ident):
+                decl = self.types.get(e.obj.name)
+                if decl is not None and decl.is_sum:
+                    v = next((x for x in decl.variants
+                              if x.name == e.field), None)
+                    if v is None:
+                        raise RuntimeError_(
+                            f"unknown variant '{e.field}' of sum type "
+                            f"'{decl.name}'")
+                    if v.fields:
+                        raise RuntimeError_(
+                            f"variant '{decl.name}.{v.name}' needs "
+                            f"payload; use "
+                            f"'{decl.name}.{v.name}(...)'")
+                    return SumValue(decl.name, v.name, [])
             obj = self.eval_expr(e.obj, env)
             if isinstance(obj, dict):
                 if e.field not in obj:
@@ -338,6 +367,8 @@ class Interpreter:
                 return obj[e.field]
             raise RuntimeError_("cannot access field on "
                                 f"{type(obj).__name__}")
+        if isinstance(e, ast.Match):
+            return self.eval_match(e, env)
         if isinstance(e, ast.Index):
             obj = self.eval_expr(e.obj, env)
             idx = self.eval_expr(e.idx, env)
@@ -417,6 +448,22 @@ class Interpreter:
             return l >= r
         raise RuntimeError_(f"unknown operator '{op}'")
 
+    # -- Phase 5b: match ------------------------------------------------
+
+    def eval_match(self, e: ast.Match, env: Env) -> Any:
+        sv = self.eval_expr(e.scrutinee, env)
+        if not isinstance(sv, SumValue):
+            raise RuntimeError_("match scrutinee is not a sum value")
+        for arm in e.arms:
+            if arm.wildcard or (arm.type_name == sv.type_name
+                                and arm.variant == sv.variant):
+                child = Env(env)
+                for bname, val in zip(arm.binds, sv.fields):
+                    child.define(bname, val, False)
+                return self.eval_expr(arm.body, child)
+        raise RuntimeError_(
+            f"non-exhaustive match on {sv.type_name}.{sv.variant}")
+
     # -- calls --------------------------------------------------------
 
     def eval_call(self, e: ast.Call, env: Env) -> Any:
@@ -435,6 +482,21 @@ class Interpreter:
             return self.call_model(self.models[name], args, e)
         if name in self.screens:
             return ("screen", name, args)
+        # Phase 5b: sum variant construction `Type.Variant(args)`.
+        if "." in name:
+            head, _, var = name.partition(".")
+            decl = self.types.get(head)
+            if decl is not None and decl.is_sum:
+                v = next((x for x in decl.variants if x.name == var),
+                         None)
+                if v is None:
+                    raise RuntimeError_(
+                        f"unknown variant '{var}' of sum type '{head}'")
+                if len(args) != len(v.fields):
+                    raise RuntimeError_(
+                        f"variant '{head}.{var}' takes "
+                        f"{len(v.fields)} args, got {len(args)}")
+                return SumValue(head, var, args)
         if name in self.fns:
             return self.call_fn(self.fns[name], args, e)
         if name == "navigate":

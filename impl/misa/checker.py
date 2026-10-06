@@ -409,9 +409,14 @@ class Checker:
             self._check_block(s.els, dict(scope), fn_ret,
                                _ret_collect=_ret_collect)
         elif isinstance(s, ast.ForStmt):
-            self._infer(s.iter, scope)
+            it = self._infer(s.iter, scope)
+            # Phase 5b: bind the loop var to the list's element type
+            # when known (was always "unknown").
+            vt = "unknown"
+            if it.startswith("[") and it.endswith("]"):
+                vt = it[1:-1] or "unknown"
             inner = dict(scope)
-            inner[s.var] = ("unknown", False)
+            inner[s.var] = (vt, False)
             self._check_block(s.body, inner, fn_ret,
                               _ret_collect=_ret_collect)
         elif isinstance(s, ast.WhileStmt):
@@ -680,6 +685,11 @@ class Checker:
                                f"used as a value",
                                e.line, e.col)
                     return "unknown"
+            # Phase 5b: bare zero-payload variant, e.g. `Opt.None`.
+            if isinstance(e.obj, ast.Ident):
+                decl = self.types.get(e.obj.name)
+                if decl is not None and decl.is_sum:
+                    return self._check_bare_variant(decl, e)
             # Error.code / Error.message on the builtin error type
             if isinstance(e.obj, ast.Ident) and e.obj.name in scope \
                     and scope[e.obj.name][0] == "Error" \
@@ -697,6 +707,9 @@ class Checker:
                            f"type '{ot}' has no field '{e.field}'",
                            e.line, e.col)
             return "unknown"
+        if isinstance(e, ast.Match):
+            # Phase 5b: `match` expression over a sum type.
+            return self._infer_match(e, scope)
         if isinstance(e, ast.Index):
             ot = self._infer(e.obj, scope)
             self._infer(e.idx, scope)
@@ -845,6 +858,7 @@ class Checker:
             return fret
         # Phase 5a: per-arg expected types so lambdas infer untyped
         # params from the callee's function type.
+        # Phase 5b: sum variant payload types serve the same role.
         exp_ts = None
         if e.name in self.fns:
             exp_ts = [self._tname(te) for _, te in self.fns[e.name].params]
@@ -852,6 +866,14 @@ class Checker:
             fp = self._func_parts(scope[e.name][0])
             if fp is not None:
                 exp_ts, _ = fp
+        elif "." in e.name:
+            head, _, var = e.name.partition(".")
+            decl = self.types.get(head)
+            if decl is not None and decl.is_sum:
+                v = next((x for x in decl.variants if x.name == var),
+                         None)
+                if v is not None:
+                    exp_ts = [self._tname(te) for _, te in v.fields]
         arg_ts = []
         for i, a in enumerate(e.args):
             exp = exp_ts[i] if exp_ts and i < len(exp_ts) else None
@@ -866,6 +888,13 @@ class Checker:
                            f"screen '{e.name}' takes {want} args, "
                            f"got {len(e.args)}", e.line, e.col)
             return "screen"
+        # Phase 5b: sum variant construction `Type.Variant(args)`.
+        if "." in e.name:
+            head, _, var = e.name.partition(".")
+            decl = self.types.get(head)
+            if decl is not None and decl.is_sum:
+                return self._check_variant_construct(decl, var, e, scope,
+                                                     arg_ts)
         if e.name in self.fns:
             fn = self.fns[e.name]
             want = len(fn.params)
@@ -947,6 +976,117 @@ class Checker:
             self.error("E102",
                        f"model '{e.name}' takes {want} args, "
                        f"got {len(e.args)}", e.line, e.col)
+
+    # -- Phase 5b: sum types ------------------------------------------
+
+    @staticmethod
+    def _variant_of(decl: ast.TypeDecl, vname: str):
+        return next((v for v in decl.variants if v.name == vname), None)
+
+    def _check_variant_construct(self, decl: ast.TypeDecl, var: str,
+                                 e: ast.Call, scope: dict,
+                                 arg_ts: list) -> str:
+        """Check `Type.Variant(args)`; return the sum type name."""
+        v = self._variant_of(decl, var)
+        if v is None:
+            self.error("E218",
+                       f"unknown variant '{var}' of sum type "
+                       f"'{decl.name}'", e.line, e.col)
+            return "unknown"
+        if len(e.args) != len(v.fields):
+            self.error("E102",
+                       f"variant '{decl.name}.{var}' takes "
+                       f"{len(v.fields)} args, got {len(e.args)}",
+                       e.line, e.col)
+            return decl.name
+        for (fn, fte), a, at in zip(v.fields, e.args, arg_ts):
+            want_t = self._tname(fte)
+            if at != "unknown" and want_t != "unknown" \
+                    and not self._assignable(want_t, at):
+                self.error("E211",
+                           f"variant payload '{fn}' wants {want_t}, "
+                           f"got {at}", a.line, a.col)
+        return decl.name
+
+    def _check_bare_variant(self, decl: ast.TypeDecl,
+                            e: ast.Field) -> str:
+        """Check a bare `Type.Variant` field access (no payload)."""
+        v = self._variant_of(decl, e.field)
+        if v is None:
+            self.error("E218",
+                       f"unknown variant '{e.field}' of sum type "
+                       f"'{decl.name}'", e.line, e.col)
+            return "unknown"
+        if v.fields:
+            self.error("E218",
+                       f"variant '{decl.name}.{v.name}' takes "
+                       f"{len(v.fields)} payload arg(s); construct it as "
+                       f"'{decl.name}.{v.name}(...)'", e.line, e.col)
+            return "unknown"
+        return decl.name
+
+    def _infer_match(self, e: ast.Match, scope: dict) -> str:
+        st = self._infer(e.scrutinee, scope)
+        decl = self.types.get(st)
+        if decl is None or not decl.is_sum:
+            self.error("E218",
+                       f"match scrutinee must be a sum type, got '{st}'",
+                       e.scrutinee.line, e.scrutinee.col)
+            return "unknown"
+        seen = set()
+        has_wildcard = False
+        arm_ts = []
+        for arm in e.arms:
+            if arm.wildcard:
+                has_wildcard = True
+                t = self._infer(arm.body, scope)
+                arm_ts.append(t)
+                continue
+            if arm.type_name != decl.name:
+                self.error("E218",
+                           f"match arm on '{arm.type_name}.{arm.variant}' "
+                           f"does not match scrutinee type '{decl.name}'",
+                           arm.line, arm.col)
+                arm_ts.append(self._infer(arm.body, scope))
+                continue
+            v = self._variant_of(decl, arm.variant)
+            if v is None:
+                self.error("E218",
+                           f"unknown variant '{arm.variant}' of sum type "
+                           f"'{decl.name}'", arm.line, arm.col)
+                arm_ts.append(self._infer(arm.body, scope))
+                continue
+            if len(arm.binds) != len(v.fields):
+                self.error("E218",
+                           f"pattern '{decl.name}.{v.name}' binds "
+                           f"{len(arm.binds)}, variant has "
+                           f"{len(v.fields)} payload field(s)",
+                           arm.line, arm.col)
+            child = dict(scope)
+            for bname, (fn, fte) in zip(arm.binds, v.fields):
+                child[bname] = (self._tname(fte), False)
+            seen.add(arm.variant)
+            arm_ts.append(self._infer(arm.body, child))
+        if not has_wildcard:
+            missing = [v.name for v in decl.variants
+                       if v.name not in seen]
+            if missing:
+                self.error("E216",
+                           f"non-exhaustive match on '{decl.name}'; "
+                           f"missing: {', '.join(missing)}",
+                           e.line, e.col)
+        ret = "unknown"
+        for t in arm_ts:
+            if t == "unknown":
+                continue
+            if ret == "unknown":
+                ret = t
+            elif t != ret:
+                self.error("E217",
+                           f"match arms yield different types "
+                           f"('{ret}' vs '{t}')", e.line, e.col)
+                return "unknown"
+        return ret
 
     # -- type helpers ---------------------------------------------------
 

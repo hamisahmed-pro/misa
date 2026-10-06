@@ -15,6 +15,8 @@ KEYWORDS = {
     "with", "eval", "given", "expect", "runs", "provider", "models",
     "true", "false", "and", "or", "not", "navigate", "env", "nil",
     "fn", "import", "try", "catch", "throw",
+    # Phase 5b: `match` expression for sum types.
+    "match",
 }
 
 # token kinds that trigger implicit semicolon insertion at newline
@@ -23,7 +25,7 @@ INSERT_AFTER = {
     ")", "]", "}", "true", "false", "nil", "return",
 }
 
-MULTI = ["==", "!=", "<=", ">=", "->"]
+MULTI = ["==", "!=", "<=", ">=", "->", "=>"]  # Phase 5b: "=>" match arms
 
 
 @dataclass

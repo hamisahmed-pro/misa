@@ -178,6 +178,11 @@ class Emitter:
         self.CLOSURE_FN = "__closure_fn"
         self.CLOSURE_ENV = "__closure_env"
         self.CLOSURE_DISP = "__closure_disp"
+        # Phase 5b: sum types. Values are MVal* records
+        # {__tag: Int(variant index), __fields: [MVal* payload]}.
+        self.SUM_TAG = "__tag"
+        self.SUM_FIELDS = "__fields"
+        self.SUM_DISP = "__sum_disp"
         self.fn_decls = {}
         self.model_decls = {}
         self.screen_decls = {}
@@ -731,6 +736,11 @@ class Emitter:
         if isinstance(e, A.Call):
             return self.emit_call(e, ctx)
         if isinstance(e, A.Field):
+            # Phase 5b: bare zero-payload variant, e.g. `Opt.None`.
+            if isinstance(e.obj, A.Ident):
+                decl = self.type_decls.get(e.obj.name)
+                if decl is not None and decl.is_sum:
+                    return self.emit_bare_variant(decl, e, ctx)
             # Phase 4 (M4): `<id>.text` readback inside handlers goes
             # to the active UI driver. (The checker guarantees `.text`
             # on a TextInput here.)
@@ -795,6 +805,9 @@ class Emitter:
             # Phase 5a: first-class lambdas become closure values
             # (record {__closure_fn, __closure_env}).
             return self.emit_closure(e, ctx)
+        if isinstance(e, A.Match):
+            # Phase 5b: `match` expression over a sum value.
+            return self.emit_match(e, ctx)
         if isinstance(e, A.UnOp):
             v = self.emit_expr(e.operand, ctx)
             self.check(ctx, e)
@@ -923,6 +936,12 @@ class Emitter:
                 target = None
             if target is not None:
                 return self.emit_closure_call_var(e, ctx, name, target)
+        # Phase 5b: sum variant construction `Type.Variant(args)`.
+        if "." in name:
+            head, _, var = name.partition(".")
+            decl = self.type_decls.get(head)
+            if decl is not None and decl.is_sum:
+                return self.emit_sum_construct(decl, var, e, ctx)
         return self.emit_builtin(e, ctx)
 
     def call(self, ctx: FnCtx, name, args, node, check=True,
@@ -1189,6 +1208,127 @@ class Emitter:
                   [clos, self.cstr(self.CLOSURE_DISP), disp],
                   node, check=False)
         return clos
+
+    # -- Phase 5b: sum types -------------------------------------------
+    #
+    # A sum value is an MVal* record:
+    #   {__tag: Int(variant index), __fields: [MVal* payload]}.
+    # `match` compiles to an LLVM switch on the tag.
+
+    def _variant_index(self, decl, vname: str) -> int:
+        for i, v in enumerate(decl.variants):
+            if v.name == vname:
+                return i
+        raise AOTError("E600", f"unknown variant '{vname}' of sum type "
+                               f"'{decl.name}'", decl.line, decl.col)
+
+    def emit_sum_construct(self, decl, vname: str, e: A.Call,
+                           ctx: FnCtx):
+        """Build the {__tag, __fields} record for `Type.Variant(args)`."""
+        b = ctx.builder
+        idx = self._variant_index(decl, vname)
+        v = decl.variants[idx]
+        if len(e.args) != len(v.fields):
+            raise AOTError("E600",
+                           f"variant '{decl.name}.{vname}' takes "
+                           f"{len(v.fields)} args, got {len(e.args)}",
+                           e.line, e.col)
+        r = self.call(ctx, "misa_record_new", [], e, check=False)
+        tag = self.call(ctx, "misa_int", [self.const_i64(idx)], e,
+                        check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr(self.SUM_TAG), tag], e, check=False)
+        l = self.call(ctx, "misa_list_new", [], e, check=False)
+        for a in e.args:
+            av = self.emit_expr(a, ctx)
+            self.check(ctx, e)
+            self.call(ctx, "misa_list_push", [l, av], e, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr(self.SUM_FIELDS), l], e, check=False)
+        # Phase 5b: display prefix for print/str parity with the
+        # interpreter (`Type.Variant`); the C renderer appends payload.
+        disp = self.call(ctx, "misa_text_cstr",
+                         [self.cstr(f"{decl.name}.{vname}")],
+                         e, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr(self.SUM_DISP), disp], e, check=False)
+        return r
+
+    def emit_bare_variant(self, decl, e: A.Field, ctx: FnCtx):
+        """Build the {__tag, __fields} record for a bare `Type.Variant`."""
+        # zero-field: reuse the construct path with no args.
+        fake = A.Call(name=f"{decl.name}.{e.field}", args=[],
+                      line=e.line, col=e.col)
+        return self.emit_sum_construct(decl, e.field, fake, ctx)
+
+    def emit_match(self, e: A.Match, ctx: FnCtx):
+        b = ctx.builder
+        line, col = self.loc(e)
+        sv = self.emit_expr(e.scrutinee, ctx)
+        self.check(ctx, e)
+        tag_val = self.call(ctx, "misa_record_get",
+                            [sv, self.cstr(self.SUM_TAG), line, col], e)
+        tag = self.call(ctx, "misa_as_int", [tag_val], e, check=False)
+        fields = self.call(ctx, "misa_record_get",
+                           [sv, self.cstr(self.SUM_FIELDS), line, col],
+                           e)
+        # variant name -> index, from the first non-wildcard arm's type
+        # (the checker guarantees every arm targets the scrutinee type).
+        vmap = {}
+        for arm in e.arms:
+            if not arm.wildcard:
+                decl = self.type_decls[arm.type_name]
+                vmap = {v.name: i for i, v in
+                        enumerate(decl.variants)}
+                break
+        arm_blocks = [ctx.fn.append_basic_block(f"match.arm{i}")
+                      for i in range(len(e.arms))]
+        end_b = ctx.fn.append_basic_block("match.end")
+        wild_idx = next((i for i, a in enumerate(e.arms)
+                         if a.wildcard), None)
+        if wild_idx is not None:
+            default_b = arm_blocks[wild_idx]
+        else:
+            # Unreachable: the checker enforces exhaustiveness.
+            default_b = ctx.fn.append_basic_block("match.unreachable")
+        sw = b.switch(tag, default_b)
+        seen_idx = set()
+        for i, arm in enumerate(e.arms):
+            if arm.wildcard:
+                continue
+            idx = vmap[arm.variant]
+            if idx not in seen_idx:
+                seen_idx.add(idx)
+                sw.add_case(self.const_i64(idx), arm_blocks[i])
+        if wild_idx is None:
+            b.position_at_end(default_b)
+            b.unreachable()
+        incomings = []
+        for i, arm in enumerate(e.arms):
+            b.position_at_end(arm_blocks[i])
+            old_scope = ctx.scope
+            if not arm.wildcard:
+                child = ctx.scope.child()
+                ctx.scope = child
+                for j, bname in enumerate(arm.binds):
+                    fv = self.call(ctx, "misa_list_get",
+                                   [fields, self.const_i64(j)],
+                                   arm, check=False)
+                    a = self.alloca_var(ctx, bname)
+                    b.store(fv, a)
+                    child.declare(bname, a)
+            rv = self.emit_expr(arm.body, ctx)
+            self.check(ctx, arm)
+            if not b.block.is_terminated:
+                cur = b.block
+                b.branch(end_b)
+                incomings.append((rv, cur))
+            ctx.scope = old_scope
+        b.position_at_end(end_b)
+        phi = b.phi(PTR, name="matchv")
+        for rv, blk in incomings:
+            phi.add_incoming(rv, blk)
+        return phi
 
     def emit_model_call(self, name: str, e: A.Call, ctx: FnCtx):
         fn, _g = self.models[name]

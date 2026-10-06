@@ -49,6 +49,9 @@ Every Misa diagnostic carries a code. Ranges:
 | E213 | **(Phase 5a)** Cannot infer a lambda parameter's type — annotate it (`\|x: Int\|`) or use the lambda where a function type is expected. |
 | E214 | **(Phase 5a)** A builtin (`print`, `str`, `fs.read`, …) used as a value. Builtins are not first-class. |
 | E215 | **(Phase 5a)** Calling a value that is not a function (`'x' has type 'Int' and is not callable`). |
+| E216 | **(Phase 5b)** Non-exhaustive `match` — lists the missing variants (`non-exhaustive match on 'Shape'; missing: Rect`). Add the missing arms or a `_` wildcard. |
+| E217 | **(Phase 5b)** `match` arms yield different types (`match arms yield different types ('Int' vs 'Text')`). |
+| E218 | **(Phase 5b)** Sum-type misuse: unknown variant, payload arity mismatch on a pattern, bare use of a payload-carrying variant, `match` on a non-sum scrutinee, or an arm targeting a different sum type. |
 
 ## E3xx — runtime
 

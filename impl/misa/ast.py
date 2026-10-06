@@ -60,6 +60,19 @@ class TypeDecl(Node):
     name: str = ""
     # (field_name, TypeExpr)
     fields: List[Tuple[str, TypeExpr]] = field(default_factory=list)
+    # Phase 5b: sum types. When is_sum is True, `fields` is unused and
+    # `variants` holds the variant list instead.
+    is_sum: bool = False
+    variants: List["VariantDecl"] = field(default_factory=list)
+
+
+@dataclass
+class VariantDecl(Node):
+    """Phase 5b: one variant of a sum type, e.g. `Circle(radius: Float)`."""
+    name: str = ""
+    # (field_name, TypeExpr); positional fields (e.g. `Some(Int)`) get
+    # synthetic names `_0`, `_1`, ...
+    fields: List[Tuple[str, TypeExpr]] = field(default_factory=list)
 
 
 @dataclass
@@ -289,6 +302,25 @@ class Lambda(Node):
         default_factory=list)
     body: List[Node] = field(default_factory=list)
     expr_body: Optional[Node] = None
+
+
+@dataclass
+class MatchArm(Node):
+    """Phase 5b: one arm of a `match` expression."""
+    # Pattern: Type.Variant(binds...) — or a wildcard when wildcard=True
+    # (type_name/variant/binds unused then).
+    type_name: str = ""
+    variant: str = ""
+    binds: List[str] = field(default_factory=list)
+    body: Optional[Node] = None
+    wildcard: bool = False
+
+
+@dataclass
+class Match(Node):
+    """Phase 5b: `match` expression over a sum-typed scrutinee."""
+    scrutinee: Optional[Node] = None
+    arms: List[MatchArm] = field(default_factory=list)
 
 
 @dataclass

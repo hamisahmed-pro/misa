@@ -428,6 +428,31 @@ static void render_into(Str *s, MVal *v) {
             str_putn(s, d->u.text.data, d->u.text.len);
             break;
         }
+        /* Phase 5b: sum values render as `Type.Variant(payload, ...)`,
+         * matching the interpreter. */
+        int64_t sdisp_idx = -1, sfields_idx = -1;
+        for (int64_t i = 0; i < v->u.record.len; i++) {
+            if (strcmp(v->u.record.names[i], "__sum_disp") == 0
+                && v->u.record.vals[i]->tag == M_TAG_TEXT)
+                sdisp_idx = i;
+            else if (strcmp(v->u.record.names[i], "__fields") == 0)
+                sfields_idx = i;
+        }
+        if (sdisp_idx >= 0) {
+            MVal *d = v->u.record.vals[sdisp_idx];
+            str_putn(s, d->u.text.data, d->u.text.len);
+            MVal *fl = (sfields_idx >= 0)
+                ? v->u.record.vals[sfields_idx] : NULL;
+            if (fl && fl->tag == M_TAG_LIST && fl->u.list.len > 0) {
+                str_puts(s, "(");
+                for (int64_t i = 0; i < fl->u.list.len; i++) {
+                    if (i) str_puts(s, ", ");
+                    render_into(s, fl->u.list.items[i]);
+                }
+                str_puts(s, ")");
+            }
+            break;
+        }
         str_puts(s, "{ ");
         for (int64_t i = 0; i < v->u.record.len; i++) {
             if (i) str_puts(s, ", ");

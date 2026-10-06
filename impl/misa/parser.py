@@ -178,17 +178,71 @@ class Parser:
         name = self.expect_ident("type name").value
         self.expect("{", "'{'")
         fields = []
+        variants = []
+        is_sum = False
         self.skip_semis()
-        while not self.at("}"):
-            fk = self.expect_ident("field name").value
-            self.expect(":", "':'")
-            te = self.parse_type_expr()
-            fields.append((fk, te))
-            if self.at(","):
+        if not self.at("}"):
+            # Phase 5b: disambiguate record vs sum form by what follows
+            # the first name: `name:` -> record field, otherwise a variant.
+            first = self.expect_ident("field or variant name").value
+            if self.at(":"):
                 self.advance()
-            self.skip_semis()
+                te = self.parse_type_expr()
+                fields.append((first, te))
+                if self.at(","):
+                    self.advance()
+                self.skip_semis()
+                while not self.at("}"):
+                    fk = self.expect_ident("field name").value
+                    self.expect(":", "':'")
+                    te = self.parse_type_expr()
+                    fields.append((fk, te))
+                    if self.at(","):
+                        self.advance()
+                    self.skip_semis()
+            else:
+                is_sum = True
+                variants.append(self._finish_variant(first))
+                if self.at(","):
+                    self.advance()
+                self.skip_semis()
+                while not self.at("}"):
+                    vn = self.expect_ident("variant name").value
+                    variants.append(self._finish_variant(vn))
+                    if self.at(","):
+                        self.advance()
+                    self.skip_semis()
         self.expect("}", "'}'")
-        return ast.TypeDecl(name=name, fields=fields, line=t.line, col=t.col)
+        return ast.TypeDecl(name=name, fields=fields, is_sum=is_sum,
+                            variants=variants, line=t.line, col=t.col)
+
+    def _finish_variant(self, vname: str) -> ast.VariantDecl:
+        """Parse the optional `(fields)` after a variant name. Fields may
+        be named (`radius: Float`) or positional (`Int`); positional
+        fields get synthetic names `_0`, `_1`, ..."""
+        t = self.peek()
+        fields = []
+        if self.at("("):
+            self.advance()
+            idx = 0
+            if not self.at(")"):
+                while True:
+                    if self.at("IDENT") and self.peek(1).kind == ":":
+                        fn = self.expect_ident("field name").value
+                        self.expect(":", "':'")
+                        te = self.parse_type_expr()
+                        fields.append((fn, te))
+                    else:
+                        te = self.parse_type_expr()
+                        fields.append((f"_{idx}", te))
+                        idx += 1
+                    if self.at(","):
+                        self.advance()
+                        continue
+                    break
+            self.expect(")", "')'")
+        return ast.VariantDecl(name=vname, fields=fields,
+                               line=t.line, col=t.col)
 
     def expect_gt(self):
         """Consume a '>' closing a Map<...> type. Splits a lexed '>='
@@ -745,6 +799,50 @@ class Parser:
                 break
         return node
 
+    def parse_match(self) -> ast.Match:
+        """Phase 5b: `match scrut { Type.Variant(binds) => expr, _ => expr }`."""
+        t = self.expect("match", "'match'")
+        scrut = self.parse_expr()
+        self.expect("{", "'{'")
+        arms = []
+        self.skip_semis()
+        while not self.at("}"):
+            arms.append(self.parse_match_arm())
+            if self.at(","):
+                self.advance()
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.Match(scrutinee=scrut, arms=arms,
+                         line=t.line, col=t.col)
+
+    def parse_match_arm(self) -> ast.MatchArm:
+        t = self.peek()
+        wildcard = False
+        type_name, variant, binds = "", "", []
+        if self.at("IDENT") and self.peek().value == "_":
+            self.advance()
+            wildcard = True
+        else:
+            type_name = self.expect_ident("type name").value
+            self.expect(".", "'.'")
+            variant = self.expect_ident("variant name").value
+            if self.at("("):
+                self.advance()
+                if not self.at(")"):
+                    while True:
+                        binds.append(
+                            self.expect_ident("binding").value)
+                        if self.at(","):
+                            self.advance()
+                            continue
+                        break
+                self.expect(")", "')'")
+        self.expect("=>", "'=>'")
+        body = self.parse_expr()
+        return ast.MatchArm(type_name=type_name, variant=variant,
+                            binds=binds, body=body, wildcard=wildcard,
+                            line=t.line, col=t.col)
+
     def parse_call_args(self) -> list:
         """Parse `(a, b, ...)`; the opening paren must be next."""
         self.expect("(", "'('")
@@ -763,6 +861,9 @@ class Parser:
 
     def parse_primary(self) -> ast.Node:
         t = self.peek()
+        # Phase 5b: `match` expression over a sum-typed scrutinee.
+        if t.kind == "match":
+            return self.parse_match()
         if t.kind == "INT":
             self.advance()
             return ast.IntLit(value=t.value, line=t.line, col=t.col)
