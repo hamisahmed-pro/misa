@@ -82,6 +82,10 @@ static pthread_mutex_t g_dispatch_mu = PTHREAD_MUTEX_INITIALIZER;
 /* Camera capture filenames. */
 static int g_capture_seq = 0;
 
+/* Associated-object key for a List view's explicit height constraint
+ * (UITableView has no intrinsic height; see misa_ui_begin_comp). */
+static const char kMisaListHeightKey;
+
 static void ui_main_sync(void (^block)(void)) {
     if ([NSThread isMainThread]) {
         block();
@@ -332,9 +336,25 @@ MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
                                  forAxis:UILayoutConstraintAxisHorizontal];
             v = s;
         } else if (strcmp(kind, "__screen__") == 0) {
-            /* Screen root: a plain container UIView that
-             * misa_ui_show_screen attaches full-bleed. */
-            v = [UIView new];
+            /* Screen root: a vertical UIStackView, pinned full-bleed
+             * by misa_ui_show_screen. Top-level components become
+             * arranged subviews and lay out in source order (the same
+             * sequence the text driver prints). A plain UIView root
+             * left every child at CGRectZero, so nothing painted. */
+            UIStackView *s = [UIStackView new];
+            s.axis = UILayoutConstraintAxisVertical;
+            v = s;
+        }
+        if (strcmp(kind, "List") == 0 && v) {
+            /* UITableView has no intrinsic height; without an explicit
+             * height a List collapses to zero inside a UIStackView.
+             * Default two rows; resized to fit the content when items:
+             * arrives (see misa_ui_set_arg). */
+            NSLayoutConstraint *hc =
+                [v.heightAnchor constraintEqualToConstant:88.0];
+            hc.active = YES;
+            objc_setAssociatedObject(v, &kMisaListHeightKey, hc,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         ui->nw++;
         w = ui->nw;
@@ -380,6 +400,12 @@ void misa_ui_set_arg(MisaUI *ui, MisaWidget w,
                                      data, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             t.dataSource = data;
             [t reloadData];
+            /* Size the table to its content (44pt rows); without this
+             * the List collapses inside its UIStackView. */
+            NSLayoutConstraint *hc = objc_getAssociatedObject(
+                t, &kMisaListHeightKey);
+            if (hc)
+                hc.constant = MAX(44.0, (CGFloat)rows.count * 44.0);
         });
         return;
     }
