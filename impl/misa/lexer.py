@@ -19,6 +19,8 @@ KEYWORDS = {
     "match",
     # Phase 5 (DB): `table` declarations for typed SQL queries.
     "table",
+    # Phase 7: `extern` blocks for FFI (calling C libraries).
+    "extern",
 }
 
 # token kinds that trigger implicit semicolon insertion at newline

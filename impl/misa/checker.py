@@ -10,7 +10,10 @@ from typing import Dict, List, Optional
 from . import ast
 
 
-PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void"}
+PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void",
+              # Phase 7: `Ptr` — opaque C pointer for FFI. Values can be
+              # passed back to C and compared to nil, never dereferenced.
+              "Ptr"}
 MEDIA = {"Photo", "Audio", "Video", "Document"}
 SPECIAL = {"TokenStream", "Embedding", "Db"}
 BUILTINS = {
@@ -99,6 +102,10 @@ class Checker:
         self.screens: Dict[str, ast.ScreenDecl] = {}
         self.evals: Dict[str, ast.EvalDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
+        # Phase 7: extern (FFI) functions: name -> FnDecl (signature
+        # only), plus name -> library string.
+        self.externs: Dict[str, ast.FnDecl] = {}
+        self.extern_libs: Dict[str, str] = {}
         self.app_seen = False
         self._file_of: Optional[Dict[int, str]] = None
         # Phase 4 (M4): id: name -> component kind for the screen whose
@@ -158,6 +165,10 @@ class Checker:
                 self._dup(self.evals, item.name, item, "eval")
             elif isinstance(item, ast.FnDecl):
                 self._dup(self.fns, item.name, item, "function")
+            elif isinstance(item, ast.ExternDecl):
+                for fn in item.fns:
+                    self._dup(self.externs, fn.name, fn, "extern function")
+                    self.extern_libs[fn.name] = item.lib
             elif isinstance(item, ast.ImportDecl):
                 pass  # resolved by the loader before checking
 
@@ -188,6 +199,8 @@ class Checker:
             self._check_eval(item)
         elif isinstance(item, ast.FnDecl):
             self._check_fn(item)
+        elif isinstance(item, ast.ExternDecl):
+            self._check_extern(item)
         elif isinstance(item, ast.TypeDecl):
             self._check_type_decl(item)
         elif isinstance(item, ast.TableDecl):
@@ -223,6 +236,48 @@ class Checker:
         """Phase 5 (DB): validate a table decl's column types."""
         for _, fte, _ in decl.fields:
             self._check_te(fte, fte.line, fte.col)
+
+    # Phase 7: FFI type mapping (v1). Only these Misa types may cross
+    # the boundary; everything else (structs, function types, lists,
+    # maps, generics) is rejected with E225.
+    FFI_TYPES = {"Int", "Float", "Text", "Bool", "Ptr", "Void"}
+
+    def _check_extern(self, decl: ast.ExternDecl):
+        """Phase 7: validate an `extern` block. Library name must be a
+        non-empty string; each signature may only use FFI-mappable
+        types (E225 otherwise); no type parameters (E225); names must
+        not collide with Misa functions (E210)."""
+        if not decl.lib:
+            self.error("E225", "extern library name is empty",
+                       decl.line, decl.col)
+        for fn in decl.fns:
+            if fn.name in self.fns:
+                self.error("E210",
+                           f"extern function '{fn.name}' collides with "
+                           f"a Misa function of the same name",
+                           fn.line, fn.col)
+                continue
+            if fn.type_params:
+                self.error("E225",
+                           f"extern function '{fn.name}' must not have "
+                           f"type parameters (generics are not supported "
+                           f"across FFI)",
+                           fn.line, fn.col)
+            for pn, te in fn.params:
+                self._check_ffi_type(te, fn.name, pn)
+            if fn.ret is not None:
+                self._check_ffi_type(fn.ret, fn.name, "return")
+
+    def _check_ffi_type(self, te: ast.TypeExpr, fn_name: str,
+                        where: str):
+        t = self._tname(te)
+        if t in self.FFI_TYPES:
+            return
+        self.error("E225",
+                   f"extern function '{fn_name}': {where} has type "
+                   f"'{t}', which cannot cross the FFI boundary "
+                   f"(v1 supports only Int, Float, Text, Bool, Ptr, Void)",
+                   te.line, te.col)
 
     def _check_fn(self, fn: ast.FnDecl):
         seen_params = set()
@@ -1016,6 +1071,23 @@ class Checker:
             if len(e.args) != want:
                 self.error("E102",
                            f"function '{e.name}' takes {want} args, "
+                           f"got {len(e.args)}", e.line, e.col)
+            else:
+                for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
+                    want_t = self._tname(te)
+                    if at != "unknown" and not self._assignable(want_t, at):
+                        self.error("E211",
+                                   f"argument '{pn}' wants {want_t}, "
+                                   f"got {at}", a.line, a.col)
+            return self._tname(fn.ret) if fn.ret else "Void"
+        # Phase 7: extern (FFI) function calls — same arity/type
+        # checking as Misa functions.
+        if e.name in self.externs:
+            fn = self.externs[e.name]
+            want = len(fn.params)
+            if len(e.args) != want:
+                self.error("E102",
+                           f"extern function '{e.name}' takes {want} args, "
                            f"got {len(e.args)}", e.line, e.col)
             else:
                 for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
@@ -1937,6 +2009,9 @@ class Checker:
                     return False
             return self._assignable(wr, gr)
         if want == "Float" and got == "Int":
+            return True
+        # Phase 7: nil is a valid Ptr (null pointer).
+        if want == "Ptr" and got == "nil":
             return True
         if want.endswith("?") and got == "nil":
             return True

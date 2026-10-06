@@ -715,6 +715,7 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
                        for e in errors]
 
     from misa.aot.emit import Emitter, AOTError
+    from misa import ast as mast
     from misa.ast import ProviderDecl
     eff_target = canonical_target(target or host_triple())
 
@@ -828,6 +829,14 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
     # --- host: link ----------------------------------------------------
     need_ort = bool(staged_models)
     _defines, _cflags, libs = runtime_flags(eff_target, need_ort)
+    # Phase 7: extern (FFI) libraries. "c" needs no flag; anything
+    # else becomes -l<lib>. (Always safe: the linker only pulls what
+    # the declared extern symbols need.)
+    for item in merged.items:
+        if isinstance(item, mast.ExternDecl) and item.lib != "c":
+            flag = "-l" + item.lib
+            if flag not in libs:
+                libs.append(flag)
     rt_objs = ensure_runtime(eff_target, need_ort, need_sqlite)
     with tempfile.TemporaryDirectory() as td:
         prog_o = os.path.join(td, "prog.o")

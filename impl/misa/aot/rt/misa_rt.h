@@ -35,7 +35,8 @@ enum {
     M_TAG_ERROR  = 8,   /* catchable Error value {code, message} */
     M_TAG_NULL   = 9,
     M_TAG_MEDIA  = 10,  /* Photo | Audio | Video | Document handle */
-    M_TAG_ITER   = 11   /* for-loop iterator (internal) */
+    M_TAG_ITER   = 11,  /* for-loop iterator (internal) */
+    M_TAG_PTR    = 12,  /* Phase 7: opaque C pointer (FFI `Ptr`) */
 };
 
 /* Media kinds. */
@@ -78,6 +79,10 @@ void  misa_record_set_cstr(MVal *rec, const char *field, MVal *val);
 MVal *misa_media(int kind, const char *path);
 int   misa_media_kind(MVal *v);   /* M_MEDIA_* or -1 */
 const char *misa_media_path(MVal *v);
+/* Phase 7: opaque C pointer. The pointer is NOT owned/traced; the
+ * owning C library manages its lifetime. */
+MVal *misa_ptr(void *p);
+void *misa_as_ptr(MVal *v);       /* E200 if not Ptr */
 
 /* -- inspection -------------------------------------------------- */
 int      misa_tag(MVal *v);

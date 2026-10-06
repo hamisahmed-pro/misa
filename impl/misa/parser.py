@@ -87,6 +87,8 @@ class Parser:
             return self.parse_eval()
         if k == "fn":
             return self.parse_fn_decl()
+        if k == "extern":
+            return self.parse_extern_block()
         if k == "import":
             return self.parse_import_decl()
         return self.parse_statement()
@@ -694,6 +696,42 @@ class Parser:
         return ast.FnDecl(name=name, params=params, ret=ret, body=body,
                           type_params=type_params,
                           line=t.line, col=t.col)
+
+    def parse_extern_block(self) -> ast.ExternDecl:
+        """Phase 7: `extern "<lib>" { fn f(...) -> T, ... }`."""
+        t = self.expect("extern", "'extern'")
+        lib_tok = self.expect("STRING", "library name string")
+        lib = lib_tok.value
+        self.expect("{", "'{'")
+        fns = []
+        self.skip_semis()
+        while not self.at("}"):
+            ft = self.expect("fn", "'fn'")
+            name = self.expect_ident("function name").value
+            # Phase 7: accept type params syntactically so the checker
+            # can reject them with E225 (v1: no generics across FFI).
+            type_params = []
+            if self.at("<"):
+                type_params = self._parse_type_params_decl()
+            params = self.parse_params()
+            ret = None
+            if self.at("->"):
+                self.advance()
+                ret = self.parse_type_expr()
+            # No body: extern fns are signatures only. A `{` here is a
+            # mistake (user wrote a body); reject it plainly.
+            if self.at("{"):
+                raise ParseError(
+                    "extern function '%s' must not have a body" % name,
+                    self.peek().line, self.peek().col)
+            fns.append(ast.FnDecl(name=name, params=params, ret=ret,
+                                  body=[], type_params=type_params,
+                                  line=ft.line, col=ft.col))
+            if self.at(","):
+                self.advance()
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.ExternDecl(lib=lib, fns=fns, line=t.line, col=t.col)
 
     def _parse_type_params_decl(self) -> List[str]:
         """Phase 5c: parse `<T, K>` after a fn/type name. Returns names."""

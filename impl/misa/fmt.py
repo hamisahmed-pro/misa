@@ -40,7 +40,7 @@ class Formatter:
     _DECLS = (ast.AppDecl, ast.ProviderDecl, ast.ModelsDecl, ast.TypeDecl,
               ast.TableDecl,
               ast.ModelDecl, ast.ScreenDecl, ast.EvalDecl, ast.FnDecl,
-              ast.ImportDecl)
+              ast.ExternDecl, ast.ImportDecl)
 
     def format_item(self, item: ast.Node):
         # statements emit their own leading comments via format_stmt
@@ -161,6 +161,17 @@ class Formatter:
             self.w("}")
         elif isinstance(item, ast.ImportDecl):
             self.w(f'import "{item.path}"')
+        elif isinstance(item, ast.ExternDecl):
+            # Phase 7: `extern "<lib>" { fn f(...) -> T, ... }`.
+            self.w(f'extern "{item.lib}" {{')
+            self.ind += 1
+            for fn in item.fns:
+                params = ", ".join(
+                    f"{pn}: {self.fmt_type(te)}" for pn, te in fn.params)
+                ret = f" -> {self.fmt_type(fn.ret)}" if fn.ret else ""
+                self.w(f"fn {fn.name}({params}){ret},")
+            self.ind -= 1
+            self.w("}")
 
     def fmt_duration(self, b: ast.Budget) -> str:
         ms = b.latency_ms

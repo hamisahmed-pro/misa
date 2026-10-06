@@ -14,7 +14,8 @@ from . import ast
 from .errors import (MisaError, RuntimeError_, UndefinedName,
                      ImmutableAssign, AssertFailed, ModelError,
                      SchemaValidationError, BudgetExceeded, ThrownError,
-                     IOError_, HTTPError_, MapKeyError, ProviderConfigError)
+                     IOError_, HTTPError_, MapKeyError, ProviderConfigError,
+                     FFIError)
 from .providers import (Provider, Usage, make_provider, guess_mime,
                         estimate_cost_usd, OnDeviceProvider)
 
@@ -54,6 +55,23 @@ class SumValue:
     type_name: str
     variant: str
     fields: list  # positional payload values
+
+
+@dataclass
+class PtrValue:
+    """Phase 7: an opaque C pointer (FFI `Ptr` value). Only passed
+    back to C or compared to nil; never dereferenced from Misa."""
+    addr: int  # 0 = null
+
+    def __eq__(self, other):
+        if other is None:
+            return self.addr == 0
+        if isinstance(other, PtrValue):
+            return self.addr == other.addr
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.addr)
 
 
 @dataclass
@@ -129,6 +147,8 @@ def render_value(v: Any) -> str:
                                 for k, x in v.data.items()) + "}"
     if isinstance(v, MediaHandle):
         return f"<{v.kind}: {v.path}>"
+    if isinstance(v, PtrValue):
+        return "<ptr>"
     if isinstance(v, TokenStreamHandle):
         return "<stream>"
     if isinstance(v, LambdaValue):
@@ -167,6 +187,9 @@ class Interpreter:
         self.screens: Dict[str, ast.ScreenDecl] = {}
         self.evals: Dict[str, ast.EvalDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
+        # Phase 7: extern (FFI) functions: name -> (ctypes callable,
+        # FnDecl signature). Loaded lazily on first load().
+        self.extern_fns: Dict[str, tuple] = {}
         self.provider_cache: Dict[tuple, Provider] = {}
         self.global_env = Env()
         self.current_screen = None
@@ -194,8 +217,90 @@ class Interpreter:
                 self.evals[item.name] = item
             elif isinstance(item, ast.FnDecl):
                 self.fns[item.name] = item
+            elif isinstance(item, ast.ExternDecl):
+                self._load_extern(item)
             elif isinstance(item, ast.ImportDecl):
                 pass  # resolved by the loader before load()
+
+    # -- Phase 7: FFI ---------------------------------------------------
+    # Maps Misa extern signatures onto ctypes. Text crosses as
+    # null-terminated UTF-8 copies (both directions); Ptr is an opaque
+    # address. Load/symbol failures raise FFIError (E226), never a
+    # raw traceback.
+
+    @staticmethod
+    def _ffi_ctype(tname: str):
+        import ctypes
+        return {"Int": ctypes.c_long,
+                "Float": ctypes.c_double,
+                "Text": ctypes.c_char_p,
+                "Bool": ctypes.c_int,
+                "Ptr": ctypes.c_void_p}[tname]
+
+    @staticmethod
+    def _ffi_restype(tname: str):
+        import ctypes
+        if tname == "Void":
+            return None
+        return Interpreter._ffi_ctype(tname)
+
+    def _load_extern(self, decl: ast.ExternDecl):
+        import ctypes
+        import ctypes.util
+        lib = decl.lib
+        try:
+            if lib == "c":
+                cdll = ctypes.CDLL(None)
+            else:
+                resolved = ctypes.util.find_library(lib)
+                cdll = ctypes.CDLL(resolved or ("lib" + lib))
+        except OSError as ex:
+            raise FFIError(f"cannot load library '{lib}': {ex}",
+                           line=decl.line, col=decl.col)
+        for fn in decl.fns:
+            try:
+                cfn = getattr(cdll, fn.name)
+            except AttributeError:
+                raise FFIError(
+                    f"library '{lib}' has no symbol '{fn.name}'",
+                    line=fn.line, col=fn.col)
+            # The checker guarantees FFI-mappable simple types, so
+            # te.name is the whole story here.
+            cfn.argtypes = [self._ffi_ctype(te.name)
+                            for _, te in fn.params]
+            cfn.restype = self._ffi_restype(
+                fn.ret.name if fn.ret else "Void")
+            self.extern_fns[fn.name] = (cfn, fn)
+
+    def call_extern(self, name: str, args: list, node) -> Any:
+        cfn, fn = self.extern_fns[name]
+        c_args = []
+        for (pn, te), a in zip(fn.params, args):
+            t = te.name
+            if t == "Text":
+                c_args.append(a.encode("utf-8"))
+            elif t == "Ptr":
+                c_args.append(a.addr if isinstance(a, PtrValue) else 0)
+            elif t == "Bool":
+                c_args.append(1 if a else 0)
+            else:
+                c_args.append(a)
+        try:
+            r = cfn(*c_args)
+        except Exception as ex:
+            raise FFIError(f"extern call '{name}' failed: {ex}",
+                           line=node.line, col=node.col)
+        ret = fn.ret.name if fn.ret else "Void"
+        if ret == "Void":
+            return None
+        if ret == "Text":
+            # ctypes gives bytes (or None for NULL) for c_char_p.
+            return r.decode("utf-8") if r is not None else None
+        if ret == "Ptr":
+            return PtrValue(r or 0)
+        if ret == "Bool":
+            return bool(r)
+        return r
 
     def run(self, prog: ast.Program):
         self.load(prog)
@@ -205,6 +310,7 @@ class Interpreter:
                                  ast.TableDecl,
                                  ast.ModelDecl, ast.ScreenDecl,
                                  ast.EvalDecl, ast.FnDecl,
+                                 ast.ExternDecl,
                                  ast.ImportDecl)):
                 continue
             try:
@@ -510,6 +616,9 @@ class Interpreter:
                 return SumValue(head, var, args)
         if name in self.fns:
             return self.call_fn(self.fns[name], args, e)
+        # Phase 7: extern (FFI) function calls.
+        if name in self.extern_fns:
+            return self.call_extern(name, args, e)
         # Phase 5c: generic record construction `Box<Int>(42)`.
         # Erasure: type args are checking-time only; the value is a
         # plain record dict like any other.

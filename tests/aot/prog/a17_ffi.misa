@@ -1,0 +1,20 @@
+// a17_ffi: Phase 7 FFI — calling C libraries from Misa.
+// Byte-identical on interpreter vs `misa build` (host).
+extern "c" {
+  fn strlen(s: Text) -> Int,
+  fn sqrt(x: Float) -> Float,
+  fn strcmp(a: Text, b: Text) -> Int,
+}
+
+extern "m" {
+  fn cos(x: Float) -> Float,
+  fn pow(x: Float, y: Float) -> Float,
+}
+
+print(strlen("hello"))
+print(strlen(""))
+print(sqrt(2.0))
+print(strcmp("abc", "abc"))
+print(strcmp("abc", "abd"))
+print(cos(0.0))
+print(pow(2.0, 10.0))

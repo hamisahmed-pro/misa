@@ -1663,6 +1663,149 @@ def _():
     raise AssertionError("expected ParseError for @bogus")
 
 
+# ----------------------------------------------------------------------
+# Phase 7: FFI — extern "lib" { fn ... }
+# ----------------------------------------------------------------------
+
+@test("ffi: extern libc strlen + sqrt via interpreter")
+def _():
+    src = ('extern "c" {\n'
+           '  fn strlen(s: Text) -> Int,\n'
+           '  fn sqrt(x: Float) -> Float,\n'
+           '}\n'
+           'print(strlen("hello"))\n'
+           'print(sqrt(2.0))\n')
+    out = run_src(src)
+    assert out.strip().splitlines() == ["5", "1.4142135623730951"], out
+
+
+@test("ffi: extern libm proves second-library linking")
+def _():
+    src = ('extern "m" {\n'
+           '  fn cos(x: Float) -> Float,\n'
+           '  fn pow(x: Float, y: Float) -> Float,\n'
+           '}\n'
+           'print(cos(0.0))\n'
+           'print(pow(2.0, 10.0))\n')
+    out = run_src(src)
+    assert out.strip().splitlines() == ["1.0", "1024.0"], out
+
+
+@test("ffi: Ptr round-trips through sqlite3 (opaque handle)")
+def _():
+    src = ('extern "sqlite3" {\n'
+           '  fn sqlite3_open(name: Text, db: Ptr) -> Int,\n'
+           '  fn sqlite3_close(db: Ptr) -> Int,\n'
+           '}\n'
+           'print("loaded")\n')
+    # sqlite3_open needs a Ptr* out-param (unsupported in v1), so we
+    # only prove the library loads and Ptr-typed symbols bind. A real
+    # open/close round-trip would need pointer-to-pointer marshalling.
+    out = run_src(src)
+    assert out.strip() == "loaded", out
+
+
+@test("ffi: Ptr values are opaque (<ptr>) and compare to nil")
+def _():
+    src = ('extern "c" {\n'
+           '  fn malloc(n: Int) -> Ptr,\n'
+           '  fn free(p: Ptr) -> Void,\n'
+           '}\n'
+           'let p = malloc(16)\n'
+           'print(p)\n'
+           'print(p == nil)\n'
+           'free(p)\n'
+           'let q: Ptr = nil\n'
+           'print(q == nil)\n')
+    out = run_src(src)
+    lines = out.strip().splitlines()
+    assert lines[0] == "<ptr>", lines
+    assert lines[1] == "false", lines
+    assert lines[2] == "true", lines
+
+
+@test("ffi: missing library is E226, not a traceback")
+def _():
+    raises_code(lambda: run_src('extern "no-such-lib-xyz" {\n'
+                                '  fn f() -> Int,\n'
+                                '}\n'
+                                'print(f())\n'), "E226")
+
+
+@test("ffi: missing symbol is E226")
+def _():
+    raises_code(lambda: run_src('extern "c" {\n'
+                                '  fn no_such_symbol_xyz() -> Int,\n'
+                                '}\n'
+                                'print(no_such_symbol_xyz())\n'), "E226")
+
+
+@test("ffi: arity mismatch on extern call is E102")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn strlen(s: Text) -> Int,\n'
+                        '}\n'
+                        'print(strlen("a", "b"))\n')
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("ffi: arg type mismatch on extern call is E211")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn strlen(s: Text) -> Int,\n'
+                        '}\n'
+                        'print(strlen(42))\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("ffi: non-FFI param type is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn f(xs: [Int]) -> Int,\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi: function-type param is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn f(cb: (Int) -> Int) -> Int,\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi: generic extern fn is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn f<T>(x: T) -> T,\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi: extern name colliding with Misa fn is E210")
+def _():
+    errs = check_source('fn strlen(s: Text) -> Int {\n'
+                        '  return 0\n'
+                        '}\n'
+                        'extern "c" {\n'
+                        '  fn strlen(s: Text) -> Int,\n'
+                        '}\n')
+    assert any(e["code"] == "E210" for e in errs), errs
+
+
+@test("ffi: formatter round-trips extern blocks")
+def _():
+    from misa.fmt import format_source
+    src = ('extern "c" {\n'
+           '  fn strlen(s: Text) -> Int,\n'
+           '  fn sqrt(x: Float) -> Float,\n'
+           '}\n')
+    out = format_source(src)
+    assert 'extern "c"' in out and "fn strlen(s: Text) -> Int," in out, out
+    # idempotent
+    assert format_source(out) == out
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

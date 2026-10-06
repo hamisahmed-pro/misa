@@ -168,6 +168,18 @@ class ImportDecl(Node):
     resolved: str = ""  # absolute path, filled by the loader
 
 
+@dataclass
+class ExternDecl(Node):
+    """Phase 7: `extern "<lib>" { fn f(...) -> T, ... }` — FFI block.
+
+    Each entry is an FnDecl carrying only the signature (name, params,
+    ret); body is always empty. `lib` is the library name as written,
+    e.g. "c" (C standard library) or "m" (libm).
+    """
+    lib: str = ""
+    fns: List["FnDecl"] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------- statements
 
 @dataclass

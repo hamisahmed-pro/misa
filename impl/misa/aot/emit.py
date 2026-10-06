@@ -91,6 +91,10 @@ _RT_SIGS = {
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
     "misa_list_get": (PTR, [PTR, I64]),
     "misa_as_int": (I64, [PTR]),
+    "misa_as_float": (DBL, [PTR]),
+    # Phase 7: opaque C pointer (FFI `Ptr`).
+    "misa_ptr": (PTR, [PTR]),
+    "misa_as_ptr": (PTR, [PTR]),
     "misa_map_new": (PTR, []),
     "misa_record_new": (PTR, []),
     "misa_record_set_cstr": (ir.VoidType(), [PTR, PTR, PTR]),
@@ -200,11 +204,18 @@ class Emitter:
         self.model_decls = {}
         self.screen_decls = {}
         self.type_decls = {}
+        # Phase 7: extern (FFI) blocks: fn name -> FnDecl signature.
+        self.extern_decls = {}
+        self.extern_libs = {}  # fn name -> library string
         self.providers = {}   # provider name -> ProviderDecl
         self.aliases = {}     # alias -> (provider_name, model_id)
         for item in prog.items:
             if isinstance(item, A.FnDecl):
                 self.fn_decls[item.name] = item
+            elif isinstance(item, A.ExternDecl):
+                for fn in item.fns:
+                    self.extern_decls[fn.name] = fn
+                    self.extern_libs[fn.name] = item.lib
             elif isinstance(item, A.ModelDecl):
                 self.model_decls[item.name] = item
             elif isinstance(item, A.ScreenDecl):
@@ -223,6 +234,95 @@ class Emitter:
         for name, (ret, args) in _RT_SIGS.items():
             fty = ir.FunctionType(ret, args)
             self.rt[name] = ir.Function(self.mod, fty, name=name)
+
+    # -- Phase 7: FFI ---------------------------------------------------
+    # Misa -> LLVM type mapping for extern functions. Text and Ptr
+    # both cross as i8*; Bool crosses as i32 (C int).
+
+    @staticmethod
+    def _ffi_llvm_type(tname: str):
+        if tname == "Int":
+            return I64
+        if tname == "Float":
+            return DBL
+        if tname == "Text":
+            return PTR
+        if tname == "Bool":
+            return I32
+        if tname == "Ptr":
+            return PTR
+        if tname == "Void":
+            return ir.VoidType()
+        raise AOTError("E225",
+                       f"cannot map type '{tname}' across FFI")
+
+    def emit_extern_call(self, e: A.Call, ctx, name: str):
+        """Phase 7: call an extern (FFI) function. Marshals MVal*
+        args to raw C values, calls the declared symbol, and wraps
+        the raw return back into an MVal*."""
+        decl = self.extern_decls[name]
+        line, col = self.loc(e)
+        b = ctx.builder
+        c_args = []
+        for (_, pte), arg_e in zip(decl.params, e.args):
+            v = self.emit_expr(arg_e, ctx)
+            self.check(ctx, e)
+            t = pte.name
+            if t == "Int":
+                c_args.append(self.call(ctx, "misa_as_int", [v], e,
+                                        check=False))
+            elif t == "Float":
+                c_args.append(self.call(ctx, "misa_as_float", [v], e,
+                                        check=False))
+            elif t == "Text":
+                c_args.append(self.call(ctx, "misa_text_z", [v], e,
+                                        check=False))
+            elif t == "Bool":
+                c_args.append(self.call(ctx, "misa_truthy", [v], e,
+                                        check=False))
+            elif t == "Ptr":
+                c_args.append(self.call(ctx, "misa_as_ptr", [v], e,
+                                        check=False))
+            else:
+                raise AOTError("E225",
+                               f"cannot map type '{t}' across FFI",
+                               e.line, e.col)
+        target = self.mod.get_global(name)
+        raw = b.call(target, c_args, name="_extern_ret")
+        ret_t = decl.ret.name if decl.ret else "Void"
+        if ret_t == "Void":
+            return self.call(ctx, "misa_null", [], e, check=False)
+        if ret_t == "Int":
+            return self.call(ctx, "misa_int", [raw], e, check=False)
+        if ret_t == "Float":
+            return self.call(ctx, "misa_float", [raw], e, check=False)
+        if ret_t == "Text":
+            # NULL char* -> nil; otherwise copy into Misa memory.
+            is_null = b.icmp_unsigned("==", raw, NULL_PTR,
+                                      name="_text_null")
+            null_bb = b.append_basic_block("text_null")
+            copy_bb = b.append_basic_block("text_copy")
+            merge_bb = b.append_basic_block("text_merge")
+            b.cbranch(is_null, null_bb, copy_bb)
+            b.position_at_end(null_bb)
+            null_v = self.call(ctx, "misa_null", [], e, check=False)
+            b.branch(merge_bb)
+            b.position_at_end(copy_bb)
+            copy_v = self.call(ctx, "misa_text_cstr", [raw], e,
+                                check=False)
+            b.branch(merge_bb)
+            b.position_at_end(merge_bb)
+            phi = b.phi(PTR, name="_text_ret")
+            phi.add_incoming(null_v, null_bb)
+            phi.add_incoming(copy_v, copy_bb)
+            return phi
+        if ret_t == "Bool":
+            return self.call(ctx, "misa_bool", [raw], e, check=False)
+        if ret_t == "Ptr":
+            return self.call(ctx, "misa_ptr", [raw], e, check=False)
+        raise AOTError("E225",
+                       f"cannot map return type '{ret_t}' across FFI",
+                       e.line, e.col)
 
     def cstr(self, s: str):
         """i8* global constant for a (NUL-free) string."""
@@ -280,6 +380,15 @@ class Emitter:
             fty = ir.FunctionType(PTR, [PTR] * len(decl.params))
             self.screens[name] = ir.Function(
                 self.mod, fty, name=f"misa_screen_{name}")
+        # Phase 7: declare extern (FFI) functions with raw C types.
+        # The linker resolves them against the shared libraries
+        # (build.py adds -l<lib>).
+        for name, decl in self.extern_decls.items():
+            fty = ir.FunctionType(self._ffi_llvm_type(
+                decl.ret.name if decl.ret else "Void"),
+                [self._ffi_llvm_type(pte.name)
+                 for _, pte in decl.params])
+            ir.Function(self.mod, fty, name=name)
         for name, decl in self.fn_decls.items():
             if decl.type_params:
                 continue
@@ -556,6 +665,7 @@ class Emitter:
                                              A.TableDecl,
                                              A.ModelDecl, A.ScreenDecl,
                                              A.EvalDecl, A.FnDecl,
+                                             A.ExternDecl,
                                              A.ImportDecl))]
         ctx.cell_vars = self._cell_vars_for(top_stmts)
         self.get_nil(ctx)
@@ -564,7 +674,8 @@ class Emitter:
             if isinstance(item, (A.AppDecl, A.ProviderDecl, A.ModelsDecl,
                                  A.TypeDecl, A.TableDecl, A.ModelDecl,
                                  A.ScreenDecl,
-                                 A.EvalDecl, A.FnDecl, A.ImportDecl)):
+                                 A.EvalDecl, A.FnDecl, A.ExternDecl,
+                                 A.ImportDecl)):
                 continue
             self.emit_stmt(item, ctx)
         self.finish_fn_ctx(ctx)
@@ -1058,6 +1169,15 @@ class Emitter:
                 args.append(v)
             return self.call(ctx, f"misa_fn_{name}", args, e,
                              check=True, direct=True)
+        # Phase 7: extern (FFI) function calls.
+        if name in self.extern_decls:
+            decl = self.extern_decls[name]
+            if len(e.args) != len(decl.params):
+                raise AOTError("E600",
+                               f"extern fn '{name}' takes "
+                               f"{len(decl.params)} args, got "
+                               f"{len(e.args)}", e.line, e.col)
+            return self.emit_extern_call(e, ctx, name)
         if name in self.models:
             return self.emit_model_call(name, e, ctx)
         if name in self.screens:

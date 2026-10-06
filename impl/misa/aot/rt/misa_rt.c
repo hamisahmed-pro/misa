@@ -38,6 +38,7 @@ struct MVal {
         struct { MVal *code; MVal *message; } error;
         struct { int kind; char *path; } media;
         struct { MVal *src; int64_t idx; int64_t nchars; } iter;
+        void *ptr;   /* Phase 7: M_TAG_PTR — opaque C pointer */
     } u;
 };
 
@@ -296,6 +297,21 @@ const char *misa_media_path(MVal *v) {
     return v->tag == M_TAG_MEDIA ? v->u.media.path : "";
 }
 
+/* Phase 7: opaque C pointer (FFI `Ptr`). */
+MVal *misa_ptr(void *p) {
+    MVal *x = val_new(M_TAG_PTR);
+    x->u.ptr = p;
+    return x;
+}
+
+void *misa_as_ptr(MVal *v) {
+    if (v->tag != M_TAG_PTR) {
+        misa_raise("E200", "expected Ptr", 0, 0);
+        return NULL;
+    }
+    return v->u.ptr;
+}
+
 /* ------------------------------------------------------------------ */
 /* inspection                                                         */
 /* ------------------------------------------------------------------ */
@@ -492,6 +508,7 @@ static void render_into(Str *s, MVal *v) {
         break;
     }
     case M_TAG_ITER: str_puts(s, "<iter>"); break;
+    case M_TAG_PTR: str_puts(s, "<ptr>"); break;
     default: str_puts(s, "<value>"); break;
     }
 }
@@ -644,9 +661,15 @@ static int val_equal(MVal *a, MVal *b) {
         return (double)a->u.i == b->u.f;
     if (a->tag == M_TAG_FLOAT && b->tag == M_TAG_INT)
         return a->u.f == (double)b->u.i;
+    /* Phase 7: a null Ptr equals nil. */
+    if (a->tag == M_TAG_PTR && b->tag == M_TAG_NULL)
+        return a->u.ptr == NULL;
+    if (a->tag == M_TAG_NULL && b->tag == M_TAG_PTR)
+        return b->u.ptr == NULL;
     if (a->tag != b->tag) return 0;
     switch (a->tag) {
     case M_TAG_NULL: return 1;
+    case M_TAG_PTR: return a->u.ptr == b->u.ptr;
     case M_TAG_BOOL: return a->u.b == b->u.b;
     case M_TAG_INT: return a->u.i == b->u.i;
     case M_TAG_FLOAT: return a->u.f == b->u.f;

@@ -97,3 +97,9 @@ class HTTPError_(MisaError):
 
 class MapKeyError(MisaError):
     code = "E305"
+
+
+class FFIError(MisaError):
+    """Phase 7: foreign-function interface failure — missing library,
+    missing symbol, or marshalling failure. Code E226."""
+    code = "E226"
