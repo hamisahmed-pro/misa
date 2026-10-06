@@ -1,10 +1,18 @@
 """Misa v0.2 tree-walking interpreter."""
 from __future__ import annotations
+import codecs
+import calendar
+import functools
+import hashlib
+import hmac
 import json
 import math
 import os
+import random as _py_random
+import socket
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -58,6 +66,23 @@ class DbHandle:
 class TextBuilder:
     """Text.Builder: amortized O(1) string building (perf gap P-1)."""
     parts: list  # list[str]
+
+
+@dataclass
+class SocketHandle:
+    """Wave 3 (networking): a connected TCP socket (opaque `Socket`)."""
+    sock: Any  # socket.socket
+    closed: bool = False
+    # Incremental UTF-8 decoder: recv() may split a multi-byte char
+    # across reads; decoding incrementally is never lossy.
+    decoder: Any = None
+
+
+@dataclass
+class ListenerHandle:
+    """Wave 3 (networking): a bound+listening TCP socket (`Listener`)."""
+    sock: Any  # socket.socket
+    closed: bool = False
 
 
 @dataclass
@@ -206,6 +231,71 @@ class MapValue:
         return f"MapValue({self.data!r})"
 
 
+class RegexValue:
+    """Wave 3 (stdlib): a compiled regex (`regex("...")`).
+
+    Wraps misa.regexp.Regex — the same portable engine the checker
+    uses for check-time validation, so checked patterns always
+    compile here.
+    """
+
+    def __init__(self, pattern: str):
+        from .regexp import Regex, RegexError
+        try:
+            self.rx = Regex(pattern)
+        except RegexError as ex:
+            raise RuntimeError_(f"invalid regex pattern: {ex}")
+        self.pattern = pattern
+
+
+class SetValue:
+    """Wave 3 (stdlib): a `Set<T>` value.
+
+    v1: insertion-ordered list + linear scan with Misa equality
+    (mirrors the AOT backend exactly; O(n) membership).
+    """
+
+    def __init__(self, items=None):
+        self.items: list = list(items) if items else []
+
+    def __len__(self):
+        return len(self.items)
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"SetValue({self.items!r})"
+
+
+def _misa_eq(a: Any, b: Any) -> bool:
+    """Misa value equality, mirroring C `val_equal`.
+
+    Numeric cross-type equality (1 == 1.0); Bool is distinct from Int
+    (unlike Python's `==`); structural for lists/maps/records.
+    Used by Set membership so both backends agree.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_misa_eq(x, y)
+                                       for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a.keys()) == set(b.keys()) and all(
+            _misa_eq(a[k], b[k]) for k in a)
+    if isinstance(a, MapValue) and isinstance(b, MapValue):
+        return _misa_eq(a.data, b.data)
+    if isinstance(a, SetValue) and isinstance(b, SetValue):
+        return len(a.items) == len(b.items) and all(
+            any(_misa_eq(x, y) for y in b.items) for x in a.items)
+    return type(a) is type(b) and a == b
+
+
+# Wave 3 (stdlib): `random.*` uses a dedicated RNG instance so
+# `random.seed(n)` gives a reproducible stream without disturbing
+# anything else.
+_rng = _py_random.Random()
+
+
 class Env:
     def __init__(self, parent: Optional["Env"] = None):
         self.parent = parent
@@ -265,6 +355,11 @@ def render_value(v: Any) -> str:
         return "<task>"
     if isinstance(v, Channel):
         return "<chan>"
+    # Wave 3 (stdlib).
+    if isinstance(v, RegexValue):
+        return f"<regex: {v.pattern}>"
+    if isinstance(v, SetValue):
+        return "{" + ", ".join(render_value(i) for i in v.items) + "}"
     if isinstance(v, LambdaValue):
         return "<lambda>"
     if isinstance(v, FnValue):
@@ -1264,6 +1359,27 @@ class Interpreter:
         if name == "http.post_json":
             body = self.json_stringify(args[1], e)
             return self.http_post(args[0], body, "application/json", e)
+        # -- Wave 3 (networking): TCP sockets + HTTP server ------------
+        if name == "net.connect":
+            return self.net_connect(args[0], args[1], e)
+        if name == "net.listen":
+            return self.net_listen(args[0], e)
+        if name == "net.accept":
+            return self.net_accept(args[0], e)
+        if name == "net.port":
+            return self.net_port(args[0], e)
+        if name == "listener.close":
+            return self.listener_close(args[0], e)
+        if name == "socket.send":
+            return self.socket_send(args[0], args[1], e)
+        if name == "socket.recv":
+            return self.socket_recv(args[0], args[1], e)
+        if name == "socket.close":
+            return self.socket_close(args[0], e)
+        if name == "socket.set_timeout":
+            return self.socket_set_timeout(args[0], args[1], e)
+        if name == "http.serve":
+            return self.http_serve(args[0], args[1], e)
         if name == "time.now":
             return int(time.time())
         if name == "time.now_ms":
@@ -1377,6 +1493,263 @@ class Interpreter:
                 raise RuntimeError_(
                     f"str.chr: invalid code point {cp}")
             return chr(cp)
+        if name == "process.run":
+            return self.process_run(args[0], e)
+        # -- Wave 3 (stdlib expansion) ----------------------------------
+        if name == "regex":
+            if not isinstance(args[0], str):
+                raise RuntimeError_("regex(Text) needs a text arg")
+            return RegexValue(args[0])
+        if name in ("regex.matches", "regex.find", "regex.find_all",
+                    "regex.replace", "regex.captures"):
+            rx, text = args[0], args[1]
+            if not isinstance(rx, RegexValue) \
+                    or not isinstance(text, str):
+                raise RuntimeError_(
+                    f"{name}(Regex, Text) needs a regex and text")
+            if name == "regex.matches":
+                return rx.rx.matches(text)
+            if name == "regex.find":
+                return rx.rx.find(text)
+            if name == "regex.find_all":
+                return rx.rx.find_all(text)
+            if name == "regex.captures":
+                return rx.rx.captures(text)
+            repl = args[2]
+            if not isinstance(repl, str):
+                raise RuntimeError_(
+                    "regex.replace(Regex, Text, Text) needs text args")
+            return rx.rx.replace(text, repl)
+        if name in ("crypto.sha256", "crypto.sha1", "crypto.md5"):
+            if not isinstance(args[0], str):
+                raise RuntimeError_(f"{name}(Text) needs a text arg")
+            data = args[0].encode("utf-8")
+            algo = name.split(".")[1]
+            return hashlib.new(algo, data).hexdigest()
+        if name == "crypto.hmac_sha256":
+            key, msg = args[0], args[1]
+            if not isinstance(key, str) or not isinstance(msg, str):
+                raise RuntimeError_(
+                    "crypto.hmac_sha256(Text, Text) needs text args")
+            return hmac.new(key.encode("utf-8"),
+                            msg.encode("utf-8"),
+                            hashlib.sha256).hexdigest()
+        if name == "random.int":
+            lo, hi = args[0], args[1]
+            if not isinstance(lo, int) or not isinstance(hi, int):
+                raise RuntimeError_(
+                    "random.int(Int, Int) needs int args")
+            if lo > hi:
+                raise RuntimeError_(
+                    f"random.int: min ({lo}) > max ({hi})")
+            return _rng.randint(lo, hi)
+        if name == "random.float":
+            return _rng.random()
+        if name == "random.choice":
+            xs = args[0]
+            if not isinstance(xs, list):
+                raise RuntimeError_(
+                    "random.choice([T]) needs a list")
+            if not xs:
+                raise RuntimeError_(
+                    "random.choice: cannot choose from an empty list")
+            return _rng.choice(xs)
+        if name == "random.shuffle":
+            xs = args[0]
+            if not isinstance(xs, list):
+                raise RuntimeError_(
+                    "random.shuffle([T]) needs a list")
+            out = list(xs)
+            _rng.shuffle(out)
+            return out
+        if name == "random.seed":
+            if not isinstance(args[0], int):
+                raise RuntimeError_("random.seed(Int) needs an int")
+            _rng.seed(args[0])
+            return None
+        if name == "time.now_utc":
+            return int(time.time())
+        if name == "time.to_utc":
+            # Epoch timestamps are always UTC; identity, for clarity.
+            return args[0]
+        if name == "time.from_parts":
+            parts = args
+            if not all(isinstance(p, int) for p in parts):
+                raise RuntimeError_(
+                    "time.from_parts needs int args")
+            y, mo, d, h, mi, s = parts
+            try:
+                t = calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
+            except (OverflowError, ValueError):
+                raise RuntimeError_(
+                    "time.from_parts: invalid date")
+            back = time.gmtime(t)
+            if (back.tm_year, back.tm_mon, back.tm_mday,
+                    back.tm_hour, back.tm_min,
+                    back.tm_sec) != (y, mo, d, h, mi, s):
+                raise RuntimeError_(
+                    "time.from_parts: invalid date")
+            return t
+        if name == "time.add":
+            return args[0] + args[1]
+        if name == "time.add_hours":
+            return args[0] + args[1] * 3600
+        if name == "time.in_tz":
+            # Shift the epoch so UTC formatting shows wall-clock time
+            # at the given offset (fractional hours supported).
+            return args[0] + int(args[1] * 3600)
+        if name == "time.weekday":
+            wd = time.gmtime(args[0]).tm_wday
+            return ("Monday", "Tuesday", "Wednesday", "Thursday",
+                    "Friday", "Saturday", "Sunday")[wd]
+        if name == "time.is_leap":
+            return calendar.isleap(args[0])
+        if name == "fs.temp_file":
+            try:
+                fd, path = tempfile.mkstemp(prefix="misa-")
+                os.close(fd)
+                return path
+            except OSError as ex:
+                raise RuntimeError_(f"fs.temp_file failed: {ex}")
+        if name == "fs.temp_dir":
+            try:
+                return tempfile.mkdtemp(prefix="misa-")
+            except OSError as ex:
+                raise RuntimeError_(f"fs.temp_dir failed: {ex}")
+        if name == "set":
+            return SetValue()
+        if name in ("set.add", "set.contains", "set.remove",
+                    "set.union", "set.intersect", "set.diff",
+                    "set.to_list", "set.len"):
+            s = args[0]
+            if not isinstance(s, SetValue):
+                raise RuntimeError_(f"{name} needs a Set")
+            if name == "set.add":
+                if not any(_misa_eq(x, args[1]) for x in s.items):
+                    s.items.append(args[1])
+                return None
+            if name == "set.contains":
+                return any(_misa_eq(x, args[1]) for x in s.items)
+            if name == "set.remove":
+                s.items = [x for x in s.items
+                           if not _misa_eq(x, args[1])]
+                return None
+            if name == "set.to_list":
+                return list(s.items)
+            if name == "set.len":
+                return len(s.items)
+            other = args[1]
+            if not isinstance(other, SetValue):
+                raise RuntimeError_(f"{name} needs two Sets")
+            if name == "set.union":
+                out = SetValue(s.items)
+                for x in other.items:
+                    if not any(_misa_eq(y, x) for y in out.items):
+                        out.items.append(x)
+                return out
+            if name == "set.intersect":
+                return SetValue([x for x in s.items
+                                 if any(_misa_eq(x, y)
+                                       for y in other.items)])
+            # set.diff
+            return SetValue([x for x in s.items
+                             if not any(_misa_eq(x, y)
+                                       for y in other.items)])
+        if name in ("map", "filter", "fold", "sort_by"):
+            xs = args[0]
+            if not isinstance(xs, list):
+                raise RuntimeError_(f"{name} needs a list")
+            if name == "map":
+                f = args[1]
+                return [self._call_fn_value(f, [x], e) for x in xs]
+            if name == "filter":
+                f = args[1]
+                return [x for x in xs
+                        if self._call_fn_value(f, [x], e) is True]
+            if name == "fold":
+                f, acc = args[2], args[1]
+                for x in xs:
+                    acc = self._call_fn_value(f, [acc, x], e)
+                return acc
+            # sort_by: stable sort via the `less(a, b)` comparator.
+            f = args[1]
+
+            def _cmp(a, b, _f=f):
+                if self._call_fn_value(_f, [a, b], e) is True:
+                    return -1
+                if self._call_fn_value(_f, [b, a], e) is True:
+                    return 1
+                return 0
+
+            return sorted(xs, key=functools.cmp_to_key(_cmp))
+        if name == "list.flat":
+            xss = args[0]
+            if not all(isinstance(xs, list) for xs in xss):
+                raise RuntimeError_("list.flat([[T]]) needs a "
+                                    "list of lists")
+            return [x for xs in xss for x in xs]
+        if name == "list.zip":
+            xs, ys = args[0], args[1]
+            if not isinstance(xs, list) or not isinstance(ys, list):
+                raise RuntimeError_("list.zip needs two lists")
+            return [[x, y] for x, y in zip(xs, ys)]
+        if name == "list.unique":
+            xs = args[0]
+            if not isinstance(xs, list):
+                raise RuntimeError_("list.unique([T]) needs a list")
+            out = []
+            for x in xs:
+                if not any(_misa_eq(x, y) for y in out):
+                    out.append(x)
+            return out
+        if name == "str.join":
+            xs, sep = args[0], args[1]
+            if not isinstance(xs, list) or not isinstance(sep, str) \
+                    or not all(isinstance(x, str) for x in xs):
+                raise RuntimeError_(
+                    "str.join([Text], Text) needs text args")
+            return sep.join(xs)
+        if name == "str.replace":
+            s, old, new = args[0], args[1], args[2]
+            if not all(isinstance(a, str) for a in (s, old, new)):
+                raise RuntimeError_(
+                    "str.replace(Text, Text, Text) needs text args")
+            if old == "":
+                raise RuntimeError_(
+                    "str.replace: search string is empty")
+            return s.replace(old, new)
+        if name == "str.to_upper":
+            s = args[0]
+            if not isinstance(s, str):
+                raise RuntimeError_("str.to_upper(Text) needs text")
+            # v1: ASCII only (documented); full Unicode casefold is
+            # future work.
+            return "".join(chr(ord(c) - 32) if "a" <= c <= "z" else c
+                           for c in s)
+        if name == "str.to_lower":
+            s = args[0]
+            if not isinstance(s, str):
+                raise RuntimeError_("str.to_lower(Text) needs text")
+            return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c
+                           for c in s)
+        if name == "str.ends_with":
+            if not isinstance(args[0], str) \
+                    or not isinstance(args[1], str):
+                raise RuntimeError_(
+                    "str.ends_with(Text, Text) needs text args")
+            return args[0].endswith(args[1])
+        if name in ("str.pad_left", "str.pad_right"):
+            s, width, pad = args[0], args[1], args[2]
+            if not isinstance(s, str) or not isinstance(width, int) \
+                    or not isinstance(pad, str):
+                raise RuntimeError_(
+                    f"{name}(Text, Int, Text) needs text/int/text")
+            if not pad:
+                raise RuntimeError_(f"{name}: pad string is empty")
+            ch = pad[0]
+            if name == "str.pad_left":
+                return s.rjust(width, ch)
+            return s.ljust(width, ch)
         if name == "process.run":
             return self.process_run(args[0], e)
         # -- Phase 7 (concurrency) ------------------------------------
@@ -1678,6 +2051,378 @@ class Interpreter:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPError_(f"http.post {url}: body is not UTF-8 text", **lc)
+
+    # -- Wave 3 (networking): TCP sockets + HTTP server -----------------
+
+    @staticmethod
+    def _net_lc(node):
+        return {"line": node.line, "col": node.col}
+
+    def _sock_open(self, v, op, node):
+        if not isinstance(v, SocketHandle) or v.closed:
+            raise RuntimeError_(
+                f"{op}: expected an open Socket",
+                **self._net_lc(node))
+        return v
+
+    def _listener_open(self, v, op, node):
+        if not isinstance(v, ListenerHandle) or v.closed:
+            raise RuntimeError_(
+                f"{op}: expected an open Listener",
+                **self._net_lc(node))
+        return v
+
+    @staticmethod
+    def _check_port(port, op, node):
+        lc = {"line": node.line, "col": node.col}
+        if isinstance(port, bool) or not isinstance(port, int) \
+                or port < 0 or port > 65535:
+            raise RuntimeError_(
+                f"{op}: port must be an Int in 0..65535",
+                **lc)
+        return port
+
+    def net_connect(self, host, port, node):
+        lc = self._net_lc(node)
+        if not isinstance(host, str):
+            raise RuntimeError_(
+                "net.connect(host: Text, port: Int)", **lc)
+        port = self._check_port(port, "net.connect", node)
+        try:
+            s = socket.create_connection((host, port), timeout=30)
+        except socket.timeout:
+            raise HTTPError_(
+                f"net.connect {host}:{port} timed out", **lc)
+        except OSError as ex:
+            raise HTTPError_(
+                f"net.connect {host}:{port} failed: {ex}", **lc)
+        return SocketHandle(
+            sock=s,
+            decoder=codecs.getincrementaldecoder("utf-8")())
+
+    def net_listen(self, port, node):
+        lc = self._net_lc(node)
+        port = self._check_port(port, "net.listen", node)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", port))
+            s.listen(128)
+        except OSError as ex:
+            s.close()
+            raise HTTPError_(f"net.listen({port}) failed: {ex}", **lc)
+        return ListenerHandle(sock=s)
+
+    def net_accept(self, lis, node):
+        lc = self._net_lc(node)
+        h = self._listener_open(lis, "net.accept", node)
+        try:
+            conn, _addr = h.sock.accept()
+        except OSError as ex:
+            raise HTTPError_(f"net.accept failed: {ex}", **lc)
+        return SocketHandle(
+            sock=conn,
+            decoder=codecs.getincrementaldecoder("utf-8")())
+
+    def net_port(self, lis, node):
+        h = self._listener_open(lis, "net.port", node)
+        try:
+            return h.sock.getsockname()[1]
+        except OSError as ex:
+            raise HTTPError_(f"net.port failed: {ex}",
+                             **self._net_lc(node))
+
+    def listener_close(self, lis, node):
+        h = self._listener_open(lis, "listener.close", node)
+        h.closed = True
+        try:
+            h.sock.close()
+        except OSError:
+            pass
+        return None
+
+    def socket_send(self, v, data, node):
+        lc = self._net_lc(node)
+        h = self._sock_open(v, "socket.send", node)
+        if not isinstance(data, str):
+            raise RuntimeError_(
+                "socket.send(sock, data: Text)", **lc)
+        raw = data.encode("utf-8")
+        try:
+            h.sock.sendall(raw)
+        except socket.timeout:
+            raise HTTPError_("socket.send timed out", **lc)
+        except OSError as ex:
+            raise HTTPError_(f"socket.send failed: {ex}", **lc)
+        return len(raw)
+
+    def socket_recv(self, v, maxv, node):
+        lc = self._net_lc(node)
+        h = self._sock_open(v, "socket.recv", node)
+        if isinstance(maxv, bool) or not isinstance(maxv, int) \
+                or maxv <= 0:
+            raise RuntimeError_(
+                "socket.recv(sock, max: Int > 0)", **lc)
+        try:
+            chunk = h.sock.recv(min(maxv, 65536))
+        except socket.timeout:
+            raise HTTPError_("socket.recv timed out", **lc)
+        except OSError as ex:
+            raise HTTPError_(f"socket.recv failed: {ex}", **lc)
+        if not chunk:
+            # Clean EOF: flush the incremental decoder (a truncated
+            # multi-byte sequence at EOF decodes to "" rather than
+            # raising — v1 is lossy here, never crashing).
+            try:
+                return h.decoder.decode(b"", final=True)
+            except UnicodeDecodeError:
+                return ""
+        return h.decoder.decode(chunk)
+
+    def socket_close(self, v, node):
+        h = self._sock_open(v, "socket.close", node)
+        h.closed = True
+        try:
+            h.sock.close()
+        except OSError:
+            pass
+        return None
+
+    def socket_set_timeout(self, v, ms, node):
+        lc = self._net_lc(node)
+        h = self._sock_open(v, "socket.set_timeout", node)
+        if isinstance(ms, bool) or not isinstance(ms, int):
+            raise RuntimeError_(
+                "socket.set_timeout(sock, ms: Int)", **lc)
+        h.sock.settimeout(ms / 1000.0 if ms >= 0 else None)
+        return None
+
+    # -- Wave 3: minimal HTTP/1.1 server (raw sockets, no deps) --------
+
+    # Parser limits (documented in spec/STDLIB.md).
+    _HTTP_MAX_HEADERS = 64 * 1024   # bytes of header block
+    _HTTP_MAX_BODY = 10 * 1024 * 1024  # Content-Length cap
+    _HTTP_MAX_HEADER_COUNT = 100
+
+    _HTTP_REASONS = {
+        200: "OK", 201: "Created", 204: "No Content",
+        400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
+        413: "Content Too Large", 431: "Request Header Fields Too Large",
+        500: "Internal Server Error", 501: "Not Implemented",
+    }
+
+    @staticmethod
+    def _http_urldecode(s):
+        out = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == "+":
+                out.append(" ")
+                i += 1
+            elif c == "%" and i + 2 < len(s):
+                try:
+                    out.append(chr(int(s[i + 1:i + 3], 16)))
+                    i += 3
+                except ValueError:
+                    out.append(c)
+                    i += 1
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+
+    @classmethod
+    def _http_parse_query(cls, qs):
+        q = {}
+        if qs:
+            for part in qs.split("&"):
+                if not part:
+                    continue
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                else:
+                    k, v = part, ""
+                q[cls._http_urldecode(k)] = cls._http_urldecode(v)
+        return q
+
+    def _http_read_request(self, sock, node):
+        """Read + parse one HTTP/1.1 request. Returns (request_dict,
+        status_if_error). request_dict has method/path/query/headers/
+        body. Malformed input -> (None, 400/413/431/501)."""
+        lc = self._net_lc(node)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    return None, 400  # EOF mid-headers
+                buf += chunk
+                if len(buf) > self._HTTP_MAX_HEADERS:
+                    return None, 431
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            lines = head.split(b"\r\n")
+            try:
+                request_line = lines[0].decode("latin-1")
+            except UnicodeDecodeError:
+                return None, 400
+            parts = request_line.split(" ")
+            if len(parts) != 3:
+                return None, 400
+            method, target, version = parts
+            if not version.startswith("HTTP/"):
+                return None, 400
+            if not method or not all(
+                    c.isupper() or c == "-" for c in method):
+                return None, 400
+            headers = {}
+            for raw in lines[1:]:
+                if len(headers) >= self._HTTP_MAX_HEADER_COUNT:
+                    return None, 431
+                try:
+                    line = raw.decode("latin-1")
+                except UnicodeDecodeError:
+                    return None, 400
+                if ":" not in line:
+                    return None, 400
+                name, value = line.split(":", 1)
+                name = name.strip().lower()
+                if not name:
+                    return None, 400
+                headers[name] = value.strip()  # last wins
+            if headers.get("transfer-encoding", "").lower() == "chunked":
+                return None, 501  # v1: no chunked bodies
+            body = rest
+            if "content-length" in headers:
+                try:
+                    n = int(headers["content-length"])
+                except ValueError:
+                    return None, 400
+                if n < 0 or n > self._HTTP_MAX_BODY:
+                    return None, 413
+                while len(body) < n:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        return None, 400  # EOF mid-body
+                    body += chunk
+                body = body[:n]
+            try:
+                body_text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return None, 400
+            if "?" in target:
+                path, qs = target.split("?", 1)
+            else:
+                path, qs = target, ""
+            return {
+                "method": method,
+                "path": self._http_urldecode(path),
+                "query": MapValue(self._http_parse_query(qs)),
+                "headers": MapValue(dict(headers)),
+                "body": body_text,
+            }, 0
+        except socket.timeout:
+            raise HTTPError_("http.serve: read timed out", **lc)
+        except OSError as ex:
+            raise HTTPError_(f"http.serve: read failed: {ex}", **lc)
+
+    def _http_write_response(self, sock, resp, node):
+        lc = self._net_lc(node)
+        status = 200
+        headers = {}
+        body = ""
+        if isinstance(resp, dict):
+            if "status" in resp:
+                status = resp["status"]
+            if "headers" in resp:
+                hv = resp["headers"]
+                raw = hv.data if isinstance(hv, MapValue) else hv
+                if isinstance(raw, dict):
+                    headers = {str(k): str(v)
+                               for k, v in raw.items()}
+            if "body" in resp:
+                body = resp["body"]
+        if isinstance(status, bool) or not isinstance(status, int):
+            status = 500
+        if not isinstance(body, str):
+            body = str(body)
+        body_raw = body.encode("utf-8")
+        reason = self._HTTP_REASONS.get(status, "OK")
+        out = [f"HTTP/1.1 {status} {reason}\r\n"]
+        if not any(k.lower() == "content-type" for k in headers):
+            out.append("Content-Type: text/plain; charset=utf-8\r\n")
+        for k, v in headers.items():
+            out.append(f"{k}: {v}\r\n")
+        out.append(f"Content-Length: {len(body_raw)}\r\n")
+        out.append("Connection: close\r\n\r\n")
+        try:
+            sock.sendall("".join(out).encode("latin-1") + body_raw)
+        except OSError as ex:
+            raise HTTPError_(f"http.serve: write failed: {ex}", **lc)
+
+    def _http_serve_one(self, conn, handler, node):
+        """Serve a single connection: parse, invoke handler, respond.
+        Handler Misa errors -> 500 (per-connection isolation)."""
+        req, err_status = self._http_read_request(conn.sock, node)
+        if err_status:
+            self._http_write_response(
+                conn.sock, {"status": err_status, "body": ""}, node)
+            return
+        try:
+            if isinstance(handler, LambdaValue):
+                resp = self.invoke_lambda_value(handler, [req], node)
+            else:
+                resp = self.call_fn(handler, [req], node)
+        except MisaError:
+            self._http_write_response(
+                conn.sock, {"status": 500, "body": ""}, node)
+            return
+        self._http_write_response(conn.sock, resp, node)
+
+    def http_serve(self, port, handler, node):
+        lc = self._net_lc(node)
+        port = self._check_port(port, "http.serve", node)
+        if not isinstance(handler, LambdaValue):
+            raise RuntimeError_(
+                "http.serve(port, handler): handler must be a lambda "
+                "`|req: Request| -> Response`", **lc)
+        lis = self.net_listen(port, node)
+        # Wake the accept() periodically so a cancelled task (structured
+        # concurrency: children die at scope exit) stops promptly instead
+        # of blocking forever in the C call.
+        lis.sock.settimeout(0.5)
+        try:
+            while True:
+                self._check_cancelled(node)
+                try:
+                    conn, _addr = lis.sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError as ex:
+                    raise HTTPError_(
+                        f"http.serve: accept failed: {ex}", **lc)
+                conn_h = SocketHandle(
+                    sock=conn,
+                    decoder=codecs.getincrementaldecoder("utf-8")())
+                try:
+                    self._http_serve_one(conn_h, handler, node)
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+        except ConcurrencyError:
+            # Structured cancellation: the server task was cancelled at
+            # scope exit. Swallow E306 here (it is the *expected* way a
+            # server stops); anything else propagates.
+            pass
+        finally:
+            try:
+                lis.sock.close()
+            except OSError:
+                pass
+            lis.closed = True
+        return None
 
     # -- Phase 5 (stdlib2): JSON ---------------------------------------
 
@@ -2565,6 +3310,19 @@ class Interpreter:
 
     def invoke_lambda(self, lam: LambdaValue, args: list, env: Env):
         return self.invoke_lambda_value(lam, args, None)
+
+    def _call_fn_value(self, v: Any, args: list, node: ast.Node) -> Any:
+        """Call a first-class function value (lambda or named fn).
+
+        Used by higher-order builtins (`map`/`filter`/`fold`/`sort_by`).
+        """
+        if isinstance(v, LambdaValue):
+            return self.invoke_lambda_value(v, args, node)
+        if isinstance(v, FnValue):
+            return self.call_fn(v.decl, args, node)
+        raise RuntimeError_(
+            f"expected a function, got {render_value(v)}",
+            line=node.line, col=node.col)
 
     def invoke_lambda_value(self, lam: LambdaValue, args: list,
                             node: Optional[ast.Node]):

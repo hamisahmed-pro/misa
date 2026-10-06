@@ -203,6 +203,56 @@ _RT_SIGS = {
     "misa_str_chars": (PTR, [PTR, I32, I32]),
     "misa_str_ord": (PTR, [PTR, I32, I32]),
     "misa_str_chr": (PTR, [PTR, I32, I32]),
+    # Wave 3 (stdlib expansion).
+    "misa_regex_new": (PTR, [PTR, I32, I32]),
+    "misa_regex_matches": (PTR, [PTR, PTR, I32, I32]),
+    "misa_regex_find": (PTR, [PTR, PTR, I32, I32]),
+    "misa_regex_find_all": (PTR, [PTR, PTR, I32, I32]),
+    "misa_regex_replace": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_regex_captures": (PTR, [PTR, PTR, I32, I32]),
+    "misa_crypto_sha256": (PTR, [PTR, I32, I32]),
+    "misa_crypto_sha1": (PTR, [PTR, I32, I32]),
+    "misa_crypto_md5": (PTR, [PTR, I32, I32]),
+    "misa_crypto_hmac_sha256": (PTR, [PTR, PTR, I32, I32]),
+    "misa_random_seed": (PTR, [PTR, I32, I32]),
+    "misa_random_int": (PTR, [PTR, PTR, I32, I32]),
+    "misa_random_float": (PTR, []),
+    "misa_random_choice": (PTR, [PTR, I32, I32]),
+    "misa_random_shuffle": (PTR, [PTR, I32, I32]),
+    "misa_time_now_utc": (PTR, []),
+    "misa_time_to_utc": (PTR, [PTR, I32, I32]),
+    "misa_time_from_parts": (PTR, [PTR, PTR, PTR, PTR, PTR, PTR,
+                                   I32, I32]),
+    "misa_time_add": (PTR, [PTR, PTR, I32, I32]),
+    "misa_time_add_hours": (PTR, [PTR, PTR, I32, I32]),
+    "misa_time_in_tz": (PTR, [PTR, PTR, I32, I32]),
+    "misa_time_weekday": (PTR, [PTR, I32, I32]),
+    "misa_time_is_leap": (PTR, [PTR, I32, I32]),
+    "misa_fs_temp_file": (PTR, [I32, I32]),
+    "misa_fs_temp_dir": (PTR, [I32, I32]),
+    "misa_set_new": (PTR, []),
+    "misa_set_add": (ir.VoidType(), [PTR, PTR, I32, I32]),
+    "misa_set_contains": (PTR, [PTR, PTR, I32, I32]),
+    "misa_set_remove": (ir.VoidType(), [PTR, PTR, I32, I32]),
+    "misa_set_union": (PTR, [PTR, PTR, I32, I32]),
+    "misa_set_intersect": (PTR, [PTR, PTR, I32, I32]),
+    "misa_set_diff": (PTR, [PTR, PTR, I32, I32]),
+    "misa_set_to_list": (PTR, [PTR, I32, I32]),
+    "misa_set_len": (I64, [PTR, I32, I32]),
+    "misa_list_map": (PTR, [PTR, PTR, I32, I32]),
+    "misa_list_filter": (PTR, [PTR, PTR, I32, I32]),
+    "misa_list_fold": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_list_sort_by": (PTR, [PTR, PTR, I32, I32]),
+    "misa_list_flat": (PTR, [PTR, I32, I32]),
+    "misa_list_zip": (PTR, [PTR, PTR, I32, I32]),
+    "misa_list_unique": (PTR, [PTR, I32, I32]),
+    "misa_str_join": (PTR, [PTR, PTR, I32, I32]),
+    "misa_str_replace": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_str_to_upper": (PTR, [PTR, I32, I32]),
+    "misa_str_to_lower": (PTR, [PTR, I32, I32]),
+    "misa_str_ends_with": (PTR, [PTR, PTR, I32, I32]),
+    "misa_str_pad_left": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_str_pad_right": (PTR, [PTR, PTR, PTR, I32, I32]),
     # Phase 5 (DB): SQLite bindings.
     "misa_db_open": (PTR, [PTR, I32, I32]),
     "misa_db_exec": (PTR, [PTR, PTR, PTR, I32, I32]),
@@ -260,6 +310,17 @@ _RT_SIGS = {
     "misa_chan_recv": (PTR, [PTR, I32, I32]),
     "misa_chan_close": (PTR, [PTR, I32, I32]),
     "misa_fetch_all": (PTR, [PTR, I32, I32]),
+    # Wave 3 (networking): TCP sockets + HTTP server.
+    "misa_net_connect": (PTR, [PTR, PTR, I32, I32]),
+    "misa_net_listen": (PTR, [PTR, I32, I32]),
+    "misa_net_accept": (PTR, [PTR, I32, I32]),
+    "misa_net_port": (PTR, [PTR, I32, I32]),
+    "misa_listener_close": (PTR, [PTR, I32, I32]),
+    "misa_socket_send": (PTR, [PTR, PTR, I32, I32]),
+    "misa_socket_recv": (PTR, [PTR, PTR, I32, I32]),
+    "misa_socket_close": (PTR, [PTR, I32, I32]),
+    "misa_socket_set_timeout": (PTR, [PTR, PTR, I32, I32]),
+    "misa_http_serve": (PTR, [PTR, PTR, I32, I32]),
 }
 
 
@@ -2456,6 +2517,40 @@ class Emitter:
         if name == "fetch_all":
             return self.call(ctx, "misa_fetch_all", [arg(0), line, col],
                              e)
+        # Wave 3 (networking): TCP sockets + HTTP server. `net.accept`
+        # / `net.port` / `listener.close` are the checker's canonical
+        # rewrites of `lis.accept()` / `lis.port()` / `lis.close()`;
+        # `socket.*` likewise for `sock.send()` etc.
+        if name == "net.connect":
+            return self.call(ctx, "misa_net_connect",
+                             [arg(0), arg(1), line, col], e)
+        if name == "net.listen":
+            return self.call(ctx, "misa_net_listen",
+                             [arg(0), line, col], e)
+        if name == "net.accept":
+            return self.call(ctx, "misa_net_accept",
+                             [arg(0), line, col], e)
+        if name == "net.port":
+            return self.call(ctx, "misa_net_port",
+                             [arg(0), line, col], e)
+        if name == "listener.close":
+            return self.call(ctx, "misa_listener_close",
+                             [arg(0), line, col], e)
+        if name == "socket.send":
+            return self.call(ctx, "misa_socket_send",
+                             [arg(0), arg(1), line, col], e)
+        if name == "socket.recv":
+            return self.call(ctx, "misa_socket_recv",
+                             [arg(0), arg(1), line, col], e)
+        if name == "socket.close":
+            return self.call(ctx, "misa_socket_close",
+                             [arg(0), line, col], e)
+        if name == "socket.set_timeout":
+            return self.call(ctx, "misa_socket_set_timeout",
+                             [arg(0), arg(1), line, col], e)
+        if name == "http.serve":
+            return self.call(ctx, "misa_http_serve",
+                             [arg(0), arg(1), line, col], e)
         # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
         if name == "json.parse":
             return self.call(ctx, "misa_json_parse",
@@ -2523,6 +2618,155 @@ class Emitter:
         if name == "str.chr":
             return self.call(ctx, "misa_str_chr",
                              [arg(0), line, col], e)
+        # Wave 3 (stdlib expansion).
+        if name == "regex":
+            return self.call(ctx, "misa_regex_new",
+                             [arg(0), line, col], e)
+        if name == "regex.matches":
+            return self.call(ctx, "misa_regex_matches",
+                             [arg(0), arg(1), line, col], e)
+        if name == "regex.find":
+            return self.call(ctx, "misa_regex_find",
+                             [arg(0), arg(1), line, col], e)
+        if name == "regex.find_all":
+            return self.call(ctx, "misa_regex_find_all",
+                             [arg(0), arg(1), line, col], e)
+        if name == "regex.replace":
+            return self.call(ctx, "misa_regex_replace",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "regex.captures":
+            return self.call(ctx, "misa_regex_captures",
+                             [arg(0), arg(1), line, col], e)
+        if name == "crypto.sha256":
+            return self.call(ctx, "misa_crypto_sha256",
+                             [arg(0), line, col], e)
+        if name == "crypto.sha1":
+            return self.call(ctx, "misa_crypto_sha1",
+                             [arg(0), line, col], e)
+        if name == "crypto.md5":
+            return self.call(ctx, "misa_crypto_md5",
+                             [arg(0), line, col], e)
+        if name == "crypto.hmac_sha256":
+            return self.call(ctx, "misa_crypto_hmac_sha256",
+                             [arg(0), arg(1), line, col], e)
+        if name == "random.seed":
+            return self.call(ctx, "misa_random_seed",
+                             [arg(0), line, col], e)
+        if name == "random.int":
+            return self.call(ctx, "misa_random_int",
+                             [arg(0), arg(1), line, col], e)
+        if name == "random.float":
+            return self.call(ctx, "misa_random_float", [], e,
+                             check=False)
+        if name == "random.choice":
+            return self.call(ctx, "misa_random_choice",
+                             [arg(0), line, col], e)
+        if name == "random.shuffle":
+            return self.call(ctx, "misa_random_shuffle",
+                             [arg(0), line, col], e)
+        if name == "time.now_utc":
+            return self.call(ctx, "misa_time_now_utc", [], e,
+                             check=False)
+        if name == "time.to_utc":
+            return self.call(ctx, "misa_time_to_utc",
+                             [arg(0), line, col], e)
+        if name == "time.from_parts":
+            return self.call(ctx, "misa_time_from_parts",
+                             [arg(0), arg(1), arg(2), arg(3), arg(4),
+                              arg(5), line, col], e)
+        if name == "time.add":
+            return self.call(ctx, "misa_time_add",
+                             [arg(0), arg(1), line, col], e)
+        if name == "time.add_hours":
+            return self.call(ctx, "misa_time_add_hours",
+                             [arg(0), arg(1), line, col], e)
+        if name == "time.in_tz":
+            return self.call(ctx, "misa_time_in_tz",
+                             [arg(0), arg(1), line, col], e)
+        if name == "time.weekday":
+            return self.call(ctx, "misa_time_weekday",
+                             [arg(0), line, col], e)
+        if name == "time.is_leap":
+            return self.call(ctx, "misa_time_is_leap",
+                             [arg(0), line, col], e)
+        if name == "fs.temp_file":
+            return self.call(ctx, "misa_fs_temp_file",
+                             [line, col], e)
+        if name == "fs.temp_dir":
+            return self.call(ctx, "misa_fs_temp_dir",
+                             [line, col], e)
+        if name == "set":
+            return self.call(ctx, "misa_set_new", [], e, check=False)
+        if name == "set.add":
+            self.call(ctx, "misa_set_add",
+                      [arg(0), arg(1), line, col], e)
+            return self.get_nil(ctx)
+        if name == "set.contains":
+            return self.call(ctx, "misa_set_contains",
+                             [arg(0), arg(1), line, col], e)
+        if name == "set.remove":
+            self.call(ctx, "misa_set_remove",
+                      [arg(0), arg(1), line, col], e)
+            return self.get_nil(ctx)
+        if name == "set.union":
+            return self.call(ctx, "misa_set_union",
+                             [arg(0), arg(1), line, col], e)
+        if name == "set.intersect":
+            return self.call(ctx, "misa_set_intersect",
+                             [arg(0), arg(1), line, col], e)
+        if name == "set.diff":
+            return self.call(ctx, "misa_set_diff",
+                             [arg(0), arg(1), line, col], e)
+        if name == "set.to_list":
+            return self.call(ctx, "misa_set_to_list",
+                             [arg(0), line, col], e)
+        if name == "set.len":
+            # int64 return; box it.
+            v = self.call(ctx, "misa_set_len",
+                          [arg(0), line, col], e)
+            return self.call(ctx, "misa_int", [v], e, check=False)
+        if name == "map":
+            return self.call(ctx, "misa_list_map",
+                             [arg(0), arg(1), line, col], e)
+        if name == "filter":
+            return self.call(ctx, "misa_list_filter",
+                             [arg(0), arg(1), line, col], e)
+        if name == "fold":
+            return self.call(ctx, "misa_list_fold",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "sort_by":
+            return self.call(ctx, "misa_list_sort_by",
+                             [arg(0), arg(1), line, col], e)
+        if name == "list.flat":
+            return self.call(ctx, "misa_list_flat",
+                             [arg(0), line, col], e)
+        if name == "list.zip":
+            return self.call(ctx, "misa_list_zip",
+                             [arg(0), arg(1), line, col], e)
+        if name == "list.unique":
+            return self.call(ctx, "misa_list_unique",
+                             [arg(0), line, col], e)
+        if name == "str.join":
+            return self.call(ctx, "misa_str_join",
+                             [arg(0), arg(1), line, col], e)
+        if name == "str.replace":
+            return self.call(ctx, "misa_str_replace",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "str.to_upper":
+            return self.call(ctx, "misa_str_to_upper",
+                             [arg(0), line, col], e)
+        if name == "str.to_lower":
+            return self.call(ctx, "misa_str_to_lower",
+                             [arg(0), line, col], e)
+        if name == "str.ends_with":
+            return self.call(ctx, "misa_str_ends_with",
+                             [arg(0), arg(1), line, col], e)
+        if name == "str.pad_left":
+            return self.call(ctx, "misa_str_pad_left",
+                             [arg(0), arg(1), arg(2), line, col], e)
+        if name == "str.pad_right":
+            return self.call(ctx, "misa_str_pad_right",
+                             [arg(0), arg(1), arg(2), line, col], e)
         # Phase 5 (DB): SQLite bindings. The optional `args` list
         # defaults to an empty list.
         if name == "db.open":

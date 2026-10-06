@@ -4172,6 +4172,368 @@ def _():
     assert "<T: Drawable>" in out, out
 
 
+# --------------------------------------------------------------------------
+# Wave 3: profiler (`misa profile`) and REPL (`misa repl`)
+# --------------------------------------------------------------------------
+
+def _repl_run(lines):
+    """Drive `misa repl` through a pipe. Returns (returncode, stdout,
+    stderr)."""
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-repl-")
+    try:
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "repl"],
+            input="\n".join(lines) + "\n",
+            capture_output=True, text=True, timeout=60, cwd=d)
+        return p.returncode, p.stdout, p.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("repl: evaluates expressions and persists bindings")
+def _():
+    rc, out, err = _repl_run(["let x = 5", "x + 1", ":quit"])
+    assert rc == 0, err
+    assert "misa> 6" in out, out
+
+
+@test("repl: print does not echo nil")
+def _():
+    rc, out, err = _repl_run(['print("hi")', ":quit"])
+    assert rc == 0, err
+    assert "hi" in out, out
+    assert "nil" not in out, out
+
+
+@test("repl: multi-line fn definition")
+def _():
+    rc, out, err = _repl_run([
+        "fn double(n: Int) -> Int {",
+        "return n * 2",
+        "}",
+        "double(21)",
+        ":quit",
+    ])
+    assert rc == 0, err
+    assert "misa> 42" in out, out
+
+
+@test("repl: :type shows the checker's inferred type")
+def _():
+    rc, out, err = _repl_run([":type 1 + 2", ":type [1, 2]", ":quit"])
+    assert rc == 0, err
+    assert "1 + 2: Int" in out, out
+    assert "[1, 2]: [Int]" in out, out
+
+
+@test("repl: errors are clean E-codes, never tracebacks")
+def _():
+    rc, out, err = _repl_run([
+        'let x: Int = "hi"',
+        "no_such_name + 1",
+        ":quit",
+    ])
+    assert rc == 0, err
+    assert "E200" in out, out
+    assert "E101" in out, out
+    assert "Traceback" not in out + err, out + err
+
+
+@test("repl: :reset forgets bindings")
+def _():
+    rc, out, err = _repl_run(["let x = 5", ":reset", "x", ":quit"])
+    assert rc == 0, err
+    assert "reset" in out, out
+    assert "E101" in out, out  # x is gone after :reset
+
+
+@test("repl: spawn/await works across lines")
+def _():
+    rc, out, err = _repl_run([
+        "let t = spawn { sleep(50) return 7 }",
+        "await t",
+        ":quit",
+    ])
+    assert rc == 0, err
+    assert "misa> 7" in out, out
+
+
+def _profile_run(prog_src, extra_args=()):
+    """Write prog_src to a temp file and run `misa profile` on it.
+    Returns (returncode, stdout, stderr)."""
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-prof-")
+    try:
+        prog = os.path.join(d, "prog.misa")
+        with open(prog, "w") as f:
+            f.write(prog_src)
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "profile", *extra_args, prog],
+            capture_output=True, text=True, timeout=120, cwd=d)
+        return p.returncode, p.stdout, p.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_FIB_SRC = ("fn fib(n: Int) -> Int {\n"
+            "  if n < 2 { return n }\n"
+            "  return fib(n - 1) + fib(n - 2)\n"
+            "}\n"
+            "fib(25)\n")
+
+
+@test("profile: human table attributes fib correctly")
+def _():
+    rc, out, err = _profile_run(_FIB_SRC)
+    assert rc == 0, err
+    assert "samples" in out and "fib" in out, out
+
+
+@test("profile: --json attributes >80% to fib")
+def _():
+    rc, out, err = _profile_run(_FIB_SRC, ("--json",))
+    assert rc == 0, err
+    # The program's own output precedes the JSON document.
+    doc = json.loads(out[out.index("{"):])
+    assert doc["samples"] > 50, doc["samples"]
+    fib_pct = sum(r["pct"] for r in doc["profile"]
+                  if r["function"] == "fib")
+    assert fib_pct > 80, (fib_pct, doc["profile"])
+    row = doc["profile"][0]
+    assert set(row) >= {"function", "file", "line", "samples",
+                        "pct"}, row
+
+
+@test("profile: check errors fail cleanly")
+def _():
+    rc, out, err = _profile_run('let x: Int = "hi"\n')
+    assert rc == 1, (rc, out, err)
+    assert "E200" in err, err
+
+
+
+
+# -- Wave 3 (networking): TCP sockets + HTTP server --------------------
+
+@test("net: echo server round-trip via spawn (interp)")
+def _():
+    src = ('let lis = net.listen(0)\n'
+           'let port = lis.port()\n'
+           'let srv = spawn {\n'
+           '  let conn = lis.accept()\n'
+           '  let msg = conn.recv(1024)\n'
+           '  conn.send("echo:" + msg)\n'
+           '  conn.close()\n'
+           '}\n'
+           'sleep(200)\n'
+           'let c = net.connect("127.0.0.1", port)\n'
+           'c.send("hello")\n'
+           'print(c.recv(1024))\n'
+           'c.close()\n'
+           'await srv\n'
+           'print("done")\n')
+    eq(run_src(src), "echo:hello\ndone\n")
+
+
+@test("net: method-style socket calls")
+def _():
+    src = ('let lis = net.listen(0)\n'
+           'let port = lis.port()\n'
+           'let srv = spawn {\n'
+           '  let conn = lis.accept()\n'
+           '  conn.send(conn.recv(64))\n'
+           '  conn.close()\n'
+           '}\n'
+           'sleep(200)\n'
+           'let c = net.connect("127.0.0.1", port)\n'
+           'let n = c.send("ping")\n'
+           'print(n)\n'
+           'print(c.recv(64))\n'
+           'c.close()\n'
+           'lis.close()\n'
+           'await srv\n')
+    eq(run_src(src), "4\nping\n")
+
+
+@test("net: recv at EOF is clean empty text, not an error")
+def _():
+    src = ('let lis = net.listen(0)\n'
+           'let port = lis.port()\n'
+           'let srv = spawn {\n'
+           '  let conn = lis.accept()\n'
+           '  conn.close()\n'  # close immediately -> client sees EOF
+           '}\n'
+           'sleep(200)\n'
+           'let c = net.connect("127.0.0.1", port)\n'
+           'let chunk = c.recv(1024)\n'
+           'print("eof:" + chunk + ":end")\n'
+           'c.close()\n'
+           'await srv\n')
+    eq(run_src(src), "eof::end\n")
+
+
+@test("net: connect to a closed port raises catchable E304")
+def _():
+    src = ('let tmp = net.listen(0)\n'
+           'let port = tmp.port()\n'
+           'tmp.close()\n'
+           'try {\n'
+           '  net.connect("127.0.0.1", port)\n'
+           '  print("NOPE")\n'
+           '} catch e {\n'
+           '  print("caught:" + e.code)\n'
+           '}\n')
+    out = run_src(src)
+    assert out.startswith("caught:E304"), out
+
+
+@test("net: set_timeout makes recv raise E304")
+def _():
+    src = ('let lis = net.listen(0)\n'
+           'let port = lis.port()\n'
+           'let srv = spawn {\n'
+           '  let conn = lis.accept()\n'
+           '  sleep(2000)\n'  # hold the connection open, send nothing
+           '  conn.close()\n'
+           '}\n'
+           'sleep(200)\n'
+           'let c = net.connect("127.0.0.1", port)\n'
+           'c.set_timeout(300)\n'
+           'try {\n'
+           '  c.recv(1024)\n'
+           '  print("NOPE")\n'
+           '} catch e {\n'
+           '  print("caught:" + e.code)\n'
+           '}\n'
+           'c.close()\n'
+           'await srv\n')
+    out = run_src(src)
+    assert out.startswith("caught:E304"), out
+
+
+@test("net: socket ops are in checked throws (E304)")
+def _():
+    # Calling a throwing builtin from a fn without `throws` is E227.
+    errs = check_source('fn f() { net.connect("h", 80) }\n')
+    assert any(e.code == "E227" for e in errs), errs
+    errs = check_source(
+        'fn f() throws E304 { net.connect("h", 80) }\n')
+    assert not errs, errs
+
+
+@test("net: bad args are clean E200, not tracebacks")
+def _():
+    errs = check_source('net.connect("h", "eighty")\n')
+    assert any(e.code == "E200" for e in errs), errs
+    # Wrong arity
+    errs = check_source('net.listen()\n')
+    assert errs, "expected arity error"
+
+
+def _net_http_src(handler_body):
+    # http.serve never returns; run it in a fn so scope exit cancels
+    # the server promptly (no 10s linger).
+    return ('fn serve_once() throws E304 {\n'
+            '  let tmp = net.listen(0)\n'
+            '  let port = tmp.port()\n'
+            '  tmp.close()\n'
+            '  let srv = spawn {\n'
+            '    http.serve(port, |req: Request| {\n'
+            + handler_body +
+            '    })\n'
+            '  }\n'
+            '  sleep(400)\n'
+            '  PORT.put("port", port)\n'
+            '}\n')
+
+
+@test("net: http.serve GET with query parsing")
+def _():
+    src = ('let port = (fn() throws E304 {\n'
+           '  let tmp = net.listen(0)\n'
+           '  let p = tmp.port()\n'
+           '  tmp.close()\n'
+           '  let srv = spawn {\n'
+           '    http.serve(p, |req: Request| {\n'
+           '      return {status: 200,\n'
+           '              body: req.method + " " + req.path + " " +\n'
+           '                    req.query["name"]}\n'
+           '    })\n'
+           '  }\n'
+           '  sleep(400)\n'
+           '  let r = http.get("http://127.0.0.1:" + str(p) +\n'
+           '                 "/hello?name=world")\n'
+           '  print(r)\n'
+           '  return p\n'
+           '})()\n')
+    eq(run_src(src), "GET /hello world\n")
+
+
+@test("net: http.serve POST with body + custom status")
+def _():
+    src = ('(fn() throws E304 {\n'
+           '  let tmp = net.listen(0)\n'
+           '  let p = tmp.port()\n'
+           '  tmp.close()\n'
+           '  let srv = spawn {\n'
+           '    http.serve(p, |req: Request| {\n'
+           '      if req.path == "/echo" {\n'
+           '        return {status: 201, body: "got:" + req.body}\n'
+           '      }\n'
+           '      return {status: 404, body: "nope"}\n'
+           '    })\n'
+           '  }\n'
+           '  sleep(400)\n'
+           '  let base = "http://127.0.0.1:" + str(p)\n'
+           '  print(http.post(base + "/echo", "ping"))\n'
+           '})()\n')
+    eq(run_src(src), "got:ping\n")
+
+
+@test("net: http.serve headers are visible to the handler")
+def _():
+    src = ('(fn() throws E304 {\n'
+           '  let tmp = net.listen(0)\n'
+           '  let p = tmp.port()\n'
+           '  tmp.close()\n'
+           '  let srv = spawn {\n'
+           '    http.serve(p, |req: Request| {\n'
+           '      return {status: 200,\n'
+           '              headers: {"x-echo": req.headers["x-test"]},\n'
+           '              body: "ok"}\n'
+           '    })\n'
+           '  }\n'
+           '  sleep(400)\n'
+           '  print("ok")\n'
+           '})()\n')
+    eq(run_src(src), "ok\n")
+
+
+@test("net: http.serve malformed request gets 400")
+def _():
+    # Pure Misa: speak raw HTTP with a bad request line, expect 400.
+    src = ('(fn() throws E304 {\n'
+           '  let tmp = net.listen(0)\n'
+           '  let p = tmp.port()\n'
+           '  tmp.close()\n'
+           '  let srv = spawn {\n'
+           '    http.serve(p, |req: Request| {\n'
+           '      return {status: 200, body: "unreachable"}\n'
+           '    })\n'
+           '  }\n'
+           '  sleep(400)\n'
+           '  let c = net.connect("127.0.0.1", p)\n'
+           '  c.send("GARBAGE\\r\\n\\r\\n")\n'
+           '  let resp = c.recv(1024)\n'
+           '  c.close()\n'
+           '  print(resp.split("\\r\\n")[0])\n'
+           '})()\n')
+    eq(run_src(src), "HTTP/1.1 400 Bad Request\n")
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

@@ -41,6 +41,10 @@ enum {
     M_TAG_CHAN   = 14,  /* Phase 7: Chan<T> handle (wraps MisaChan*) */
     M_TAG_BUILDER = 15, /* Text.Builder handle (wraps Str*) */
     M_TAG_STRUCT = 16, /* Wave 2 FFI: C-layout struct (wraps raw bytes) */
+    M_TAG_SOCKET = 17, /* Wave 3: TCP socket (wraps MisaSock*) */
+    M_TAG_LISTENER = 18, /* Wave 3: TCP listener (wraps MisaSock*) */
+    M_TAG_SET = 19,    /* Wave 3 (stdlib): Set<T> (insertion-ordered) */
+    M_TAG_REGEX = 20,  /* Wave 3 (stdlib): compiled regex (MisaRx*) */
 };
 
 /* Media kinds. */
@@ -119,7 +123,7 @@ MVal *misa_add(MVal *a, MVal *b, int line, int col);
 MVal *misa_sub(MVal *a, MVal *b, int line, int col);
 MVal *misa_mul(MVal *a, MVal *b, int line, int col);
 MVal *misa_div(MVal *a, MVal *b, int line, int col); /* E300 on div by zero */
-MVal *misa_mod(MVal *a, MVal *b, int line, int col); /* Python semantics */
+MVal *misa_mod(MVal *a, MVal *b, int line, int col); /* E300 on div by zero */
 MVal *misa_neg(MVal *a, int line, int col);
 MVal *misa_not(MVal *a);
 MVal *misa_eq(MVal *a, MVal *b);
@@ -144,6 +148,7 @@ int64_t misa_len(MVal *v, int line, int col);  /* code points for Text */
 MVal *misa_index_get(MVal *obj, MVal *idx, int line, int col);
 void  misa_index_set(MVal *obj, MVal *idx, MVal *val, int line, int col);
 MVal *misa_record_get(MVal *obj, const char *field, int line, int col);
+MVal *misa_record_get_opt(MVal *obj, const char *field); /* no raise */
 void  misa_record_set(MVal *obj, const char *field, MVal *val,
                       int line, int col);
 int64_t misa_list_len(MVal *l);
@@ -215,6 +220,57 @@ MVal *misa_str_trim(MVal *s, int line, int col);
 MVal *misa_str_chars(MVal *s, int line, int col);
 MVal *misa_str_ord(MVal *c, int line, int col);
 MVal *misa_str_chr(MVal *code, int line, int col);
+/* Wave 3 (stdlib expansion). */
+MVal *misa_regex_new(MVal *pat, int line, int col);          /* E300 */
+MVal *misa_regex_matches(MVal *rx, MVal *text, int line, int col);
+MVal *misa_regex_find(MVal *rx, MVal *text, int line, int col);
+MVal *misa_regex_find_all(MVal *rx, MVal *text, int line, int col);
+MVal *misa_regex_replace(MVal *rx, MVal *text, MVal *repl,
+                         int line, int col);
+MVal *misa_regex_captures(MVal *rx, MVal *text, int line, int col);
+MVal *misa_crypto_sha256(MVal *data, int line, int col);
+MVal *misa_crypto_sha1(MVal *data, int line, int col);
+MVal *misa_crypto_md5(MVal *data, int line, int col);
+MVal *misa_crypto_hmac_sha256(MVal *key, MVal *msg, int line, int col);
+MVal *misa_random_seed(MVal *n, int line, int col);
+MVal *misa_random_int(MVal *lo, MVal *hi, int line, int col); /* E300 */
+MVal *misa_random_float(void);
+MVal *misa_random_choice(MVal *xs, int line, int col);       /* E300 */
+MVal *misa_random_shuffle(MVal *xs, int line, int col);
+MVal *misa_time_now_utc(void);
+MVal *misa_time_to_utc(MVal *t, int line, int col);
+MVal *misa_time_from_parts(MVal *y, MVal *mo, MVal *d, MVal *h,
+                           MVal *mi, MVal *s, int line, int col);
+MVal *misa_time_add(MVal *t, MVal *secs, int line, int col);
+MVal *misa_time_add_hours(MVal *t, MVal *h, int line, int col);
+MVal *misa_time_in_tz(MVal *t, MVal *off_hours, int line, int col);
+MVal *misa_time_weekday(MVal *t, int line, int col);
+MVal *misa_time_is_leap(MVal *y, int line, int col);
+MVal *misa_fs_temp_file(int line, int col);                 /* E303 */
+MVal *misa_fs_temp_dir(int line, int col);                  /* E303 */
+MVal *misa_set_new(void);
+void  misa_set_add(MVal *s, MVal *x, int line, int col);
+MVal *misa_set_contains(MVal *s, MVal *x, int line, int col);
+void  misa_set_remove(MVal *s, MVal *x, int line, int col);
+MVal *misa_set_union(MVal *a, MVal *b, int line, int col);
+MVal *misa_set_intersect(MVal *a, MVal *b, int line, int col);
+MVal *misa_set_diff(MVal *a, MVal *b, int line, int col);
+MVal *misa_set_to_list(MVal *s, int line, int col);
+int64_t misa_set_len(MVal *s, int line, int col);
+MVal *misa_list_map(MVal *xs, MVal *f, int line, int col);
+MVal *misa_list_filter(MVal *xs, MVal *f, int line, int col);
+MVal *misa_list_fold(MVal *xs, MVal *init, MVal *f, int line, int col);
+MVal *misa_list_sort_by(MVal *xs, MVal *f, int line, int col);
+MVal *misa_list_flat(MVal *xss, int line, int col);
+MVal *misa_list_zip(MVal *xs, MVal *ys, int line, int col);
+MVal *misa_list_unique(MVal *xs, int line, int col);
+MVal *misa_str_join(MVal *xs, MVal *sep, int line, int col);
+MVal *misa_str_replace(MVal *s, MVal *old, MVal *nw, int line, int col);
+MVal *misa_str_to_upper(MVal *s, int line, int col);
+MVal *misa_str_to_lower(MVal *s, int line, int col);
+MVal *misa_str_ends_with(MVal *s, MVal *sfx, int line, int col);
+MVal *misa_str_pad_left(MVal *s, MVal *w, MVal *pad, int line, int col);
+MVal *misa_str_pad_right(MVal *s, MVal *w, MVal *pad, int line, int col);
 
 /* -- concurrency (Phase 7): cooperative fibers (misa_task.c) ------------ */
 /* Task body signature: the emitter compiles `spawn { ... }` to
@@ -236,6 +292,20 @@ MVal *misa_chan_send(MVal *ch, MVal *v, int line, int col);
 MVal *misa_chan_recv(MVal *ch, int line, int col);      /* yields */
 MVal *misa_chan_close(MVal *ch, int line, int col);
 MVal *misa_fetch_all(MVal *urls, int line, int col);    /* [Text] */
+/* Wave 3 (networking): TCP sockets + HTTP server. All E304 on failure.
+ * Sockets are non-blocking; blocking operations park the current task
+ * on the fiber scheduler (never stall other tasks). On Emscripten
+ * these raise E600 (no raw sockets under wasm). */
+MVal *misa_net_connect(MVal *host, MVal *port, int line, int col);
+MVal *misa_net_listen(MVal *port, int line, int col);
+MVal *misa_net_accept(MVal *lis, int line, int col);
+MVal *misa_net_port(MVal *lis, int line, int col);
+MVal *misa_listener_close(MVal *lis, int line, int col);
+MVal *misa_socket_send(MVal *sock, MVal *data, int line, int col);
+MVal *misa_socket_recv(MVal *sock, MVal *max, int line, int col);
+MVal *misa_socket_close(MVal *sock, int line, int col);
+MVal *misa_socket_set_timeout(MVal *sock, MVal *ms, int line, int col);
+MVal *misa_http_serve(MVal *port, MVal *handler, int line, int col);
 
 /* -- db (Phase 5): SQLite bindings (misa_db.c) ------------------------ */
 MVal *misa_db_open(MVal *path, int line, int col);           /* E303 */

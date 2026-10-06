@@ -12,7 +12,9 @@ and byte-stable, and the language server speaks standard LSP.
 | `misa fmt <f.misa> [--write]` | Canonical formatter (4-space, K&R, one blank line between items). |
 | `misa run <f.misa> [--mock m.json]` | Interpret with hot-reload semantics. Args after `--` go to the program's `argv()`. |
 | `misa debug [--agent] <f.misa>` | **Agent-native debugger** (see below). `--agent` speaks a JSON-line protocol for AI agents; without it, a human text REPL. |
+| `misa profile <f.misa> [--json] [--interval-ms N]` | **Sampling CPU profiler** (see below): flat profile of where the interpreter spends its time. `--json` emits `[{function, file, line, samples, pct}]` for agents. |
 | `misa test [path] [--mock m.json] [--json]` | Run unit `test` blocks (`*_test.misa` / `test_*.misa` discovered under directories) plus `eval` blocks. `--json` emits structured results for agents. |
+| `misa repl` | **Interactive REPL** (see below): read-eval-print loop with persistent bindings, multi-line input, and `:type` showing the checker's inferred type. |
 | `misa build <f.misa> [--target triple]` | LLVM AOT native binary. |
 | `misa lsp` | **Language server** (JSON-RPC 2.0 over stdio). Never writes to stdout except protocol frames; logs to stderr. |
 
@@ -222,3 +224,97 @@ Commands: `b file:line`, `c`/`r` (continue/run), `s` (step), `n` (next),
   conflict with the debugger in `--agent` mode.
 - The program is type-checked before the session starts (`misa check`
   errors go to stderr, exit 1) — you debug runtime behavior, not syntax.
+
+## Sampling profiler (`misa profile`)
+
+A sampling CPU profiler for the interpreter: a timer thread reads the
+currently-executing statement every N ms (default 10) and aggregates
+into a flat profile — `% time, samples, function, file:line`, sorted
+by samples descending.
+
+```
+$ misa profile fib.misa
+75025
+profile: 719 samples (10 ms interval)
+samples      %  function                  location
+    499   69.4  fib                       fib.misa:2
+    219   30.5  fib                       fib.misa:3
+      1    0.1  main                      fib.misa:7
+```
+
+`misa profile --json fib.misa` emits the agent interface instead:
+
+```json
+{"samples": 719, "interval_ms": 10.0, "profile": [
+  {"function": "fib", "file": "fib.misa", "line": 2,
+   "samples": 499, "pct": 69.4},
+  {"function": "fib", "file": "fib.misa", "line": 3,
+   "samples": 219, "pct": 30.5}
+]}
+```
+
+The loop this enables: `misa profile` finds the hot line → the agent
+reads the typed code → fixes → re-profiles. The profile above is real
+output from `fib(25)` — 100% of samples inside `fib`, lines 2–3.
+
+### v1 limitations (stated, not faked)
+
+- **Interpreter only.** AOT-native profiling (frame-pointer unwinding
+  of compiled binaries, `perf`-style external sampling) is future work.
+  `misa profile` always runs the interpreter.
+- **Main thread only.** `spawn`ed tasks run free and aren't attributed.
+- **Sampling overhead.** The per-statement hook slows the interpreter
+  while profiling; percentages are trustworthy, absolute times are not
+  — use `misa build` + `time` for wall-clock numbers.
+- The program is type-checked before profiling (`misa check` errors go
+  to stderr, exit 1). A program that fails at runtime still prints the
+  profile of what it sampled, then the E-code.
+
+## Interactive REPL (`misa repl`)
+
+A read-eval-print loop with persistent bindings, multi-line input, and
+`:type` — which shows the **checker's inferred type** for any
+expression, the fastest way to learn the type system.
+
+```
+$ misa repl
+misa repl (v0.3) — :help for help, :quit to leave
+misa> let prices = [10, 20, 30]
+misa> map(prices, |p: Int| p * 2)
+[20, 40, 60]
+misa> :type prices
+prices: [Int]
+misa> fn total(xs: [Int]) -> Int {
+....> var s = 0
+....> for x in xs { s = s + x }
+....> return s
+....> }
+misa> total(prices)
+60
+misa> let x: Int = "hi"
+1:1: E200: cannot assign Text to 'x: Int'
+misa> :quit
+```
+
+How it works: each chunk is appended to the session source and the
+whole program is re-checked (the old prefix was clean, so any error is
+the new chunk's — reported with chunk-relative lines, then discarded).
+A lone bare expression is evaluated and its value printed (`nil`
+prints nothing, so `print("hi")` doesn't echo `nil`). `spawn` in one
+line and `await` in the next works — one task scope lives for the
+whole session and is finished (bounded wait, then cancel) on
+`:quit`/EOF, so task errors are never silent.
+
+Commands: `:help`, `:quit`, `:reset` (forget all bindings),
+`:type <expr>`. readline history is used when available.
+
+### v1 limitations (stated, not faked)
+
+- `import` parses but does nothing (the loader resolves imports from
+  files; the REPL has no files).
+- `screen` declarations check but never render — there is no UI driver
+  in a REPL; `state()` outside a screen is E211 as usual.
+- `let` redefinition is E210, exactly as in a file — use `var` +
+  assignment, or `:reset`, to iterate on a binding.
+- Model/stream calls need real provider credentials, like everywhere
+  else.

@@ -15,12 +15,19 @@ PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void",
               # passed back to C and compared to nil, never dereferenced.
               "Ptr"}
 MEDIA = {"Photo", "Audio", "Video", "Document"}
-SPECIAL = {"TokenStream", "Embedding", "Db", "Builder"}
+SPECIAL = {"TokenStream", "Embedding", "Db", "Builder",
+           # Wave 3 (networking): TCP socket handles + HTTP types.
+           "Socket", "Listener", "Request", "Response",
+           # Wave 3 (stdlib): compiled regex handle.
+           "Regex"}
 # Phase 7 (concurrency): builtin generic type names, exactly 1 type
 # argument (like List<T>). `Task<Text>`, `Chan<Int>` are valid
 # annotations; bare `Task`/`Chan` is an error (E221, suggesting the
 # generic form).
 CONCURRENCY_GENERICS = {"Task", "Chan"}
+# Wave 3 (stdlib): `Set<T>` — same 1-type-argument rule as Task/Chan.
+SET_GENERICS = {"Set"}
+BUILTIN_GENERICS_1 = CONCURRENCY_GENERICS | SET_GENERICS
 BUILTINS = {
     "print": (["Text"], "Text"),  # print accepts anything; modeled loosely
     "len": (["any"], "Int"),
@@ -78,6 +85,20 @@ NS_BUILTINS = {
     "json.stringify": (["any"], "Text"),
     "http.post": (["Text", "Text"], "Text"),
     "http.post_json": (["Text", "any"], "Text"),
+    # Wave 3 (networking): TCP sockets + HTTP server. The handler for
+    # http.serve is a lambda `|req: Request| -> Response`; typed `any`
+    # here so any one-arg lambda checks (its own body is checked
+    # normally; handler errors are caught per-connection -> 500).
+    "net.connect": (["Text", "Int"], "Socket"),
+    "net.listen": (["Int"], "Listener"),
+    "net.accept": (["Listener"], "Socket"),
+    "net.port": (["Listener"], "Int"),
+    "listener.close": (["Listener"], "Void"),
+    "socket.send": (["Socket", "Text"], "Int"),
+    "socket.recv": (["Socket", "Int"], "Text"),
+    "socket.close": (["Socket"], "Void"),
+    "socket.set_timeout": (["Socket", "Int"], "Void"),
+    "http.serve": (["Int", "any"], "Void"),
     "time.now": ([], "Int"),
     "time.now_ms": ([], "Int"),
     "time.format": (["Int", "Text"], "Text"),
@@ -88,6 +109,65 @@ NS_BUILTINS = {
     "math.floor": (["Float"], "Int"),
     "math.ceil": (["Float"], "Int"),
     "math.round": (["Float"], "Int"),
+    # Wave 3 (stdlib expansion).
+    # Regex: `regex("...")` compiles (check-time validated); the
+    # `regex.*` functions operate on the compiled handle.
+    "regex.matches": (["Regex", "Text"], "Bool"),
+    "regex.find": (["Regex", "Text"], "Text?"),
+    "regex.find_all": (["Regex", "Text"], "[Text]"),
+    "regex.replace": (["Regex", "Text", "Text"], "Text"),
+    "regex.captures": (["Regex", "Text"], "[Text]?"),
+    # Crypto: pure hash functions (hex digests).
+    "crypto.sha256": (["Text"], "Text"),
+    "crypto.sha1": (["Text"], "Text"),
+    "crypto.md5": (["Text"], "Text"),
+    "crypto.hmac_sha256": (["Text", "Text"], "Text"),
+    # Random: splitmix64 (AOT) / random.Random (interp); `random.seed`
+    # gives determinism within a backend, not across backends.
+    "random.int": (["Int", "Int"], "Int"),
+    "random.float": ([], "Float"),
+    "random.seed": (["Int"], "Void"),
+    # Time: offset-based zones (no tz database in v1).
+    "time.now_utc": ([], "Int"),
+    "time.to_utc": (["Int"], "Int"),
+    "time.from_parts": (["Int", "Int", "Int", "Int", "Int", "Int"],
+                        "Int"),
+    "time.add": (["Int", "Int"], "Int"),
+    "time.add_hours": (["Int", "Int"], "Int"),
+    "time.in_tz": (["Int", "Float"], "Int"),
+    "time.weekday": (["Int"], "Text"),
+    "time.is_leap": (["Int"], "Bool"),
+    # Temp files.
+    "fs.temp_file": ([], "Text"),
+    "fs.temp_dir": ([], "Text"),
+    # str extras (str.split/trim/starts_with already exist).
+    "str.join": (["[Text]", "Text"], "Text"),
+    "str.replace": (["Text", "Text", "Text"], "Text"),
+    "str.to_upper": (["Text"], "Text"),
+    "str.to_lower": (["Text"], "Text"),
+    "str.ends_with": (["Text", "Text"], "Bool"),
+    "str.pad_left": (["Text", "Int", "Text"], "Text"),
+    "str.pad_right": (["Text", "Int", "Text"], "Text"),
+}
+# Wave 3 (stdlib): builtins with type variables. The generic
+# NS_BUILTINS branch cannot unify applied types (`Set<T>` vs
+# `Set<Int>`) or substitute into the return type, so these are
+# checked by `_check_poly_builtin` (real unification via _unify_te).
+# name -> (param type strings, return type string, type variables).
+POLY_BUILTINS = {
+    "random.choice": (["[T]"], "T", {"T"}),
+    "random.shuffle": (["[T]"], "[T]", {"T"}),
+    "set.add": (["Set<T>", "T"], "Void", {"T"}),
+    "set.contains": (["Set<T>", "T"], "Bool", {"T"}),
+    "set.remove": (["Set<T>", "T"], "Void", {"T"}),
+    "set.union": (["Set<T>", "Set<T>"], "Set<T>", {"T"}),
+    "set.intersect": (["Set<T>", "Set<T>"], "Set<T>", {"T"}),
+    "set.diff": (["Set<T>", "Set<T>"], "Set<T>", {"T"}),
+    "set.to_list": (["Set<T>"], "[T]", {"T"}),
+    "set.len": (["Set<T>"], "Int", {"T"}),
+    "list.flat": (["[[T]]"], "[T]", {"T"}),
+    "list.zip": (["[A]", "[B]"], "[[any]]", {"A", "B"}),
+    "list.unique": (["[T]"], "[T]", {"T"}),
 }
 # Phase 5 (DB): namespaced builtins with optional trailing args:
 # name -> (min_arity, max_arity). Absent = exact arity from NS_BUILTINS.
@@ -107,6 +187,17 @@ BUILTIN_THROWS = {
     "http.post": frozenset({"E304"}),
     "http.post_json": frozenset({"E304"}),
     "fetch_all": frozenset({"E304"}),
+    # Wave 3 (networking): TCP sockets + HTTP server.
+    "net.connect": frozenset({"E304"}),
+    "net.listen": frozenset({"E304"}),
+    "net.accept": frozenset({"E304"}),
+    "net.port": frozenset({"E304"}),
+    "listener.close": frozenset({"E304"}),
+    "socket.send": frozenset({"E304"}),
+    "socket.recv": frozenset({"E304"}),
+    "socket.close": frozenset({"E304"}),
+    "socket.set_timeout": frozenset({"E304"}),
+    "http.serve": frozenset({"E304"}),
     # I/O
     "fs.read": frozenset({"E303"}),
     "fs.write": frozenset({"E303"}),
@@ -138,6 +229,19 @@ BUILTIN_THROWS = {
     "math.sqrt": frozenset({"E300"}),
     "math.pow": frozenset({"E300"}),
     "math.abs": frozenset({"E300"}),
+    # Wave 3 (stdlib expansion).
+    "regex.matches": frozenset({"E300"}),
+    "regex.find": frozenset({"E300"}),
+    "regex.find_all": frozenset({"E300"}),
+    "regex.replace": frozenset({"E300"}),
+    "regex.captures": frozenset({"E300"}),
+    "random.int": frozenset({"E300"}),
+    "random.choice": frozenset({"E300"}),
+    "time.from_parts": frozenset({"E300"}),
+    "fs.temp_file": frozenset({"E303"}),
+    "fs.temp_dir": frozenset({"E303"}),
+    "str.pad_left": frozenset({"E300"}),
+    "str.pad_right": frozenset({"E300"}),
     "math.floor": frozenset({"E300"}),
     "math.ceil": frozenset({"E300"}),
     "math.round": frozenset({"E300"}),
@@ -872,6 +976,114 @@ class Checker:
             self.error("E211",
                        f"argument '{pn}' wants {want_t}, got {at}",
                        a.line, a.col)
+
+    # -- Wave 3 (stdlib expansion) ------------------------------------
+
+    @staticmethod
+    def _validate_regex(pattern: str):
+        """Validate a regex pattern against the v1 grammar.
+
+        Returns None when valid, else a human-readable error message.
+        Shared with the interpreter (runtime validation of
+        non-literal patterns).
+        """
+        from .regexp import validate
+        return validate(pattern)
+
+    def _check_poly_builtin(self, e: ast.Call, scope: dict) -> str:
+        """Check a POLY_BUILTINS call via real type-variable unification.
+
+        Binds type vars from the arguments (_unify_te) and substitutes
+        them into the return type. Conflicts are E211.
+        """
+        params, ret, tparams = POLY_BUILTINS[e.name]
+        if len(e.args) != len(params):
+            self.error("E102",
+                       f"'{e.name}' takes {len(params)} args, "
+                       f"got {len(e.args)}", e.line, e.col)
+            return "unknown"
+        arg_ts = [self._infer(a, scope) for a in e.args]
+        bindings: Dict[str, str] = {}
+        for want_s, a, at in zip(params, e.args, arg_ts):
+            if at == "unknown":
+                continue
+            err = self._unify_te(self._parse_tstr(want_s),
+                                 self._parse_tstr(at), tparams,
+                                 bindings)
+            if err:
+                self.error("E211",
+                           f"'{e.name}': {err}", a.line, a.col)
+                return "unknown"
+        for p in tparams:
+            if p not in bindings:
+                bindings[p] = "unknown"
+        return self._tname(self._subst_te(self._parse_tstr(ret),
+                                          bindings))
+
+    def _check_hof_builtin(self, e: ast.Call, scope: dict) -> str:
+        """Check `map`/`filter`/`fold`/`sort_by`.
+
+        The list element type comes from the first argument; the
+        callable's type is inferred against an expected function type
+        built from it (so untyped lambda params infer, like user
+        generic fns). A user-defined function of the same name shadows
+        the builtin (checked before this is reached).
+        """
+        want_n = {"map": 2, "filter": 2, "fold": 3, "sort_by": 2}
+        n = want_n[e.name]
+        if len(e.args) != n:
+            self.error("E102",
+                       f"'{e.name}' takes {n} args, got {len(e.args)}",
+                       e.line, e.col)
+            return "unknown"
+        xt = self._infer(e.args[0], scope)
+        base, targs = self._split_applied(xt)
+        elem = None
+        if xt != "unknown":
+            if not (xt.startswith("[") and xt.endswith("]")
+                    and "," not in xt[1:-1]):
+                self.error("E211",
+                           f"'{e.name}' wants a list, got {xt}",
+                           e.args[0].line, e.args[0].col)
+                return "unknown"
+            elem = xt[1:-1] or "unknown"
+        else:
+            elem = "unknown"
+        fn_arg = e.args[1] if e.name != "fold" else e.args[2]
+        if e.name == "map":
+            exp = f"({elem}) -> unknown"
+        elif e.name == "filter":
+            exp = f"({elem}) -> Bool"
+        elif e.name == "sort_by":
+            exp = f"({elem}, {elem}) -> Bool"
+        else:  # fold
+            init_t = self._infer(e.args[1], scope)
+            acc = init_t if init_t != "unknown" else "unknown"
+            exp = f"({acc}, {elem}) -> {acc}"
+        ft = self._infer(fn_arg, scope, expected=exp)
+        fp = self._func_parts(ft)
+        if ft != "unknown" and fp is None:
+            self.error("E211",
+                       f"'{e.name}' wants a function, got {ft}",
+                       fn_arg.line, fn_arg.col)
+            return "unknown"
+        want_arity = {"map": 1, "filter": 1, "fold": 2, "sort_by": 2}
+        if fp is not None and len(fp[0]) != want_arity[e.name]:
+            self.error("E211",
+                       f"'{e.name}' wants a {want_arity[e.name]}-arg "
+                       f"function, got {ft}",
+                       fn_arg.line, fn_arg.col)
+            return "unknown"
+        if e.name == "map":
+            ret_elem = fp[1] if fp else "unknown"
+            return f"[{ret_elem}]"
+        if e.name == "filter":
+            return f"[{elem}]"
+        if e.name == "sort_by":
+            return f"[{elem}]"
+        # fold: the accumulator type
+        init_t = self._infer(e.args[1], scope)
+        return init_t if init_t != "unknown" else "unknown"
 
     def _callback_matches(self, want_t: str, at: str) -> bool:
         """Do the function-type strings match for a C callback? Both
@@ -2321,6 +2533,47 @@ class Checker:
                 e.name = f"builder.{field}"
                 e.args.insert(0, ast.Ident(name=recv, line=e.line,
                                            col=e.col))
+        # Wave 3 (stdlib): `s.add(x)` / `s.contains(x)` / ... where the
+        # receiver variable has type `Set<T>` rewrites to the canonical
+        # `set.*` builtin, prepending the receiver (same trick as
+        # Text.Builder above).
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name and e.name not in POLY_BUILTINS:
+            recv, _, field = e.name.partition(".")
+            if recv in scope and scope[recv][0].startswith("Set<") \
+                    and field in ("add", "contains", "remove", "union",
+                                  "intersect", "diff", "to_list", "len"):
+                e.name = f"set.{field}"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+        # Wave 3 (networking): `sock.send(d)` / `sock.recv(n)` /
+        # `sock.close()` / `sock.set_timeout(ms)` where the receiver has
+        # type Socket, and `lis.accept()` / `lis.port()` where it has
+        # type Listener, rewrite to the canonical `socket.*` / `net.*`
+        # builtins with the receiver prepended (same trick as Db/Chan).
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if recv in scope and scope[recv][0] == "Socket" \
+                    and field in ("send", "recv", "close", "set_timeout"):
+                e.name = f"socket.{field}"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+            elif recv in scope and scope[recv][0] == "Listener" \
+                    and field == "accept":
+                e.name = "net.accept"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+            elif recv in scope and scope[recv][0] == "Listener" \
+                    and field == "port":
+                e.name = "net.port"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+            elif recv in scope and scope[recv][0] == "Listener" \
+                    and field == "close":
+                e.name = "listener.close"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
         # Phase 8 (overtake): interface method calls. `d.draw()`
         # where `d: Drawable` rewrites to `iface.Drawable.draw` with the
         # receiver prepended (dynamic dispatch); `c.draw()` where
@@ -2406,6 +2659,16 @@ class Checker:
                          None)
                 if v is not None:
                     exp_ts = [self._tname(te) for _, te in v.fields]
+        # Wave 3 (stdlib): higher-order list builtins. Their types are
+        # computed from the list element type + the lambda's inferred
+        # type (like user-defined generic fns), so they cannot live in
+        # the NS_BUILTINS table and must be checked BEFORE arg_ts is
+        # inferred (the lambda needs its expected function type).
+        # A user-defined `map`/`filter`/`fold`/`sort_by` shadows the
+        # builtin.
+        if e.name in ("map", "filter", "fold", "sort_by") \
+                and e.name not in self.fns and e.name not in scope:
+            return self._check_hof_builtin(e, scope)
         arg_ts = []
         for i, a in enumerate(e.args):
             exp = exp_ts[i] if exp_ts and i < len(exp_ts) else None
@@ -2615,6 +2878,58 @@ class Checker:
                            f"got {ct}", e.args[0].line, e.args[0].col)
                 return "unknown"
             return cargs[0]
+        # Wave 3 (stdlib): `regex("...")` compiles a pattern. When the
+        # pattern is a string literal it is validated AT CHECK TIME —
+        # an invalid pattern is E200 with a position, never a runtime
+        # surprise (the overtake over Python/Rust, which fail at
+        # runtime). Non-literal patterns are validated at runtime
+        # (E300 on invalid).
+        if e.name == "regex" and "regex" not in self.fns \
+                and "regex" not in scope:
+            if len(e.args) != 1:
+                self.error("E102",
+                           f"'regex' takes 1 arg, got {len(e.args)}",
+                           e.line, e.col)
+                return "unknown"
+            pat_t = self._infer(e.args[0], scope)
+            if pat_t != "unknown" and pat_t != "Text":
+                self.error("E211",
+                           f"'regex' wants Text, got {pat_t}",
+                           e.args[0].line, e.args[0].col)
+                return "unknown"
+            arg = e.args[0]
+            if isinstance(arg, ast.StrLit) and len(arg.parts) == 1 \
+                    and isinstance(arg.parts[0], str):
+                err = self._validate_regex(arg.parts[0])
+                if err is not None:
+                    self.error("E200",
+                               f"invalid regex pattern: {err}",
+                               arg.line, arg.col)
+                    return "unknown"
+            return "Regex"
+        # Wave 3 (stdlib): `set()` / `set<T>()` constructs an empty
+        # `Set<T>` (defaults to `Set<unknown>`).
+        if e.name == "set" and "set" not in self.fns \
+                and "set" not in scope:
+            if e.args:
+                self.error("E102",
+                           f"'set' takes 0 args, got {len(e.args)}",
+                           e.line, e.col)
+                return "unknown"
+            if len(e.type_args) > 1:
+                self.error("E221",
+                           f"'set' takes 1 type argument(s), "
+                           f"got {len(e.type_args)}", e.line, e.col)
+                return "unknown"
+            if e.type_args:
+                ta = e.type_args[0]
+                self._check_te(ta, ta.line, ta.col)
+                return f"Set<{self._tname(ta)}>"
+            return "Set<unknown>"
+        # Wave 3 (stdlib): builtins with type variables (Set<T> etc.)
+        # need real unification, not the NS_BUILTINS table.
+        if e.name in POLY_BUILTINS:
+            return self._check_poly_builtin(e, scope)
         if e.name in NS_BUILTINS:
             params, ret = NS_BUILTINS[e.name]
             lo, hi = NS_BUILTIN_ARITY.get(e.name, (len(params),
@@ -3066,7 +3381,7 @@ class Checker:
         if te.type_args:
             # Phase 7 (concurrency): builtin `Task<T>` / `Chan<T>`
             # require exactly 1 type argument.
-            if te.name in CONCURRENCY_GENERICS:
+            if te.name in BUILTIN_GENERICS_1:
                 return (len(te.type_args) == 1
                         and all(self._known_type(a)
                                 for a in te.type_args))
@@ -3102,7 +3417,7 @@ class Checker:
         # Phase 5c: applied generic type with wrong arity.
         if te.type_args:
             # Phase 7 (concurrency): `Task`/`Chan` take exactly 1.
-            if te.name in CONCURRENCY_GENERICS \
+            if te.name in BUILTIN_GENERICS_1 \
                     and len(te.type_args) != 1:
                 self.error(
                     "E221",

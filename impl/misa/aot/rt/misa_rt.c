@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h> /* close() for mkstemp */
 
 #ifdef MISA_USE_GC
 #include <gc.h>
@@ -51,6 +52,10 @@ struct MVal {
         struct { int kind; char *path; } media;
         struct { MVal *src; int64_t idx; int64_t nchars; } iter;
         void *ptr;   /* Phase 7: M_TAG_PTR — opaque C pointer */
+        /* Wave 3 (stdlib): M_TAG_SET — insertion-ordered dedup list. */
+        struct { MVal **items; int64_t len, cap; } set;
+        /* Wave 3 (stdlib): M_TAG_REGEX — compiled pattern + source. */
+        struct { void *rx; char *pattern; } regex;
     } u;
 };
 
@@ -663,6 +668,25 @@ static void render_into(Str *s, MVal *v) {
     case M_TAG_TASK: str_puts(s, "<task>"); break;
     case M_TAG_CHAN: str_puts(s, "<chan>"); break;
     case M_TAG_BUILDER: str_puts(s, "<builder>"); break;
+    case M_TAG_STRUCT: str_puts(s, "<struct>"); break;
+    case M_TAG_SET: {
+        /* Render like the interpreter: {a, b, c}. */
+        str_puts(s, "{");
+        for (int64_t i = 0; i < v->u.set.len; i++) {
+            if (i) str_puts(s, ", ");
+            Str tmp = {0};
+            render_into(&tmp, v->u.set.items[i]);
+            str_putn(s, tmp.buf ? tmp.buf : "", tmp.len);
+        }
+        str_puts(s, "}");
+        break;
+    }
+    case M_TAG_REGEX: {
+        str_puts(s, "<regex: ");
+        str_puts(s, v->u.regex.pattern ? v->u.regex.pattern : "?");
+        str_puts(s, ">");
+        break;
+    }
     default: str_puts(s, "<value>"); break;
     }
 }
@@ -982,8 +1006,9 @@ int64_t misa_len(MVal *v, int line, int col) {
     case M_TAG_LIST:   return v->u.list.len;
     case M_TAG_MAP:    return v->u.map.len;
     case M_TAG_RECORD: return v->u.record.len;
+    case M_TAG_SET:    return v->u.set.len;
     default:
-        misa_raise("E300", "len() needs text, list, map, or record", line, col);
+        misa_raise("E300", "len() needs text, list, map, set, or record", line, col);
         return 0;
     }
 }
@@ -1138,6 +1163,18 @@ MVal *misa_record_get(MVal *obj, const char *field, int line, int col) {
             return obj->u.record.vals[i];
     }
     misa_raise_fmt("E300", line, col, "no field '%s'", field);
+    return NULL;
+}
+
+/* Wave 3: non-raising field lookup (optional record fields). Returns
+ * NULL without raising when the object is not a record or the field
+ * is absent. */
+MVal *misa_record_get_opt(MVal *obj, const char *field) {
+    if (!obj || obj->tag != M_TAG_RECORD) return NULL;
+    for (int64_t i = 0; i < obj->u.record.len; i++) {
+        if (strcmp(obj->u.record.names[i], field) == 0)
+            return obj->u.record.vals[i];
+    }
     return NULL;
 }
 
@@ -2006,4 +2043,1624 @@ void misa_screen_after_handler(void) {
             misa_ui_report_error(misa_ui_active(), err);
         }
     }
+}
+
+/* ==================================================================
+ * Wave 3 (stdlib expansion)
+ * ================================================================== */
+
+/* Forward declarations for types used before their definitions. */
+typedef struct MisaRx MisaRx;
+
+/* -- UTF-8 helpers (shared by the regex engine) -------------------- */
+
+static uint32_t utf8_decode_one(const unsigned char **pp) {
+    const unsigned char *p = *pp;
+    uint32_t c = *p;
+    if (c < 0x80) { *pp = p + 1; return c; }
+    if ((c & 0xE0) == 0xC0) {
+        *pp = p + 2;
+        return ((c & 0x1F) << 6) | (p[1] & 0x3F);
+    }
+    if ((c & 0xF0) == 0xE0) {
+        *pp = p + 3;
+        return ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    }
+    *pp = p + 4;
+    return ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) |
+           ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+}
+
+/* Decode UTF-8 text to code points; `offs[i]` = byte offset of cps[i].
+ * `offs[n]` = total bytes (sentinel). */
+typedef struct { uint32_t *cps; size_t *offs; size_t n; } Decoded;
+static Decoded decode_text(const char *data, size_t len) {
+    Decoded d;
+    d.cps = (uint32_t *)misa_alloc((len + 1) * sizeof(uint32_t));
+    d.offs = (size_t *)misa_alloc((len + 2) * sizeof(size_t));
+    d.n = 0;
+    const unsigned char *p = (const unsigned char *)data;
+    const unsigned char *end = p + len;
+    while (p < end) {
+        d.offs[d.n] = (size_t)(p - (const unsigned char *)data);
+        d.cps[d.n++] = utf8_decode_one(&p);
+    }
+    d.offs[d.n] = len;
+    return d;
+}
+
+/* -- Portable regex engine (mirrors impl/misa/regexp.py exactly) --- */
+
+typedef enum {
+    RX_LIT, RX_DOT, RX_CLASS, RX_SEQ, RX_ALT, RX_QUANT, RX_GROUP,
+    RX_START, RX_END
+} RxKind;
+
+typedef struct RxNode RxNode;
+struct RxNode {
+    RxKind kind;
+    uint32_t ch;                 /* RX_LIT */
+    int neg;                     /* RX_CLASS */
+    uint32_t *ranges; int nr;    /* RX_CLASS: (lo,hi) pairs */
+    RxNode **kids; int nk;       /* RX_SEQ */
+    RxNode *left, *right;        /* RX_ALT */
+    RxNode *child; int qmin, qmax; /* RX_QUANT: qmax<0 = unbounded */
+    int gidx;                    /* RX_GROUP: 1-based */
+};
+
+typedef struct MisaRx {
+    RxNode *root;
+    int ngroups;
+    char *pattern;               /* owned copy, for rendering */
+} MisaRx;
+
+typedef struct {
+    const char *pat;
+    size_t n, i;
+    int ngroups;
+    char err[160];
+    int failed;
+} RxParser;
+
+static RxNode *rx_new(RxKind k) {
+    RxNode *nd = (RxNode *)misa_alloc(sizeof(RxNode));
+    memset(nd, 0, sizeof(RxNode));
+    nd->kind = k;
+    return nd;
+}
+
+static void rx_fail(RxParser *p, const char *msg) {
+    if (!p->failed) {
+        snprintf(p->err, sizeof(p->err), "%s (at index %zu)", msg, p->i);
+        p->failed = 1;
+    }
+}
+
+static RxNode *rx_parse_alt(RxParser *p);
+static RxNode *rx_parse_seq(RxParser *p);
+
+static uint32_t rx_parse_class_char(RxParser *p) {
+    char c = p->pat[p->i];
+    if (c == '\\') {
+        p->i++;
+        if (p->i >= p->n) { rx_fail(p, "pattern ends with '\\'"); return 0; }
+        char e = p->pat[p->i++];
+        switch (e) {
+        case 'n': return '\n'; case 't': return '\t'; case '\\': return '\\';
+        case '.': return '.'; case '*': return '*'; case '+': return '+';
+        case '?': return '?'; case '(': return '('; case ')': return ')';
+        case '[': return '['; case ']': return ']'; case '{': return '{';
+        case '}': return '}'; case '|': return '|'; case '^': return '^';
+        case '$': return '$'; default: break;
+        }
+        rx_fail(p, "unsupported escape in class");
+        return 0;
+    }
+    p->i++;
+    return (uint32_t)(unsigned char)c;
+}
+
+static RxNode *rx_parse_class(RxParser *p) {
+    p->i++; /* consume '[' */
+    int neg = 0;
+    if (p->i < p->n && p->pat[p->i] == '^') { neg = 1; p->i++; }
+    RxNode *nd = rx_new(RX_CLASS);
+    nd->neg = neg;
+    int cap = 8;
+    nd->ranges = (uint32_t *)misa_alloc(cap * 2 * sizeof(uint32_t));
+    int first = 1;
+    for (;;) {
+        if (p->i >= p->n) { rx_fail(p, "unclosed '['"); return nd; }
+        if (p->pat[p->i] == ']' && !first) { p->i++; break; }
+        first = 0;
+        uint32_t lo = rx_parse_class_char(p);
+        if (p->failed) return nd;
+        uint32_t hi = lo;
+        if (p->i < p->n && p->pat[p->i] == '-' && p->i + 1 < p->n &&
+            p->pat[p->i + 1] != ']') {
+            p->i++;
+            hi = rx_parse_class_char(p);
+            if (p->failed) return nd;
+            if (hi < lo) { rx_fail(p, "invalid range"); return nd; }
+        }
+        if (nd->nr * 2 + 2 > cap * 2) {
+            cap *= 2;
+            uint32_t *nr = (uint32_t *)misa_alloc(cap * 2 * sizeof(uint32_t));
+            memcpy(nr, nd->ranges, nd->nr * 2 * sizeof(uint32_t));
+            nd->ranges = nr;
+        }
+        nd->ranges[nd->nr * 2] = lo;
+        nd->ranges[nd->nr * 2 + 1] = hi;
+        nd->nr++;
+    }
+    if (nd->nr == 0) { rx_fail(p, "'[]' matches nothing"); return nd; }
+    return nd;
+}
+
+static RxNode *rx_parse_atom(RxParser *p) {
+    if (p->i >= p->n) { rx_fail(p, "unexpected end of pattern"); return rx_new(RX_SEQ); }
+    char c = p->pat[p->i];
+    if (c == '*' || c == '+' || c == '?') {
+        char m[64]; snprintf(m, sizeof(m), "quantifier '%c' has nothing to repeat", c);
+        rx_fail(p, m); return rx_new(RX_SEQ);
+    }
+    if (c == '{') {
+        rx_fail(p, "'{' has nothing to repeat (write '\\{' for a literal brace)");
+        return rx_new(RX_SEQ);
+    }
+    if (c == '^') { p->i++; return rx_new(RX_START); }
+    if (c == '$') { p->i++; return rx_new(RX_END); }
+    if (c == '.') { p->i++; return rx_new(RX_DOT); }
+    if (c == '(') {
+        p->i++;
+        if (p->i < p->n && p->pat[p->i] == '?') {
+            rx_fail(p, "'(.....)' groups are not supported in v1 (use plain '(...)' groups)");
+            return rx_new(RX_SEQ);
+        }
+        p->ngroups++;
+        int idx = p->ngroups;
+        RxNode *inner = rx_parse_alt(p);
+        if (p->i >= p->n || p->pat[p->i] != ')') {
+            rx_fail(p, "unclosed '('"); return inner;
+        }
+        p->i++;
+        RxNode *nd = rx_new(RX_GROUP);
+        nd->gidx = idx; nd->child = inner;
+        return nd;
+    }
+    if (c == '[') return rx_parse_class(p);
+    if (c == '\\') {
+        p->i++;
+        if (p->i >= p->n) { rx_fail(p, "pattern ends with '\\'"); return rx_new(RX_SEQ); }
+        char e = p->pat[p->i++];
+        const char *hint = NULL;
+        uint32_t lit = 0;
+        int ok = 1;
+        switch (e) {
+        case 'n': lit = '\n'; break; case 't': lit = '\t'; break;
+        case '\\': lit = '\\'; break; case '.': lit = '.'; break;
+        case '*': lit = '*'; break; case '+': lit = '+'; break;
+        case '?': lit = '?'; break; case '(': lit = '('; break;
+        case ')': lit = ')'; break; case '[': lit = '['; break;
+        case ']': lit = ']'; break; case '{': lit = '{'; break;
+        case '}': lit = '}'; break; case '|': lit = '|'; break;
+        case '^': lit = '^'; break; case '$': lit = '$'; break;
+        case 'd': hint = "[0-9]"; ok = 0; break;
+        case 'w': hint = "[A-Za-z0-9_]"; ok = 0; break;
+        case 's': hint = "[ \\t\\n\\r]"; ok = 0; break;
+        default: ok = 0; break;
+        }
+        if (!ok) {
+            char m[128];
+            if (hint) snprintf(m, sizeof(m), "unsupported escape '\\%c' -- use %s instead", e, hint);
+            else snprintf(m, sizeof(m), "unsupported escape '\\%c'", e);
+            rx_fail(p, m);
+            return rx_new(RX_SEQ);
+        }
+        RxNode *nd = rx_new(RX_LIT);
+        nd->ch = lit;
+        return nd;
+    }
+    if (c == '|') { rx_fail(p, "empty branch in alternation"); return rx_new(RX_SEQ); }
+    if (c == ')') { rx_fail(p, "unmatched ')'"); return rx_new(RX_SEQ); }
+    /* literal (may be a UTF-8 multibyte char) */
+    const unsigned char *up = (const unsigned char *)p->pat + p->i;
+    uint32_t cp = utf8_decode_one(&up);
+    p->i = (size_t)(up - (const unsigned char *)p->pat);
+    RxNode *nd = rx_new(RX_LIT);
+    nd->ch = cp;
+    return nd;
+}
+
+static RxNode *rx_parse_quantified(RxParser *p) {
+    RxNode *atom = rx_parse_atom(p);
+    if (p->failed) return atom;
+    if (p->i >= p->n) return atom;
+    char c = p->pat[p->i];
+    if (c == '*' || c == '+' || c == '?') {
+        p->i++;
+        RxNode *nd = rx_new(RX_QUANT);
+        nd->child = atom;
+        if (c == '*') { nd->qmin = 0; nd->qmax = -1; }
+        else if (c == '+') { nd->qmin = 1; nd->qmax = -1; }
+        else { nd->qmin = 0; nd->qmax = 1; }
+        return nd;
+    }
+    if (c == '{') {
+        size_t j = p->i + 1, k = j;
+        while (k < p->n && p->pat[k] >= '0' && p->pat[k] <= '9') k++;
+        if (k == j) {
+            rx_fail(p, "expected a number after '{' (write '\\{' for a literal brace)");
+            return atom;
+        }
+        int lo = atoi(p->pat + j);
+        int hi = lo;
+        if (k < p->n && p->pat[k] == ',') {
+            k++;
+            size_t j2 = k;
+            while (k < p->n && p->pat[k] >= '0' && p->pat[k] <= '9') k++;
+            hi = (k > j2) ? atoi(p->pat + j2) : -1;
+        }
+        if (k >= p->n || p->pat[k] != '}') {
+            rx_fail(p, "expected '}' to close '{m,n}'"); return atom;
+        }
+        if (hi >= 0 && hi < lo) {
+            char m[64]; snprintf(m, sizeof(m), "{%d,%d}: max < min", lo, hi);
+            rx_fail(p, m); return atom;
+        }
+        p->i = k + 1;
+        RxNode *nd = rx_new(RX_QUANT);
+        nd->child = atom; nd->qmin = lo; nd->qmax = hi;
+        return nd;
+    }
+    return atom;
+}
+
+static RxNode *rx_parse_seq(RxParser *p) {
+    int cap = 8, nk = 0;
+    RxNode **kids = (RxNode **)misa_alloc(cap * sizeof(RxNode *));
+    while (p->i < p->n && p->pat[p->i] != '|' && p->pat[p->i] != ')') {
+        if (nk == cap) {
+            cap *= 2;
+            RxNode **nk2 = (RxNode **)misa_alloc(cap * sizeof(RxNode *));
+            memcpy(nk2, kids, nk * sizeof(RxNode *));
+            kids = nk2;
+        }
+        kids[nk++] = rx_parse_quantified(p);
+        if (p->failed) break;
+    }
+    if (nk == 1) {
+        RxNode *one = kids[0];
+        return one;
+    }
+    RxNode *nd = rx_new(RX_SEQ);
+    nd->kids = kids; nd->nk = nk;
+    return nd;
+}
+
+static RxNode *rx_parse_alt(RxParser *p) {
+    RxNode *left = rx_parse_seq(p);
+    if (p->failed) return left;
+    if (p->i < p->n && p->pat[p->i] == '|') {
+        p->i++;
+        RxNode *right = rx_parse_alt(p);
+        RxNode *nd = rx_new(RX_ALT);
+        nd->left = left; nd->right = right;
+        return nd;
+    }
+    return left;
+}
+
+/* Compile; returns NULL + message in `err` on failure. */
+static MisaRx *rx_compile(const char *pat, size_t len, char *err, size_t errn) {
+    RxParser p;
+    char *buf = (char *)misa_alloc(len + 1);
+    memcpy(buf, pat, len);
+    buf[len] = '\0';
+    p.pat = buf; p.n = len; p.i = 0; p.ngroups = 0;
+    p.failed = 0;
+    RxNode *root = rx_parse_alt(&p);
+    if (!p.failed && p.i != p.n) {
+        snprintf(p.err, sizeof(p.err), "unexpected '%c' (at index %zu)",
+                 p.pat[p.i], p.i);
+        p.failed = 1;
+    }
+    if (p.failed) {
+        snprintf(err, errn, "%s", p.err);
+        return NULL;
+    }
+    MisaRx *rx = (MisaRx *)misa_alloc(sizeof(MisaRx));
+    rx->root = root;
+    rx->ngroups = p.ngroups;
+    rx->pattern = buf;
+    return rx;
+}
+
+/* -- regex matching (backtracking; mirrors regexp.py) --------------- */
+
+typedef struct {
+    const uint32_t *text;
+    int n;
+    int *caps;      /* 2*(ngroups+1): start,end; -1 = unset */
+    int ngroups;
+} RxState;
+
+/* -- regex matching: continuation-passing backtracker (PCRE) ----
+ * `rx_match_node(nd, s, pos, k)` tries every way `nd` can match at
+ * `pos`, calling `k(pos)` for each end position; `k` returns >= 0 on
+ * success or -1 to keep backtracking. Mirrors regexp.py. */
+
+static int *rx_snap(RxState *s) {
+    int *snap = (int *)misa_alloc(2 * (s->ngroups + 1) * sizeof(int));
+    memcpy(snap, s->caps, 2 * (s->ngroups + 1) * sizeof(int));
+    return snap;
+}
+
+static void rx_restore(RxState *s, int *snap) {
+    memcpy(s->caps, snap, 2 * (s->ngroups + 1) * sizeof(int));
+}
+
+typedef int (*RxKFn)(RxState *s, int pos, void *ctx);
+typedef struct { RxKFn fn; void *ctx; } RxK;
+
+static int rx_match_node(RxNode *nd, RxState *s, int pos, RxK k);
+
+/* Sequence chaining frame. */
+typedef struct {
+    RxNode **nodes;
+    int nn, idx;
+    RxK next;
+} RxSeqFrame;
+
+static int rx_k_seq(RxState *s, int pos, void *ctx) {
+    RxSeqFrame *f = (RxSeqFrame *)ctx;
+    if (f->idx >= f->nn)
+        return f->next.fn(s, pos, f->next.ctx);
+    RxSeqFrame *rest = (RxSeqFrame *)misa_alloc(sizeof(RxSeqFrame));
+    rest->nodes = f->nodes;
+    rest->nn = f->nn;
+    rest->idx = f->idx + 1;
+    rest->next = f->next;
+    RxK k = { rx_k_seq, rest };
+    return rx_match_node(f->nodes[f->idx], s, pos, k);
+}
+
+static int rx_match_seq(RxNode **nodes, int nn, RxState *s, int pos,
+                        RxK k) {
+    RxSeqFrame *f = (RxSeqFrame *)misa_alloc(sizeof(RxSeqFrame));
+    f->nodes = nodes; f->nn = nn; f->idx = 0; f->next = k;
+    return rx_k_seq(s, pos, f);
+}
+
+/* Group capture frame. */
+typedef struct {
+    RxK k;
+    int idx;
+    int old0, old1;
+} RxGroupFrame;
+
+static int rx_k_group_done(RxState *s, int pos, void *ctx) {
+    RxGroupFrame *f = (RxGroupFrame *)ctx;
+    s->caps[f->idx * 2 + 1] = pos;
+    int r = f->k.fn(s, pos, f->k.ctx);
+    if (r < 0) {
+        s->caps[f->idx * 2] = f->old0;
+        s->caps[f->idx * 2 + 1] = f->old1;
+    }
+    return r;
+}
+
+/* Quantifier frames. */
+typedef struct {
+    RxNode *child;
+    int lo, hi, count;
+    RxK k;
+} RxQuantFrame;
+
+typedef struct {
+    RxQuantFrame *qf;
+    int prev_pos;
+} RxProgressFrame;
+
+static int rx_quant_rec(RxState *s, int pos, void *ctx);
+
+static int rx_k_progress(RxState *s, int pos, void *ctx) {
+    RxProgressFrame *f = (RxProgressFrame *)ctx;
+    if (pos == f->prev_pos) return -1; /* no progress: stop extending */
+    return rx_quant_rec(s, pos, f->qf);
+}
+
+static int rx_quant_rec(RxState *s, int pos, void *ctx) {
+    RxQuantFrame *f = (RxQuantFrame *)ctx;
+    /* Greedy: try to extend the run first, then stop. */
+    if (f->hi < 0 || f->count < f->hi) {
+        int *saved = rx_snap(s);
+        RxQuantFrame *next =
+            (RxQuantFrame *)misa_alloc(sizeof(RxQuantFrame));
+        *next = *f;
+        next->count++;
+        RxProgressFrame *pf =
+            (RxProgressFrame *)misa_alloc(sizeof(RxProgressFrame));
+        pf->qf = next;
+        pf->prev_pos = pos;
+        RxK k = { rx_k_progress, pf };
+        int r = rx_match_node(f->child, s, pos, k);
+        if (r >= 0) return r;
+        rx_restore(s, saved);
+    }
+    if (f->count >= f->lo)
+        return f->k.fn(s, pos, f->k.ctx);
+    return -1;
+}
+
+static int rx_match_node(RxNode *nd, RxState *s, int pos, RxK k) {
+    int n = s->n;
+    switch (nd->kind) {
+    case RX_LIT:
+        if (pos < n && s->text[pos] == nd->ch)
+            return k.fn(s, pos + 1, k.ctx);
+        return -1;
+    case RX_DOT:
+        if (pos < n && s->text[pos] != '\n')
+            return k.fn(s, pos + 1, k.ctx);
+        return -1;
+    case RX_CLASS: {
+        if (pos < n) {
+            uint32_t cp = s->text[pos];
+            int hit = 0;
+            for (int i = 0; i < nd->nr; i++)
+                if (nd->ranges[i * 2] <= cp &&
+                    cp <= nd->ranges[i * 2 + 1]) { hit = 1; break; }
+            if (hit != nd->neg)
+                return k.fn(s, pos + 1, k.ctx);
+        }
+        return -1;
+    }
+    case RX_START:
+        return pos == 0 ? k.fn(s, pos, k.ctx) : -1;
+    case RX_END:
+        return pos == n ? k.fn(s, pos, k.ctx) : -1;
+    case RX_SEQ:
+        return rx_match_seq(nd->kids, nd->nk, s, pos, k);
+    case RX_GROUP: {
+        int idx = nd->gidx;
+        RxGroupFrame *f =
+            (RxGroupFrame *)misa_alloc(sizeof(RxGroupFrame));
+        f->k = k;
+        f->idx = idx;
+        f->old0 = s->caps[idx * 2];
+        f->old1 = s->caps[idx * 2 + 1];
+        s->caps[idx * 2] = pos;
+        RxK kd = { rx_k_group_done, f };
+        int r = rx_match_node(nd->child, s, pos, kd);
+        if (r < 0) {
+            s->caps[idx * 2] = -1;
+            s->caps[idx * 2 + 1] = -1;
+        }
+        return r;
+    }
+    case RX_ALT: {
+        int *saved = rx_snap(s);
+        int r = rx_match_node(nd->left, s, pos, k);
+        if (r >= 0) return r;
+        rx_restore(s, saved);
+        return rx_match_node(nd->right, s, pos, k);
+    }
+    case RX_QUANT: {
+        RxQuantFrame *f =
+            (RxQuantFrame *)misa_alloc(sizeof(RxQuantFrame));
+        f->child = nd->child;
+        f->lo = nd->qmin;
+        f->hi = nd->qmax;
+        f->count = 0;
+        f->k = k;
+        return rx_quant_rec(s, pos, f);
+    }
+    default:
+        return -1;
+    }
+}
+
+static int rx_k_done(RxState *s, int pos, void *ctx) {
+    (void)s; (void)ctx;
+    return pos;
+}
+
+/* -- regex public API ---------------------------------------------- */
+
+static MisaRx *as_rx(MVal *v, int line, int col, const char *what) {
+    if (v->tag != M_TAG_REGEX) {
+        misa_raise("E300", "regex function needs a Regex value", line, col);
+        return NULL;
+    }
+    (void)what;
+    return (MisaRx *)v->u.regex.rx;
+}
+
+static const char *as_text(MVal *v, int line, int col, const char *what) {
+    if (v->tag != M_TAG_TEXT) {
+        misa_raise("E300", what, line, col);
+        return NULL;
+    }
+    return v->u.text.data;
+}
+
+MVal *misa_regex_new(MVal *pat, int line, int col) {
+    const char *p = as_text(pat, line, col, "regex(Text) needs text");
+    if (!p) return NULL;
+    char err[192];
+    MisaRx *rx = rx_compile(p, pat->u.text.len, err, sizeof(err));
+    if (!rx) {
+        misa_raise("E300", err, line, col);
+        return NULL;
+    }
+    MVal *v = val_new(M_TAG_REGEX);
+    v->u.regex.rx = rx;
+    v->u.regex.pattern = rx->pattern;
+    return v;
+}
+
+/* Search for the first match at/after `start` (code-point index).
+ * Returns 1 + sets *ms,*me,*caps; 0 when no match. */
+static int rx_search(MisaRx *rx, Decoded *d, int start,
+                     int *ms, int *me, int *caps) {
+    RxState s;
+    s.text = d->cps; s.n = (int)d->n; s.ngroups = rx->ngroups;
+    int ncaps = 2 * (rx->ngroups + 1);
+    RxK kdone = { rx_k_done, NULL };
+    for (int pos = start; pos <= (int)d->n; pos++) {
+        for (int i = 0; i < ncaps; i++) caps[i] = -1;
+        s.caps = caps;
+        int q = rx_match_node(rx->root, &s, pos, kdone);
+        if (q >= 0) { *ms = pos; *me = q; return 1; }
+    }
+    return 0;
+}
+
+/* Build a Text from code-point range [s, e) using byte offsets. */
+static MVal *rx_text_range(Decoded *d, const char *data, int s, int e) {
+    return misa_text(data + d->offs[s], d->offs[e] - d->offs[s]);
+}
+
+MVal *misa_regex_matches(MVal *rxv, MVal *text, int line, int col) {
+    MisaRx *rx = as_rx(rxv, line, col, "regex.matches");
+    const char *t = as_text(text, line, col, "regex.matches needs text");
+    if (!rx || !t) return NULL;
+    Decoded d = decode_text(t, text->u.text.len);
+    int ncaps = 2 * (rx->ngroups + 1);
+    int *caps = (int *)misa_alloc(ncaps * sizeof(int));
+    for (int i = 0; i < ncaps; i++) caps[i] = -1;
+    RxState s = { d.cps, (int)d.n, caps, rx->ngroups };
+    /* An implicit end-anchor INSIDE the match so backtracking
+     * (alternations, quantifiers) respects the full-match. */
+    RxNode end_node;
+    memset(&end_node, 0, sizeof(end_node));
+    end_node.kind = RX_END;
+    RxNode *nodes[2] = { rx->root, &end_node };
+    RxNode seq_wrap;
+    memset(&seq_wrap, 0, sizeof(seq_wrap));
+    seq_wrap.kind = RX_SEQ;
+    seq_wrap.kids = nodes;
+    seq_wrap.nk = 2;
+    RxK kdone = { rx_k_done, NULL };
+    int q = rx_match_node(&seq_wrap, &s, 0, kdone);
+    return misa_bool(q >= 0);
+}
+
+MVal *misa_regex_find(MVal *rxv, MVal *text, int line, int col) {
+    MisaRx *rx = as_rx(rxv, line, col, "regex.find");
+    const char *t = as_text(text, line, col, "regex.find needs text");
+    if (!rx || !t) return NULL;
+    Decoded d = decode_text(t, text->u.text.len);
+    int ncaps = 2 * (rx->ngroups + 1);
+    int *caps = (int *)misa_alloc(ncaps * sizeof(int));
+    int ms, me;
+    if (!rx_search(rx, &d, 0, &ms, &me, caps)) return misa_null();
+    return rx_text_range(&d, t, ms, me);
+}
+
+MVal *misa_regex_find_all(MVal *rxv, MVal *text, int line, int col) {
+    MisaRx *rx = as_rx(rxv, line, col, "regex.find_all");
+    const char *t = as_text(text, line, col, "regex.find_all needs text");
+    if (!rx || !t) return NULL;
+    Decoded d = decode_text(t, text->u.text.len);
+    int ncaps = 2 * (rx->ngroups + 1);
+    int *caps = (int *)misa_alloc(ncaps * sizeof(int));
+    MVal *out = misa_list_new();
+    int pos = 0, ms, me;
+    while (pos <= (int)d.n) {
+        if (!rx_search(rx, &d, pos, &ms, &me, caps)) break;
+        misa_list_push(out, rx_text_range(&d, t, ms, me));
+        pos = (me > ms) ? me : ms + 1;
+    }
+    return out;
+}
+
+MVal *misa_regex_captures(MVal *rxv, MVal *text, int line, int col) {
+    MisaRx *rx = as_rx(rxv, line, col, "regex.captures");
+    const char *t = as_text(text, line, col, "regex.captures needs text");
+    if (!rx || !t) return NULL;
+    Decoded d = decode_text(t, text->u.text.len);
+    int ncaps = 2 * (rx->ngroups + 1);
+    int *caps = (int *)misa_alloc(ncaps * sizeof(int));
+    int ms, me;
+    if (!rx_search(rx, &d, 0, &ms, &me, caps)) return misa_null();
+    MVal *out = misa_list_new();
+    for (int g = 1; g <= rx->ngroups; g++) {
+        int a = caps[g * 2], b = caps[g * 2 + 1];
+        misa_list_push(out, (a >= 0)
+                       ? rx_text_range(&d, t, a, b) : misa_text("", 0));
+    }
+    return out;
+}
+
+/* Expand `$1`..`$9` / `$$` in a replacement template. */
+static MVal *rx_expand(MisaRx *rx, const char *repl, size_t rlen,
+                       Decoded *d, const char *t, int *caps) {
+    /* Build into a byte buffer. */
+    size_t cap = rlen + 64, len = 0;
+    char *buf = (char *)misa_alloc(cap);
+    size_t i = 0;
+    while (i < rlen) {
+        if (repl[i] == '$' && i + 1 < rlen) {
+            char c2 = repl[i + 1];
+            if (c2 == '$') {
+                if (len + 1 >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+                buf[len++] = '$'; i += 2; continue;
+            }
+            if (c2 >= '1' && c2 <= '9') {
+                int g = c2 - '0';
+                if (g <= rx->ngroups) {
+                    int a = caps[g * 2], b = caps[g * 2 + 1];
+                    if (a >= 0) {
+                        size_t bl = d->offs[b] - d->offs[a];
+                        while (len + bl >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+                        memcpy(buf + len, t + d->offs[a], bl);
+                        len += bl;
+                    }
+                }
+                i += 2; continue;
+            }
+        }
+        if (len + 1 >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+        buf[len++] = repl[i++];
+    }
+    return misa_text(buf, len);
+}
+
+MVal *misa_regex_replace(MVal *rxv, MVal *text, MVal *replv,
+                         int line, int col) {
+    MisaRx *rx = as_rx(rxv, line, col, "regex.replace");
+    const char *t = as_text(text, line, col, "regex.replace needs text");
+    if (!rx || !t) return NULL;
+    if (replv->tag != M_TAG_TEXT) {
+        misa_raise("E300", "regex.replace(Regex, Text, Text) needs text",
+                   line, col);
+        return NULL;
+    }
+    const char *rp = replv->u.text.data;
+    Decoded d = decode_text(t, text->u.text.len);
+    int ncaps = 2 * (rx->ngroups + 1);
+    int *caps = (int *)misa_alloc(ncaps * sizeof(int));
+    size_t cap = text->u.text.len + 64, len = 0;
+    char *buf = (char *)misa_alloc(cap);
+    int pos = 0, last = 0, ms, me;
+    while (pos <= (int)d.n) {
+        if (!rx_search(rx, &d, pos, &ms, &me, caps)) break;
+        /* copy text[last:ms] */
+        size_t bl = d.offs[ms] - d.offs[last];
+        while (len + bl >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+        memcpy(buf + len, t + d.offs[last], bl);
+        len += bl;
+        /* expand replacement */
+        MVal *exp = rx_expand(rx, rp, replv->u.text.len, &d, t, caps);
+        bl = exp->u.text.len;
+        while (len + bl >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+        memcpy(buf + len, exp->u.text.data, bl);
+        len += bl;
+        last = me;
+        pos = (me > ms) ? me : ms + 1;
+    }
+    size_t tail = d.offs[d.n] - d.offs[last];
+    while (len + tail >= cap) { cap *= 2; char *nb = (char *)misa_alloc(cap); memcpy(nb, buf, len); buf = nb; }
+    memcpy(buf + len, t + d.offs[last], tail);
+    len += tail;
+    return misa_text(buf, len);
+}
+
+/* -- crypto: self-contained hashes (no OpenSSL dependency) ---------- */
+
+static uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+/* SHA-256 (FIPS 180-4). */
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t bl; } Sha256;
+static const uint32_t SHA256_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+static void sha256_init(Sha256 *c) {
+    c->h[0]=0x6a09e667;c->h[1]=0xbb67ae85;c->h[2]=0x3c6ef372;c->h[3]=0xa54ff53a;
+    c->h[4]=0x510e527f;c->h[5]=0x9b05688c;c->h[6]=0x1f83d9ab;c->h[7]=0x5be0cd19;
+    c->len=0; c->bl=0;
+}
+static void sha256_block(Sha256 *c, const uint8_t *p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|
+               ((uint32_t)p[i*4+2]<<8)|(uint32_t)p[i*4+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = rotr32(w[i-15],7)^rotr32(w[i-15],18)^(w[i-15]>>3);
+        uint32_t s1 = rotr32(w[i-2],17)^rotr32(w[i-2],19)^(w[i-2]>>10);
+        w[i] = w[i-16]+s0+w[i-7]+s1;
+    }
+    uint32_t a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3],
+             e=c->h[4],f=c->h[5],g=c->h[6],h=c->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1=rotr32(e,6)^rotr32(e,11)^rotr32(e,25);
+        uint32_t ch=(e&f)^(~e&g);
+        uint32_t t1=h+S1+ch+SHA256_K[i]+w[i];
+        uint32_t S0=rotr32(a,2)^rotr32(a,13)^rotr32(a,22);
+        uint32_t mj=(a&b)^(a&cc)^(b&cc);
+        uint32_t t2=S0+mj;
+        h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;
+    c->h[4]+=e;c->h[5]+=f;c->h[6]+=g;c->h[7]+=h;
+}
+static void sha256_update(Sha256 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    while (n) {
+        size_t t = 64 - c->bl;
+        if (t > n) t = n;
+        memcpy(c->buf + c->bl, d, t);
+        c->bl += t; d += t; n -= t;
+        if (c->bl == 64) { sha256_block(c, c->buf); c->bl = 0; }
+    }
+}
+static void sha256_final(Sha256 *c, uint8_t out[32]) {
+    uint64_t bitlen = c->len * 8;
+    uint8_t pad = 0x80;
+    sha256_update(c, &pad, 1);
+    uint8_t zero = 0;
+    while (c->bl != 56) sha256_update(c, &zero, 1);
+    uint8_t lb[8];
+    for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bitlen >> (56 - 8*i));
+    sha256_update(c, lb, 8);
+    for (int i = 0; i < 8; i++) {
+        out[i*4]=(uint8_t)(c->h[i]>>24); out[i*4+1]=(uint8_t)(c->h[i]>>16);
+        out[i*4+2]=(uint8_t)(c->h[i]>>8); out[i*4+3]=(uint8_t)c->h[i];
+    }
+}
+
+/* SHA-1 (FIPS 180-4). */
+typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t bl; } Sha1;
+static void sha1_init(Sha1 *c) {
+    c->h[0]=0x67452301;c->h[1]=0xefcdab89;c->h[2]=0x98badcfe;
+    c->h[3]=0x10325476;c->h[4]=0xc3d2e1f0;c->len=0;c->bl=0;
+}
+static void sha1_block(Sha1 *c, const uint8_t *p) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|
+               ((uint32_t)p[i*4+2]<<8)|(uint32_t)p[i*4+3];
+    for (int i = 16; i < 80; i++)
+        w[i] = rotl32(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1);
+    uint32_t a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3],e=c->h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) { f=(b&cc)|(~b&d); k=0x5a827999; }
+        else if (i < 40) { f=b^cc^d; k=0x6ed9eba1; }
+        else if (i < 60) { f=(b&cc)|(b&d)|(cc&d); k=0x8f1bbcdc; }
+        else { f=b^cc^d; k=0xca62c1d6; }
+        uint32_t t = ((a<<5)|(a>>27)) + f + e + k + w[i];
+        e=d; d=cc; cc=(b<<30)|(b>>2); b=a; a=t;
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;c->h[4]+=e;
+}
+static void sha1_update(Sha1 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    while (n) {
+        size_t t = 64 - c->bl; if (t > n) t = n;
+        memcpy(c->buf + c->bl, d, t);
+        c->bl += t; d += t; n -= t;
+        if (c->bl == 64) { sha1_block(c, c->buf); c->bl = 0; }
+    }
+}
+static void sha1_final(Sha1 *c, uint8_t out[20]) {
+    uint64_t bitlen = c->len * 8;
+    uint8_t pad = 0x80, zero = 0;
+    sha1_update(c, &pad, 1);
+    while (c->bl != 56) sha1_update(c, &zero, 1);
+    uint8_t lb[8];
+    for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bitlen >> (56 - 8*i));
+    sha1_update(c, lb, 8);
+    for (int i = 0; i < 5; i++) {
+        out[i*4]=(uint8_t)(c->h[i]>>24); out[i*4+1]=(uint8_t)(c->h[i]>>16);
+        out[i*4+2]=(uint8_t)(c->h[i]>>8); out[i*4+3]=(uint8_t)c->h[i];
+    }
+}
+
+/* MD5 (RFC 1321). */
+typedef struct { uint32_t h[4]; uint64_t len; uint8_t buf[64]; size_t bl; } Md5;
+static const uint32_t MD5_S[64] = {
+    7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+    5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+    4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+    6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21
+};
+static const uint32_t MD5_T[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+};
+static void md5_init(Md5 *c) {
+    c->h[0]=0x67452301;c->h[1]=0xefcdab89;c->h[2]=0x98badcfe;c->h[3]=0x10325476;
+    c->len=0;c->bl=0;
+}
+static void md5_block(Md5 *c, const uint8_t *p) {
+    uint32_t w[16];
+    for (int i = 0; i < 16; i++)
+        w[i] = (uint32_t)p[i*4]|((uint32_t)p[i*4+1]<<8)|
+               ((uint32_t)p[i*4+2]<<16)|((uint32_t)p[i*4+3]<<24);
+    uint32_t a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3];
+    for (int i = 0; i < 64; i++) {
+        uint32_t f; int g;
+        if (i < 16) { f=(b&cc)|(~b&d); g=i; }
+        else if (i < 32) { f=(d&b)|(~d&cc); g=(5*i+1)%16; }
+        else if (i < 48) { f=b^cc^d; g=(3*i+5)%16; }
+        else { f=cc^(b|~d); g=(7*i)%16; }
+        f = f + a + MD5_T[i] + w[g];
+        a = d; d = cc; cc = b;
+        b = b + (((f << MD5_S[i]) | (f >> (32 - MD5_S[i]))));
+    }
+    c->h[0]+=a;c->h[1]+=b;c->h[2]+=cc;c->h[3]+=d;
+}
+static void md5_update(Md5 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    while (n) {
+        size_t t = 64 - c->bl; if (t > n) t = n;
+        memcpy(c->buf + c->bl, d, t);
+        c->bl += t; d += t; n -= t;
+        if (c->bl == 64) { md5_block(c, c->buf); c->bl = 0; }
+    }
+}
+static void md5_final(Md5 *c, uint8_t out[16]) {
+    uint64_t bitlen = c->len * 8;
+    uint8_t pad = 0x80, zero = 0;
+    md5_update(c, &pad, 1);
+    while (c->bl != 56) md5_update(c, &zero, 1);
+    uint8_t lb[8];
+    for (int i = 0; i < 8; i++) lb[i] = (uint8_t)(bitlen >> (8*i));
+    md5_update(c, lb, 8);
+    for (int i = 0; i < 4; i++) {
+        out[i*4]=(uint8_t)c->h[i]; out[i*4+1]=(uint8_t)(c->h[i]>>8);
+        out[i*4+2]=(uint8_t)(c->h[i]>>16); out[i*4+3]=(uint8_t)(c->h[i]>>24);
+    }
+}
+
+static MVal *hex_of(const uint8_t *digest, size_t n) {
+    static const char *H = "0123456789abcdef";
+    char *buf = (char *)misa_alloc(n * 2 + 1);
+    for (size_t i = 0; i < n; i++) {
+        buf[i*2] = H[digest[i] >> 4];
+        buf[i*2+1] = H[digest[i] & 15];
+    }
+    buf[n*2] = '\0';
+    MVal *v = misa_text(buf, n * 2);
+    return v;
+}
+
+MVal *misa_crypto_sha256(MVal *data, int line, int col) {
+    const char *t = as_text(data, line, col, "crypto.sha256(Text) needs text");
+    if (!t) return NULL;
+    Sha256 c; sha256_init(&c);
+    sha256_update(&c, (const uint8_t *)t, data->u.text.len);
+    uint8_t out[32]; sha256_final(&c, out);
+    return hex_of(out, 32);
+}
+
+MVal *misa_crypto_sha1(MVal *data, int line, int col) {
+    const char *t = as_text(data, line, col, "crypto.sha1(Text) needs text");
+    if (!t) return NULL;
+    Sha1 c; sha1_init(&c);
+    sha1_update(&c, (const uint8_t *)t, data->u.text.len);
+    uint8_t out[20]; sha1_final(&c, out);
+    return hex_of(out, 20);
+}
+
+MVal *misa_crypto_md5(MVal *data, int line, int col) {
+    const char *t = as_text(data, line, col, "crypto.md5(Text) needs text");
+    if (!t) return NULL;
+    Md5 c; md5_init(&c);
+    md5_update(&c, (const uint8_t *)t, data->u.text.len);
+    uint8_t out[16]; md5_final(&c, out);
+    return hex_of(out, 16);
+}
+
+MVal *misa_crypto_hmac_sha256(MVal *key, MVal *msg, int line, int col) {
+    const char *k = as_text(key, line, col, "crypto.hmac_sha256 needs text");
+    const char *m = as_text(msg, line, col, "crypto.hmac_sha256 needs text");
+    if (!k || !m) return NULL;
+    uint8_t kbuf[64];
+    memset(kbuf, 0, 64);
+    if (key->u.text.len > 64) {
+        Sha256 c; sha256_init(&c);
+        sha256_update(&c, (const uint8_t *)k, key->u.text.len);
+        sha256_final(&c, kbuf);
+    } else {
+        memcpy(kbuf, k, key->u.text.len);
+    }
+    uint8_t ipad[64], opad[64];
+    for (int i = 0; i < 64; i++) {
+        ipad[i] = kbuf[i] ^ 0x36;
+        opad[i] = kbuf[i] ^ 0x5c;
+    }
+    Sha256 inner; sha256_init(&inner);
+    sha256_update(&inner, ipad, 64);
+    sha256_update(&inner, (const uint8_t *)m, msg->u.text.len);
+    uint8_t ih[32]; sha256_final(&inner, ih);
+    Sha256 outer; sha256_init(&outer);
+    sha256_update(&outer, opad, 64);
+    sha256_update(&outer, ih, 32);
+    uint8_t out[32]; sha256_final(&outer, out);
+    return hex_of(out, 32);
+}
+
+/* -- random: splitmix64 -------------------------------------------- */
+/* `random.seed` gives determinism *within* a backend (same backend +
+ * same seed = same sequence); cross-backend determinism with the
+ * interpreter's Mersenne Twister is NOT guaranteed (documented). */
+
+static uint64_t rng_state = 0x9e3779b97f4a7c15ULL;
+
+static uint64_t splitmix64(void) {
+    uint64_t z = (rng_state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+MVal *misa_random_seed(MVal *n, int line, int col) {
+    if (n->tag != M_TAG_INT) {
+        misa_raise("E300", "random.seed(Int) needs an int", line, col);
+        return NULL;
+    }
+    rng_state = (uint64_t)n->u.i;
+    return misa_null();
+}
+
+MVal *misa_random_int(MVal *lo, MVal *hi, int line, int col) {
+    if (lo->tag != M_TAG_INT || hi->tag != M_TAG_INT) {
+        misa_raise("E300", "random.int(Int, Int) needs ints", line, col);
+        return NULL;
+    }
+    int64_t a = lo->u.i, b = hi->u.i;
+    if (a > b) {
+        misa_raise_fmt("E300", line, col,
+                       "random.int: min (%lld) > max (%lld)",
+                       (long long)a, (long long)b);
+        return NULL;
+    }
+    uint64_t span = (uint64_t)(b - a) + 1;
+    /* Rejection sampling (avoids modulo bias). */
+    uint64_t limit = (~(uint64_t)0) - ((~(uint64_t)0) % span);
+    uint64_t r;
+    do { r = splitmix64(); } while (r >= limit);
+    return misa_int(a + (int64_t)(r % span));
+}
+
+MVal *misa_random_float(void) {
+    /* [0, 1): 53 bits of randomness, like CPython. */
+    return misa_float((splitmix64() >> 11) * (1.0 / 9007199254740992.0));
+}
+
+MVal *misa_random_choice(MVal *xs, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "random.choice([T]) needs a list", line, col);
+        return NULL;
+    }
+    if (xs->u.list.len == 0) {
+        misa_raise("E300",
+                   "random.choice: cannot choose from an empty list",
+                   line, col);
+        return NULL;
+    }
+    uint64_t r = splitmix64();
+    return xs->u.list.items[r % (uint64_t)xs->u.list.len];
+}
+
+MVal *misa_random_shuffle(MVal *xs, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "random.shuffle([T]) needs a list", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < xs->u.list.len; i++)
+        misa_list_push(out, xs->u.list.items[i]);
+    /* Fisher-Yates. */
+    for (int64_t i = out->u.list.len - 1; i > 0; i--) {
+        uint64_t r = splitmix64();
+        int64_t j = (int64_t)(r % (uint64_t)(i + 1));
+        MVal *t = out->u.list.items[i];
+        out->u.list.items[i] = out->u.list.items[j];
+        out->u.list.items[j] = t;
+    }
+    return out;
+}
+
+/* -- time additions (offset-based zones; no tz database in v1) ----- */
+
+MVal *misa_time_now_utc(void) {
+    return misa_int((int64_t)time(NULL));
+}
+
+MVal *misa_time_to_utc(MVal *t, int line, int col) {
+    /* Epoch timestamps are always UTC — identity, for clarity. */
+    if (t->tag != M_TAG_INT) {
+        misa_raise("E300", "time.to_utc(Int) needs an int", line, col);
+        return NULL;
+    }
+    return t;
+}
+
+MVal *misa_time_from_parts(MVal *y, MVal *mo, MVal *d, MVal *h,
+                           MVal *mi, MVal *s, int line, int col) {
+    MVal *ps[6] = {y, mo, d, h, mi, s};
+    for (int i = 0; i < 6; i++)
+        if (ps[i]->tag != M_TAG_INT) {
+            misa_raise("E300", "time.from_parts needs int args",
+                       line, col);
+            return NULL;
+        }
+    struct tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = (int)(y->u.i - 1900);
+    tmv.tm_mon = (int)(mo->u.i - 1);
+    tmv.tm_mday = (int)d->u.i;
+    tmv.tm_hour = (int)h->u.i;
+    tmv.tm_min = (int)mi->u.i;
+    tmv.tm_sec = (int)s->u.i;
+    time_t t = timegm(&tmv);
+    if (t == (time_t)-1) {
+        misa_raise("E300", "time.from_parts: invalid date", line, col);
+        return NULL;
+    }
+    /* timegm normalizes out-of-range fields (month 13 -> next year);
+     * round-trip to detect invalid input. */
+    struct tm back;
+    if (gmtime_r(&t, &back) == NULL) {
+        misa_raise("E300", "time.from_parts: invalid date", line, col);
+        return NULL;
+    }
+    if (back.tm_year != tmv.tm_year || back.tm_mon != tmv.tm_mon ||
+        back.tm_mday != tmv.tm_mday || back.tm_hour != tmv.tm_hour ||
+        back.tm_min != tmv.tm_min || back.tm_sec != tmv.tm_sec) {
+        misa_raise("E300", "time.from_parts: invalid date", line, col);
+        return NULL;
+    }
+    return misa_int((int64_t)t);
+}
+
+MVal *misa_time_add(MVal *t, MVal *secs, int line, int col) {
+    if (t->tag != M_TAG_INT || secs->tag != M_TAG_INT) {
+        misa_raise("E300", "time.add(Int, Int) needs ints", line, col);
+        return NULL;
+    }
+    return misa_int(t->u.i + secs->u.i);
+}
+
+MVal *misa_time_add_hours(MVal *t, MVal *h, int line, int col) {
+    if (t->tag != M_TAG_INT || h->tag != M_TAG_INT) {
+        misa_raise("E300", "time.add_hours(Int, Int) needs ints",
+                   line, col);
+        return NULL;
+    }
+    return misa_int(t->u.i + h->u.i * 3600);
+}
+
+MVal *misa_time_in_tz(MVal *t, MVal *off_hours, int line, int col) {
+    if (t->tag != M_TAG_INT ||
+        (off_hours->tag != M_TAG_FLOAT && off_hours->tag != M_TAG_INT)) {
+        misa_raise("E300", "time.in_tz(Int, Float) needs int+float",
+                   line, col);
+        return NULL;
+    }
+    double off = off_hours->tag == M_TAG_FLOAT ? off_hours->u.f
+                                               : (double)off_hours->u.i;
+    /* Shift the epoch so UTC formatting shows wall-clock time at the
+     * given offset (fractional hours supported, e.g. +5.5). */
+    return misa_int(t->u.i + (int64_t)(off * 3600.0));
+}
+
+MVal *misa_time_weekday(MVal *t, int line, int col) {
+    if (t->tag != M_TAG_INT) {
+        misa_raise("E300", "time.weekday(Int) needs an int", line, col);
+        return NULL;
+    }
+    time_t tt = (time_t)t->u.i;
+    struct tm tmv;
+    if (gmtime_r(&tt, &tmv) == NULL) {
+        misa_raise("E300", "time.weekday: bad epoch", line, col);
+        return NULL;
+    }
+    static const char *days[] = {"Sunday", "Monday", "Tuesday",
+                                 "Wednesday", "Thursday", "Friday",
+                                 "Saturday"};
+    return misa_text_cstr(days[tmv.tm_wday]);
+}
+
+MVal *misa_time_is_leap(MVal *y, int line, int col) {
+    if (y->tag != M_TAG_INT) {
+        misa_raise("E300", "time.is_leap(Int) needs an int", line, col);
+        return NULL;
+    }
+    int64_t yr = y->u.i;
+    int leap = (yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0);
+    return misa_bool(leap);
+}
+
+/* -- temp files ---------------------------------------------------- */
+
+MVal *misa_fs_temp_file(int line, int col) {
+    char tmpl[] = "/tmp/misa-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        misa_raise_fmt("E303", line, col, "fs.temp_file failed: %s",
+                       strerror(errno));
+        return NULL;
+    }
+    close(fd);
+    return misa_text_cstr(tmpl);
+}
+
+MVal *misa_fs_temp_dir(int line, int col) {
+    char tmpl[] = "/tmp/misa-XXXXXX";
+    if (mkdtemp(tmpl) == NULL) {
+        misa_raise_fmt("E303", line, col, "fs.temp_dir failed: %s",
+                       strerror(errno));
+        return NULL;
+    }
+    return misa_text_cstr(tmpl);
+}
+
+/* -- Set<T>: insertion-ordered, val_equal membership (v1: O(n)) ----- */
+
+static MVal *set_check(MVal *v, int line, int col, const char *what) {
+    if (v->tag != M_TAG_SET) {
+        misa_raise("E300", what, line, col);
+        return NULL;
+    }
+    return v;
+}
+
+static int set_find(MVal *s, MVal *x) {
+    for (int64_t i = 0; i < s->u.set.len; i++)
+        if (val_equal(s->u.set.items[i], x)) return (int)i;
+    return -1;
+}
+
+static void set_grow(MVal *s) {
+    if (s->u.set.len < s->u.set.cap) return;
+    int64_t ncap = s->u.set.cap ? s->u.set.cap * 2 : 8;
+    MVal **ni = (MVal **)misa_alloc(ncap * sizeof(MVal *));
+    memcpy(ni, s->u.set.items, s->u.set.len * sizeof(MVal *));
+    s->u.set.items = ni;
+    s->u.set.cap = ncap;
+}
+
+MVal *misa_set_new(void) {
+    MVal *v = val_new(M_TAG_SET);
+    v->u.set.items = NULL; v->u.set.len = 0; v->u.set.cap = 0;
+    return v;
+}
+
+void misa_set_add(MVal *s, MVal *x, int line, int col) {
+    if (!set_check(s, line, col, "set.add needs a Set")) return;
+    if (set_find(s, x) < 0) {
+        set_grow(s);
+        s->u.set.items[s->u.set.len++] = x;
+    }
+}
+
+MVal *misa_set_contains(MVal *s, MVal *x, int line, int col) {
+    if (!set_check(s, line, col, "set.contains needs a Set")) return NULL;
+    return misa_bool(set_find(s, x) >= 0);
+}
+
+void misa_set_remove(MVal *s, MVal *x, int line, int col) {
+    if (!set_check(s, line, col, "set.remove needs a Set")) return;
+    int i = set_find(s, x);
+    if (i >= 0) {
+        for (int64_t j = i; j + 1 < s->u.set.len; j++)
+            s->u.set.items[j] = s->u.set.items[j + 1];
+        s->u.set.len--;
+    }
+}
+
+MVal *misa_set_union(MVal *a, MVal *b, int line, int col) {
+    if (!set_check(a, line, col, "set.union needs Sets")) return NULL;
+    if (!set_check(b, line, col, "set.union needs Sets")) return NULL;
+    MVal *out = misa_set_new();
+    for (int64_t i = 0; i < a->u.set.len; i++)
+        misa_set_add(out, a->u.set.items[i], line, col);
+    for (int64_t i = 0; i < b->u.set.len; i++)
+        misa_set_add(out, b->u.set.items[i], line, col);
+    return out;
+}
+
+MVal *misa_set_intersect(MVal *a, MVal *b, int line, int col) {
+    if (!set_check(a, line, col, "set.intersect needs Sets")) return NULL;
+    if (!set_check(b, line, col, "set.intersect needs Sets")) return NULL;
+    MVal *out = misa_set_new();
+    for (int64_t i = 0; i < a->u.set.len; i++)
+        if (set_find(b, a->u.set.items[i]) >= 0)
+            misa_set_add(out, a->u.set.items[i], line, col);
+    return out;
+}
+
+MVal *misa_set_diff(MVal *a, MVal *b, int line, int col) {
+    if (!set_check(a, line, col, "set.diff needs Sets")) return NULL;
+    if (!set_check(b, line, col, "set.diff needs Sets")) return NULL;
+    MVal *out = misa_set_new();
+    for (int64_t i = 0; i < a->u.set.len; i++)
+        if (set_find(b, a->u.set.items[i]) < 0)
+            misa_set_add(out, a->u.set.items[i], line, col);
+    return out;
+}
+
+MVal *misa_set_to_list(MVal *s, int line, int col) {
+    if (!set_check(s, line, col, "set.to_list needs a Set")) return NULL;
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < s->u.set.len; i++)
+        misa_list_push(out, s->u.set.items[i]);
+    return out;
+}
+
+int64_t misa_set_len(MVal *s, int line, int col) {
+    if (!set_check(s, line, col, "set.len needs a Set")) return 0;
+    return s->u.set.len;
+}
+
+/* -- calling a Misa closure value from C ---------------------------- */
+/* Closures are records {__closure_fn: Int(addr), __closure_env}.
+ * The compiled function has signature MVal*(MVal* env, MVal* args). */
+
+static MVal *closure_invoke(MVal *clos, MVal **args, int nargs,
+                            int line, int col) {
+    MVal *fnv = misa_record_get(clos, "__closure_fn", line, col);
+    if (!fnv) return NULL;
+    MVal *env = misa_record_get(clos, "__closure_env", line, col);
+    if (!env) return NULL;
+    MVal *arglist = misa_list_new();
+    for (int i = 0; i < nargs; i++) misa_list_push(arglist, args[i]);
+    MVal *(*fn)(MVal *, MVal *) =
+        (MVal *(*)(MVal *, MVal *))(intptr_t)misa_as_int(fnv);
+    MVal *r = fn(env, arglist);
+    if (misa_pending()) return NULL;
+    return r;
+}
+
+/* Strict Bool check (mirrors the interpreter's `is True`). */
+static int is_true(MVal *v) {
+    return v->tag == M_TAG_BOOL && v->u.b;
+}
+
+MVal *misa_list_map(MVal *xs, MVal *f, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "map needs a list", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *r = closure_invoke(f, &xs->u.list.items[i], 1, line, col);
+        if (!r) return NULL;
+        misa_list_push(out, r);
+    }
+    return out;
+}
+
+MVal *misa_list_filter(MVal *xs, MVal *f, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "filter needs a list", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *r = closure_invoke(f, &xs->u.list.items[i], 1, line, col);
+        if (!r) return NULL;
+        if (is_true(r)) misa_list_push(out, xs->u.list.items[i]);
+    }
+    return out;
+}
+
+MVal *misa_list_fold(MVal *xs, MVal *init, MVal *f, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "fold needs a list", line, col);
+        return NULL;
+    }
+    MVal *acc = init;
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *args[2] = {acc, xs->u.list.items[i]};
+        acc = closure_invoke(f, args, 2, line, col);
+        if (!acc) return NULL;
+    }
+    return acc;
+}
+
+/* Stable mergesort driven by a `less(a, b) -> Bool` comparator. */
+static int sort_less(MVal *f, MVal *a, MVal *b, int line, int col,
+                     int *err) {
+    MVal *args[2] = {a, b};
+    MVal *r = closure_invoke(f, args, 2, line, col);
+    if (!r) { *err = 1; return 0; }
+    return is_true(r);
+}
+
+static void merge_sort(MVal **arr, MVal **tmp, int64_t lo, int64_t hi,
+                       MVal *f, int line, int col, int *err) {
+    if (hi - lo < 2 || *err) return;
+    int64_t mid = lo + (hi - lo) / 2;
+    merge_sort(arr, tmp, lo, mid, f, line, col, err);
+    merge_sort(arr, tmp, mid, hi, f, line, col, err);
+    if (*err) return;
+    int64_t i = lo, j = mid, k = lo;
+    while (i < mid && j < hi) {
+        /* stable: take from the left run when NOT (right < left) */
+        if (sort_less(f, arr[j], arr[i], line, col, err))
+            tmp[k++] = arr[j++];
+        else
+            tmp[k++] = arr[i++];
+        if (*err) return;
+    }
+    while (i < mid) tmp[k++] = arr[i++];
+    while (j < hi) tmp[k++] = arr[j++];
+    for (i = lo; i < hi; i++) arr[i] = tmp[i];
+}
+
+MVal *misa_list_sort_by(MVal *xs, MVal *f, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "sort_by needs a list", line, col);
+        return NULL;
+    }
+    int64_t n = xs->u.list.len;
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < n; i++)
+        misa_list_push(out, xs->u.list.items[i]);
+    if (n > 1) {
+        MVal **tmp = (MVal **)misa_alloc(n * sizeof(MVal *));
+        int err = 0;
+        merge_sort(out->u.list.items, tmp, 0, n, f, line, col, &err);
+        if (err) return NULL;
+    }
+    return out;
+}
+
+MVal *misa_list_flat(MVal *xss, int line, int col) {
+    if (xss->tag != M_TAG_LIST) {
+        misa_raise("E300", "list.flat needs a list", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < xss->u.list.len; i++) {
+        MVal *xs = xss->u.list.items[i];
+        if (xs->tag != M_TAG_LIST) {
+            misa_raise("E300", "list.flat needs a list of lists",
+                       line, col);
+            return NULL;
+        }
+        for (int64_t j = 0; j < xs->u.list.len; j++)
+            misa_list_push(out, xs->u.list.items[j]);
+    }
+    return out;
+}
+
+MVal *misa_list_zip(MVal *xs, MVal *ys, int line, int col) {
+    if (xs->tag != M_TAG_LIST || ys->tag != M_TAG_LIST) {
+        misa_raise("E300", "list.zip needs two lists", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    int64_t n = xs->u.list.len < ys->u.list.len ? xs->u.list.len
+                                                : ys->u.list.len;
+    for (int64_t i = 0; i < n; i++) {
+        MVal *pair = misa_list_new();
+        misa_list_push(pair, xs->u.list.items[i]);
+        misa_list_push(pair, ys->u.list.items[i]);
+        misa_list_push(out, pair);
+    }
+    return out;
+}
+
+MVal *misa_list_unique(MVal *xs, int line, int col) {
+    if (xs->tag != M_TAG_LIST) {
+        misa_raise("E300", "list.unique needs a list", line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *x = xs->u.list.items[i];
+        int seen = 0;
+        for (int64_t j = 0; j < out->u.list.len; j++)
+            if (val_equal(out->u.list.items[j], x)) { seen = 1; break; }
+        if (!seen) misa_list_push(out, x);
+    }
+    return out;
+}
+
+/* -- str extras (Wave 3) -------------------------------------------- */
+
+MVal *misa_str_join(MVal *xs, MVal *sep, int line, int col) {
+    if (xs->tag != M_TAG_LIST || sep->tag != M_TAG_TEXT) {
+        misa_raise("E300", "str.join([Text], Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    size_t total = 0;
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *x = xs->u.list.items[i];
+        if (x->tag != M_TAG_TEXT) {
+            misa_raise("E300", "str.join([Text], Text) needs text args",
+                       line, col);
+            return NULL;
+        }
+        total += x->u.text.len;
+        if (i) total += sep->u.text.len;
+    }
+    char *buf = (char *)misa_alloc(total + 1);
+    size_t off = 0;
+    for (int64_t i = 0; i < xs->u.list.len; i++) {
+        MVal *x = xs->u.list.items[i];
+        if (i) {
+            memcpy(buf + off, sep->u.text.data, sep->u.text.len);
+            off += sep->u.text.len;
+        }
+        memcpy(buf + off, x->u.text.data, x->u.text.len);
+        off += x->u.text.len;
+    }
+    buf[total] = '\0';
+    MVal *v = misa_text(buf, total);
+    return v;
+}
+
+MVal *misa_str_replace(MVal *s, MVal *old, MVal *nw, int line, int col) {
+    if (s->tag != M_TAG_TEXT || old->tag != M_TAG_TEXT ||
+        nw->tag != M_TAG_TEXT) {
+        misa_raise("E300",
+                   "str.replace(Text, Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    if (old->u.text.len == 0) {
+        misa_raise("E300", "str.replace: search string is empty",
+                   line, col);
+        return NULL;
+    }
+    const char *data = s->u.text.data, *sp = old->u.text.data,
+               *rp = nw->u.text.data;
+    size_t len = s->u.text.len, slen = old->u.text.len,
+           rlen = nw->u.text.len;
+    /* Count occurrences to size the buffer. */
+    size_t count = 0;
+    for (size_t k = 0; k + slen <= len; k++) {
+        if (memcmp(data + k, sp, slen) == 0) { count++; k += slen - 1; }
+    }
+    size_t total = len + count * (rlen > slen ? rlen - slen : 0);
+    /* (shrinking still fits: total >= final size) */
+    if (rlen < slen) total = len;
+    char *buf = (char *)misa_alloc(total + 1);
+    size_t off = 0, k = 0;
+    while (k < len) {
+        if (k + slen <= len && memcmp(data + k, sp, slen) == 0) {
+            memcpy(buf + off, rp, rlen);
+            off += rlen; k += slen;
+        } else {
+            buf[off++] = data[k++];
+        }
+    }
+    buf[off] = '\0';
+    return misa_text(buf, off);
+}
+
+MVal *misa_str_to_upper(MVal *s, int line, int col) {
+    const char *t = as_text(s, line, col, "str.to_upper(Text) needs text");
+    if (!t) return NULL;
+    /* v1: ASCII only (documented); full Unicode casefold is future. */
+    size_t len = s->u.text.len;
+    char *buf = (char *)misa_alloc(len + 1);
+    for (size_t i = 0; i < len; i++) {
+        char c = t[i];
+        buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    buf[len] = '\0';
+    return misa_text(buf, len);
+}
+
+MVal *misa_str_to_lower(MVal *s, int line, int col) {
+    const char *t = as_text(s, line, col, "str.to_lower(Text) needs text");
+    if (!t) return NULL;
+    size_t len = s->u.text.len;
+    char *buf = (char *)misa_alloc(len + 1);
+    for (size_t i = 0; i < len; i++) {
+        char c = t[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    buf[len] = '\0';
+    return misa_text(buf, len);
+}
+
+MVal *misa_str_ends_with(MVal *s, MVal *sfx, int line, int col) {
+    if (s->tag != M_TAG_TEXT || sfx->tag != M_TAG_TEXT) {
+        misa_raise("E300",
+                   "str.ends_with(Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    size_t len = s->u.text.len, slen = sfx->u.text.len;
+    if (slen > len) return misa_bool(0);
+    return misa_bool(memcmp(s->u.text.data + len - slen,
+                            sfx->u.text.data, slen) == 0);
+}
+
+/* Pad with the first char of `pad` (code-point aware). */
+static MVal *str_pad(MVal *s, int64_t width, MVal *pad, int left,
+                     int line, int col) {
+    const char *t = as_text(s, line, col, "str.pad needs text");
+    if (!t) return NULL;
+    if (pad->tag != M_TAG_TEXT || pad->u.text.len == 0) {
+        misa_raise("E300", "str.pad: pad string is empty", line, col);
+        return NULL;
+    }
+    Decoded d = decode_text(t, s->u.text.len);
+    if ((int64_t)d.n >= width) return s;
+    /* First code point of pad, as bytes. */
+    const unsigned char *pp = (const unsigned char *)pad->u.text.data;
+    const unsigned char *start = pp;
+    utf8_decode_one(&pp);
+    size_t padlen = (size_t)(pp - start);
+    int64_t need = width - (int64_t)d.n;
+    size_t total = s->u.text.len + (size_t)need * padlen;
+    char *buf = (char *)misa_alloc(total + 1);
+    size_t off = 0;
+    if (left)
+        for (int64_t i = 0; i < need; i++) {
+            memcpy(buf + off, start, padlen); off += padlen;
+        }
+    memcpy(buf + off, t, s->u.text.len);
+    off += s->u.text.len;
+    if (!left)
+        for (int64_t i = 0; i < need; i++) {
+            memcpy(buf + off, start, padlen); off += padlen;
+        }
+    buf[off] = '\0';
+    return misa_text(buf, off);
+}
+
+MVal *misa_str_pad_left(MVal *s, MVal *w, MVal *pad, int line, int col) {
+    if (w->tag != M_TAG_INT) {
+        misa_raise("E300", "str.pad_left(Text, Int, Text) needs int",
+                   line, col);
+        return NULL;
+    }
+    return str_pad(s, w->u.i, pad, 1, line, col);
+}
+
+MVal *misa_str_pad_right(MVal *s, MVal *w, MVal *pad, int line, int col) {
+    if (w->tag != M_TAG_INT) {
+        misa_raise("E300", "str.pad_right(Text, Int, Text) needs int",
+                   line, col);
+        return NULL;
+    }
+    return str_pad(s, w->u.i, pad, 0, line, col);
 }

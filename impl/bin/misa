@@ -4,6 +4,8 @@
 Usage:
   misa run <file.misa> [--mock mocks.json] [--json] [-- args...]
   misa debug [--agent] <file.misa> [--mock mocks.json] [-- args...]
+  misa profile <file.misa> [--json] [--mock mocks.json] [--interval-ms N] [-- args...]
+  misa repl
   misa check <file.misa> [--json]
   misa fmt <file.misa> [--write]
   misa test [path] [--mock mocks.json] [--json]
@@ -131,6 +133,16 @@ def cmd_run(path, mock_path, as_json, prog_argv=None):
 def cmd_debug(path, mock_path, agent, prog_argv=None):
     from misa.debugger import debug_file
     return debug_file(path, mock_path, agent, prog_argv)
+
+
+def cmd_profile(path, mock_path, as_json, interval_ms, prog_argv=None):
+    from misa.profiler import profile_file
+    return profile_file(path, mock_path, as_json, interval_ms, prog_argv)
+
+
+def cmd_repl():
+    from misa.repl import repl_loop
+    return repl_loop()
 
 
 def discover_test_files(path):
@@ -440,6 +452,37 @@ def main(argv):
             die("usage: misa debug [--agent] <file.misa> "
                 "[--mock mocks.json] [-- args...]")
         return cmd_debug(rest[0], mock, agent, prog_argv)
+    if cmd == "profile" and 1 <= len(args) <= 6:
+        if "--" in args:
+            i = args.index("--")
+            prog_argv, args = args[i + 1:], args[:i]
+        else:
+            prog_argv = []
+        mock = None
+        interval_ms = 10.0
+        rest = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--mock" and i + 1 < len(args):
+                mock = args[i + 1]
+                i += 2
+            elif args[i] == "--interval-ms" and i + 1 < len(args):
+                try:
+                    interval_ms = float(args[i + 1])
+                except ValueError:
+                    die("--interval-ms needs a number of milliseconds")
+                if interval_ms <= 0:
+                    die("--interval-ms must be positive")
+                i += 2
+            else:
+                rest.append(args[i])
+                i += 1
+        if len(rest) != 1:
+            die("usage: misa profile <file.misa> [--json] "
+                "[--mock mocks.json] [--interval-ms N] [-- args...]")
+        return cmd_profile(rest[0], mock, as_json, interval_ms, prog_argv)
+    if cmd == "repl" and len(args) == 0:
+        return cmd_repl()
     if cmd == "serve" and 1 <= len(args) <= 9:
         from misa.serve import cmd_serve
         return cmd_serve(args)
