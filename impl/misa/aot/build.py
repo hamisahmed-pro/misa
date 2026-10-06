@@ -259,6 +259,13 @@ TARGETS = {
         "status": "object only (link in Xcode for the iOS Simulator: M7 template ios/MisaApp)",
         "desc": "Apple ARM64 iOS Simulator",
     },
+    "aarch64-apple-ios": {
+        "cc": "xcrun clang (needs macOS)",
+        "cc_id": "xcrun-arm64-ios",
+        "entry": "misa_main",
+        "status": "object only (link in Xcode for iOS devices: M7 template ios/MisaApp; unsigned IPA via ios.yml ios-device job)",
+        "desc": "Apple ARM64 iOS device",
+    },
     "x86_64-apple-darwin": {
         "cc": "xcrun clang (needs macOS)",
         "cc_id": "xcrun-x86_64",

@@ -121,3 +121,56 @@ jobs:
           name: misa-sim-screenshot
           path: /tmp/misa_shot.png
           if-no-files-found: warn
+
+  # Unsigned iOS device IPA (sideloadable). Runs ONLY on workflow_dispatch
+  # (macOS device builds are expensive; keep per-push CI on the simulator
+  # job). Trigger: gh workflow run ios
+  ios-device:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install llvmlite==0.50.0
+
+      - name: Build PlantDoc program object (iOS device)
+        run: |
+          chmod +x impl/bin/misa
+          python3 impl/bin/misa build examples/plantdoc.misa \
+            -o ios/MisaApp/program/prog_arm64.o \
+            --target aarch64-apple-ios
+          file ios/MisaApp/program/prog_arm64.o
+
+      - name: Xcode build (device, no signing)
+        run: |
+          cd ios/MisaApp
+          xcodebuild -project MisaApp.xcodeproj -target MisaApp \
+            -sdk iphoneos \
+            -configuration Release \
+            build CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP=$(find ios/MisaApp/build ~/Library/Developer/Xcode/DerivedData \
+            -name "MisaApp.app" -type d 2>/dev/null | head -1)
+          echo "app: $APP"
+          test -n "$APP" || { echo "FATAL: MisaApp.app not found"; exit 1; }
+          echo "--- executable check ---"
+          file "$APP/MisaApp"
+          otool -hv "$APP/MisaApp" | head -5
+          rm -rf /tmp/ipa && mkdir -p /tmp/ipa/Payload
+          cp -R "$APP" /tmp/ipa/Payload/
+          cd /tmp/ipa
+          zip -r -y MisaApp-unsigned.ipa Payload >/dev/null
+          echo "--- IPA contents ---"
+          unzip -l MisaApp-unsigned.ipa
+          ls -la MisaApp-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MisaApp-unsigned-ipa
+          path: /tmp/ipa/MisaApp-unsigned.ipa
+          if-no-files-found: error

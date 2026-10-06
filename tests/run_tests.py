@@ -2172,6 +2172,24 @@ def _():
     assert errors and errors[0]["code"] == "E600", errors
 
 
+@test("device: aarch64-apple-ios emits a Mach-O arm64 object")
+def _():
+    # The iOS device target (unsigned IPA pipeline) must lower through
+    # llvmlite to a real Mach-O arm64 relocatable object.
+    from misa.aot import build as bmod
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "t.misa")
+        with open(src, "w") as f:
+            f.write('print("hi")\n')
+        out = os.path.join(td, "t.o")
+        ok, errors = bmod.build(src, out, target="aarch64-apple-ios")
+        assert ok, errors
+        with open(out, "rb") as f:
+            magic = f.read(4)
+    # Mach-O 64-bit magic, little-endian (0xFEEDFACF -> CF FA ED FE)
+    assert magic == b"\xcf\xfa\xed\xfe", magic.hex()
+
+
 @test("bonus: process.run is E600 (not E101) for AOT targets")
 def _():
     from misa.aot import build as bmod
