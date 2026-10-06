@@ -64,18 +64,27 @@ jobs:
           echo "launch: $LAUNCH"
           PID=$(echo "$LAUNCH" | awk -F': ' '{print $2}')
           sleep 10
+          # Screenshot first (visual proof of what the simulator shows).
+          xcrun simctl io "$UDID" screenshot /tmp/misa_shot.png 2>&1
+          ls -la /tmp/misa_shot.png 2>/dev/null
           # Definitive aliveness: simulator apps are host processes.
           echo "--- host-side process check (pid $PID) ---"
           ps -p "$PID" -o pid,etime,comm 2>&1 || echo "(pid $PID not in ps)"
-          ps aux | grep -i "[M]isaApp" | head -3 || echo "(no MisaApp in ps aux)"
-          echo "--- screenshot ---"
-          xcrun simctl io "$UDID" screenshot /tmp/misa_shot.png 2>&1 && ls -la /tmp/misa_shot.png
           if ps -p "$PID" >/dev/null 2>&1; then
             echo "smoke test OK: app process alive after 10s (pid $PID)"
             exit 0
-          else
-            echo "SMOKE TEST FAILED: app process gone 10s after launch"
-            echo "--- device console tail for MisaApp ---"
-            xcrun simctl spawn "$UDID" log show --predicate 'process == "MisaApp"' --last 3m 2>&1 | tail -20
-            exit 1
           fi
+          echo "SMOKE TEST FAILED: app process gone 10s after launch"
+          echo "--- who killed it? system logs mentioning our bundle ---"
+          xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
+            | grep -i "misa\|0x8badf00d\|jetsam\|termination\|SIGKILL\|exited" \
+            | grep -vi "misaapp:" | tail -25
+          exit 1
+
+      - name: Upload simulator screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: misa-sim-screenshot
+          path: /tmp/misa_shot.png
+          if-no-files-found: warn
