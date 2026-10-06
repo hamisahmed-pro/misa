@@ -1,2 +1,0 @@
-print("Error: title required")
-throw { code: "EUSER", message: "user error" }

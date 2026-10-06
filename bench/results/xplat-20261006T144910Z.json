@@ -1,0 +1,371 @@
+{
+  "generated_at": "2026-10-06T14:49:10.355158+00:00",
+  "methodology": "spec/BENCHMARK.md L1-L7 + bench/specs/crossplatform.md; APK runtime UNVERIFIED (no emulator/device on this box)",
+  "trials": [
+    {
+      "trial": "xplat-misa-1",
+      "language": "misa",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 313.506503,
+      "cli_loops": 1,
+      "apk_loops": 0,
+      "failure_log": [
+        "exp/t3.misa probe: misa check E001 'unexpected token in interpolation' \u2014 literal { inside a string always opens interpolation in Misa; JSON test strings need {{ for a literal brace (scratch probe only, deliverable unaffected)"
+      ],
+      "loc": 259,
+      "shared_code_pct": 84.9,
+      "host_artifact_bytes": 1880592,
+      "startup_ms": 21.567411000432912,
+      "apk_bytes": 4149974,
+      "apk_build_seconds": 56,
+      "apk_route": "misa scripts/build_apk.py (LLVM AOT per-ABI + NDK C runtime + aapt/d8/apksigner)",
+      "notes": "Single 370-line taskman.misa produces both artifacts. Deliverable passed misa check, misa build, and verify_taskman.sh 27/27 on the first attempt each; APK built first try and verify_apk.sh 6/6. The one logged loop was a scratch language probe (brace-escape rule), not a deliverable defect. CLI: env-var dispatch with TASKMAN_CMD unset -> navigate(Home()) for Android; all error paths print 'Error: ...' then throw an Error record so the AOT binary exits 1 with a clean one-line report (no traceback). Import validates array-ness via json.stringify '[' prefix because for-in iterates Text as chars. APK: app block + Home screen (Heading, Text, List driven by task_lines() over the same SQLite schema/table decl, TextInput + Button inserting via the same db.exec path); on-device runtime unverified (no emulator/device on this box), per the honesty note."
+    },
+    {
+      "trial": "xplat-misa-2",
+      "language": "misa",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 258.058593,
+      "cli_loops": 3,
+      "apk_loops": 0,
+      "failure_log": [
+        "misa check E001 (line 264): `else if` chains are not in the Misa grammar \u2014 rewrote CLI dispatch as nested else/if blocks",
+        "misa check E208 (3 sites): `any` is not a valid user-facing annotation type, only stdlib-signature sugar",
+        "misa check E208: `value` also invalid as an annotation \u2014 inlined dynamic JSON validation into the doImport loop instead of typed helper fns"
+      ],
+      "loc": 244,
+      "shared_code_pct": 73.4,
+      "host_artifact_bytes": 1880240,
+      "startup_ms": 7.810885999788297,
+      "apk_bytes": 4149974,
+      "apk_build_seconds": 13,
+      "apk_route": "misa scripts/build_apk.py (ndk clang + aapt/d8/apksigner, debug key)",
+      "notes": "Single 274-line taskman.misa builds both artifacts. CLI passes verify_taskman.sh 27/27; APK passes verify_apk.sh 6/6 (4.1MB, signed, badging ok). Shared storage path: openDb/taskLines/nowStamp used by both CLI commands and the Home screen (List rendered from SQLite; TextInput+Button inserts via db.exec then navigate(Home())). Error paths print 'Error: ...' then throw (verified: exit 1, no traceback, structured report on stderr). Dual-mode: TASKMAN_CMD read via try/catch env (E302->''), unset/empty falls through to navigate(Home()) for the Android UI. On-device runtime unverified (no emulator/device on this box), per benchmark honesty note."
+    },
+    {
+      "trial": "xplat-misa-3",
+      "language": "misa",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 329.366992,
+      "cli_loops": 4,
+      "apk_loops": 0,
+      "failure_log": [
+        "t2.misa misa check: E001 'unexpected token in interpolation' \u2014 a literal { inside a string opens interpolation; JSON object literals in source need {{",
+        "t3.misa misa check: same E001 while isolating \u2014 confirmed { always starts interpolation inside strings",
+        "taskman.misa misa check: E001 \"expected '{', found 'if'\" \u2014 Misa has no else-if; rewrote dispatch as nested else { if ... }",
+        "t9.misa misa check: E208 \"unknown type '[value]'\" \u2014 value cannot be used as a type argument; import array-probe done via str.starts_with(json.stringify(items), \"[\") instead"
+      ],
+      "loc": 202,
+      "shared_code_pct": 88.1,
+      "host_artifact_bytes": 1872168,
+      "startup_ms": 7.762193999951705,
+      "apk_bytes": 4145878,
+      "apk_build_seconds": 22,
+      "apk_route": "misa scripts/build_apk.py (NDK, native Android Views driver)",
+      "notes": "One taskman.misa (~7kB) produces both artifacts. CLI dispatch reads TASKMAN_CMD defensively (try/catch env); error paths print 'Error: ...' then throw {code:EUSER,...} which exits 1 with the structured report on stderr. After successful CLI output it falls through to navigate(Home()); verified navigate() on host prints the component tree and returns immediately (no blocking, exit 0). Screens share every db helper with the CLI (add_task/task_lines/set_status/delete_task/export_tasks/import_tasks via table tasks + db.*). Timestamps ISO-8601 UTC via time.format. Exported JSON validated structurally by verifier. APK built first try in ~22s; on-device runtime unverified (no emulator/device on this box), per spec."
+    },
+    {
+      "trial": "xplat-python-1",
+      "language": "python",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 2070.433182,
+      "cli_loops": 0,
+      "apk_loops": 7,
+      "failure_log": [
+        "sdkmanager: build-tools;34.0.0 / platforms;android-34 silently not installed (JAVA_HOME unset during license step)",
+        "sdkmanager: remote manifest unreachable via Java through proxy - fell back to direct curl of build-tools_r34-linux.zip",
+        "gradle assembleDebug #1: blocked by runtime user-confirmation gate at ~2min, killed",
+        "gradle assembleDebug #2: same confirmation gate, killed",
+        "gradle assembleDebug #3 (foreground --no-daemon): gate timed out, 0 bytes downloaded in 280s - abandoned Gradle route",
+        "build_apk.py #1: d8 (build-tools 34.0.0) NPE on JDK-21-compiled anonymous inner classes - rewrote MainActivity with lambdas only",
+        "build_apk.py #2: apksigner rejected '--ks-pass:android' syntax - fixed to '--ks-pass pass:android'"
+      ],
+      "loc": 553,
+      "shared_code_pct": 99.1,
+      "host_artifact_bytes": null,
+      "startup_ms": 64.20532800075307,
+      "apk_bytes": 17595332,
+      "apk_build_seconds": 11,
+      "apk_route": "hand-assembled APK embedding official Chaquopy 17.0.0 prebuilt runtime (CPython 3.12, arm64-v8a); Gradle daemon network was blocked by an un-clearable runtime confirmation gate, so replicated the Gradle plugin's exact APK layout (assets/chaquopy/*.imy + bootstrap-native + lib/<abi>/*.so + build.json with SHA-1 asset map) using aapt2/d8/apksigner directly",
+      "notes": "CLI: taskman.py + taskman_core.py (stdlib only), 27/27 first try. APK: 17.6MB signed taskman.apk, 6/6 structural. Shared code: taskman_core.py used VERBATIM by both (CLI imports it; APK carries it in assets/chaquopy/app.imy, all DB access via TaskStore - no reimplementation). UI: MainActivity.java ListView + EditText + Add Button; tap cycles status, long-press deletes. APK internals verified: 17/17 build.json SHA-1 hashes match, all 8 native libs present, PyApplication+MainActivity in classes.dex. On-device RUNTIME unverified (no emulator/device on this box) - honest per spec. Side effects outside workdir: egress CA imported into ~/workspace/tools/jdk-21 cacerts; ~/.gradle/gradle.properties holds proxy creds (chmod 600); build-tools 34.0.0 added to ~/workspace/android-sdk."
+    },
+    {
+      "trial": "xplat-python-2",
+      "language": "python",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 701.867578,
+      "cli_loops": 0,
+      "apk_loops": 2,
+      "failure_log": [
+        "APK build #1: build_apk.py computed WORK as the apk/ subdir instead of the trial workdir -> FileNotFoundError for taskdb.py when zipping app.imy",
+        "APK build #2: apksigner rejected single-arg '--ks-pass:android' syntax (Unsupported option) -> fixed to '--ks-pass pass:android'"
+      ],
+      "loc": 566,
+      "shared_code_pct": 77.6,
+      "host_artifact_bytes": null,
+      "startup_ms": 64.29850699987583,
+      "apk_bytes": 17570618,
+      "apk_build_seconds": 10,
+      "apk_route": "Chaquopy 17.0.0 (CPython 3.12, arm64-v8a) with manual APK assembly via aapt2/d8/zipalign/apksigner \u2014 replicated the Chaquopy Gradle plugin's exact asset layout (assets/chaquopy/*.imy + bootstrap-native + lib/<abi>/*.so + build.json with SHA-1 asset map) from the plugin's own source; Gradle/buildozer path not attempted (blocked in this env)",
+      "notes": "One shared storage module (taskdb.py) serves both artifacts: the CLI (taskman.py) and the Android app. The app's UI (taskman_app.py: ListView task list, TextInput+Button add-task row, tap=advance status, long-press=delete) is built in Python via Chaquopy's jclass/dynamic_proxy Java bridge; MainActivity.java only bootstraps Chaquopy and calls taskman_app.main. Official Chaquopy 17.0.0 artifacts used (runtime chaquopy_java/bootstrap/libchaquopy_java/chaquopy from chaquo.com/maven-central, CPython 3.12.12 target from Maven Central incl. _sqlite3 + libsqlite3 native libs, so the app's DB works on device). Final APK: 17,570,618 bytes, v1+v2 signed with the SDK debug keystore, badging OK. On-device RUNTIME is unverified (no emulator/device on this box) \u2014 apk_completed means builds + signs + structurally contains the app, per the benchmark's honesty note."
+    },
+    {
+      "trial": "xplat-python-3",
+      "language": "python",
+      "cli_completed_reported": true,
+      "cli_completed_verified": true,
+      "cli_verifier_line": "RESULT: PASS 27/27",
+      "apk_completed_reported": true,
+      "apk_completed_verified": true,
+      "apk_verifier_line": "APK-RESULT: PASS 6/6",
+      "wall_seconds": 314.035993,
+      "cli_loops": 0,
+      "apk_loops": 4,
+      "failure_log": [
+        "apk: javac failed - classpath with '..' segments not resolved by javac (fixed with absolute path)",
+        "apk: javac failed - wrong vendor jar path (apk/build/vendor vs apk/vendor)",
+        "apk: d8 failed - 'Unsupported source file type' when passing a class directory as program input (fixed: jar the classes first)",
+        "apk: d8 8.2.2-dev internal NPE on anonymous inner classes (MainActivity$1) compiled by JDK21 javac - reproducible with a minimal case; worked around by having MainActivity implement listener interfaces directly (no inner classes)"
+      ],
+      "loc": 338,
+      "shared_code_pct": 48.5,
+      "host_artifact_bytes": null,
+      "startup_ms": 64.32515699998476,
+      "apk_bytes": 18819820,
+      "apk_build_seconds": 9,
+      "apk_route": "chaquopy-manual (Chaquopy 17.0.0 prebuilt runtime, CPython 3.12 arm64-v8a; Gradle/buildozer avoided per env lesson; APK layout assembled manually with aapt2/d8/zipalign/apksigner)",
+      "notes": "CLI passes 27/27 first try (stdlib only: sqlite3, json, os, sys, datetime). APK: 18.8MB signed APK, badging OK, 6/6 structural. One shared storage path: the APK's assets/chaquopy/app.imy contains taskman.py byte-identical (sha1 28fbabcbe57d21ec41ae149cb7e4e142339cd331) to the CLI artifact; MainActivity.java (EditText text input + Add Button + ListView task list, tap cycles status, long-press deletes) calls it via android_glue.py. On-device runtime unverifiable (no emulator/device). build_apk.py is fully re-runnable in ~9s; no Gradle/toolchain downloads were needed (reused prebuilt Chaquopy runtime assets + arm64-v8a vendor .so files + android-sdk build-tools)."
+    }
+  ],
+  "summary": {
+    "misa": {
+      "trials": 3,
+      "cli_completion": 1.0,
+      "apk_completion": 1.0,
+      "wall_seconds": {
+        "n": 3,
+        "mean": 300.310696,
+        "min": 258.058593,
+        "max": 329.366992,
+        "values": [
+          313.506503,
+          258.058593,
+          329.366992
+        ]
+      },
+      "cli_loops": {
+        "n": 3,
+        "mean": 2.6666666666666665,
+        "min": 1,
+        "max": 4,
+        "values": [
+          1,
+          3,
+          4
+        ]
+      },
+      "apk_loops": {
+        "n": 3,
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0
+        ]
+      },
+      "loc": {
+        "n": 3,
+        "mean": 235,
+        "min": 202,
+        "max": 259,
+        "values": [
+          259,
+          244,
+          202
+        ]
+      },
+      "shared_code_pct": {
+        "n": 3,
+        "mean": 82.13333333333334,
+        "min": 73.4,
+        "max": 88.1,
+        "values": [
+          84.9,
+          73.4,
+          88.1
+        ]
+      },
+      "host_artifact_bytes": {
+        "n": 3,
+        "mean": 1877666.6666666667,
+        "min": 1872168,
+        "max": 1880592,
+        "values": [
+          1880592,
+          1880240,
+          1872168
+        ]
+      },
+      "startup_ms": {
+        "n": 3,
+        "mean": 12.380163666724306,
+        "min": 7.762193999951705,
+        "max": 21.567411000432912,
+        "values": [
+          21.567411000432912,
+          7.810885999788297,
+          7.762193999951705
+        ]
+      },
+      "apk_bytes": {
+        "n": 3,
+        "mean": 4148608.6666666665,
+        "min": 4145878,
+        "max": 4149974,
+        "values": [
+          4149974,
+          4149974,
+          4145878
+        ]
+      },
+      "apk_build_seconds": {
+        "n": 3,
+        "mean": 30.333333333333332,
+        "min": 13,
+        "max": 56,
+        "values": [
+          56,
+          13,
+          22
+        ]
+      }
+    },
+    "python": {
+      "trials": 3,
+      "cli_completion": 1.0,
+      "apk_completion": 1.0,
+      "wall_seconds": {
+        "n": 3,
+        "mean": 1028.7789176666668,
+        "min": 314.035993,
+        "max": 2070.433182,
+        "values": [
+          2070.433182,
+          701.867578,
+          314.035993
+        ]
+      },
+      "cli_loops": {
+        "n": 3,
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0
+        ]
+      },
+      "apk_loops": {
+        "n": 3,
+        "mean": 4.333333333333333,
+        "min": 2,
+        "max": 7,
+        "values": [
+          7,
+          2,
+          4
+        ]
+      },
+      "loc": {
+        "n": 3,
+        "mean": 485.6666666666667,
+        "min": 338,
+        "max": 566,
+        "values": [
+          553,
+          566,
+          338
+        ]
+      },
+      "shared_code_pct": {
+        "n": 3,
+        "mean": 75.06666666666666,
+        "min": 48.5,
+        "max": 99.1,
+        "values": [
+          99.1,
+          77.6,
+          48.5
+        ]
+      },
+      "host_artifact_bytes": {
+        "n": 0,
+        "mean": null,
+        "min": null,
+        "max": null,
+        "values": []
+      },
+      "startup_ms": {
+        "n": 3,
+        "mean": 64.27633066687122,
+        "min": 64.20532800075307,
+        "max": 64.32515699998476,
+        "values": [
+          64.20532800075307,
+          64.29850699987583,
+          64.32515699998476
+        ]
+      },
+      "apk_bytes": {
+        "n": 3,
+        "mean": 17995256.666666668,
+        "min": 17570618,
+        "max": 18819820,
+        "values": [
+          17595332,
+          17570618,
+          18819820
+        ]
+      },
+      "apk_build_seconds": {
+        "n": 3,
+        "mean": 10,
+        "min": 9,
+        "max": 11,
+        "values": [
+          11,
+          10,
+          9
+        ]
+      }
+    }
+  }
+}

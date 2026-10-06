@@ -1,2 +1,0 @@
-let cmd = env("TASKMAN_CMD")
-print("cmd=[{cmd}]")
