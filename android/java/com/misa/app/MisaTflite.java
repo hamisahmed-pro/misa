@@ -15,6 +15,7 @@ import java.util.Map;
 import org.json.JSONArray;
 import org.tensorflow.lite.DataType;
 import org.tensorflow.lite.Interpreter;
+import org.tensorflow.lite.InterpreterApi;
 import org.tensorflow.lite.Tensor;
 import org.tensorflow.lite.nnapi.NnApiDelegate;
 
@@ -145,6 +146,10 @@ public final class MisaTflite {
         Throwable nnapiErr = null;
         try {
             Interpreter.Options opts = new Interpreter.Options();
+            // Never reach for the Play Services TFLite client; the
+            // bundled libtensorflowlite_jni.so is the runtime.
+            opts.setRuntime(InterpreterApi.Options.TfLiteRuntime
+                    .FROM_APPLICATION_ONLY);
             NnApiDelegate delegate = new NnApiDelegate();
             opts.addDelegate(delegate);
             Interpreter itp = new Interpreter(f, opts);
@@ -162,7 +167,10 @@ public final class MisaTflite {
         }
         Log.i(TAG, "TFLite CPU fallback for " + assetName
                 + " (NNAPI: " + nnapiErr + ")");
-        return new Interpreter(f, new Interpreter.Options());
+        Interpreter.Options cpuOpts = new Interpreter.Options();
+        cpuOpts.setRuntime(InterpreterApi.Options.TfLiteRuntime
+                .FROM_APPLICATION_ONLY);
+        return new Interpreter(f, cpuOpts);
     }
 
     /** Zero-input probe: proves the delegate can run this model. */
