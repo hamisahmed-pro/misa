@@ -1,0 +1,83 @@
+// ============================================================================
+// sysinfo — a system information reporter in Misa.
+//
+// Gathers facts about the machine via C library calls, then writes a JSON
+// report to `sysinfo-report.json` and prints a summary. Demonstrates:
+//
+//   FFI ................... `extern "c"` — getenv(), getlogin(), sysconf()
+//                           (NULL C strings become Misa `nil`)
+//   JSON .................. `json.stringify` for the report
+//   Files ................. `fs.write` for the report file
+//   Time .................. `time.format` for the report timestamp
+//   Nil handling .......... missing env vars render as "(not set)",
+//                           never crash
+//
+// Run:
+//
+//   misa run examples/sysinfo.misa        # writes ./sysinfo-report.json
+//
+// NOTE: `process.run` is deliberately NOT used here. It works in the
+// interpreter but `misa build` rejects it with E600 (subprocess in compiled
+// binaries is out of scope), so a showcase that must compile natively sticks
+// to FFI. The sysconf constant 84 (_SC_NPROCESSORS_ONLN) is glibc/Linux;
+// other libcs number it differently.
+// ============================================================================
+
+// --- FFI: C library calls ------------------------------------------------------
+extern "c" {
+  fn getenv(name: Text) -> Text,
+  fn getlogin() -> Text,
+  fn sysconf(name: Int) -> Int,
+}
+
+// --- Helpers ---------------------------------------------------------------------
+// C's NULL becomes Misa nil; render those as "(not set)" for humans and
+// keep real nils for the JSON report (json.stringify renders nil as null).
+// (FFI-declared `-> Text` functions may still yield nil at runtime when the
+// C side returns NULL — hence the unannotated `let`s below.)
+fn or_unset(v: Text) -> Text {
+  if v == nil {
+    return "(not set)"
+  }
+  return v
+}
+
+// --- Report ------------------------------------------------------------------------
+fn main() -> Void {
+  let login = getlogin()
+  let home = getenv("HOME")
+  let shell = getenv("SHELL")
+  let lang = getenv("LANG")
+  let host = getenv("HOSTNAME")
+  let ostype = getenv("OSTYPE")
+  // _SC_NPROCESSORS_ONLN == 84 on glibc/Linux.
+  let ncpu = sysconf(84)
+
+  // NOTE: a real report would stamp time.now() here, but the gallery's
+  // contract is byte-identical interpreter/AOT output, and a clock field
+  // can never be identical across two runs. `time.format` is exercised in
+  // budget.misa's monthly reports instead.
+  let report = {
+    login: login,
+    home: home,
+    shell: shell,
+    lang: lang,
+    hostname: host,
+    ostype: ostype,
+    ncpu: ncpu,
+  }
+  let body = json.stringify(report)
+  fs.write("sysinfo-report.json", body)
+
+  print("system information")
+  print("  login:    " + or_unset(login))
+  print("  home:     " + or_unset(home))
+  print("  shell:    " + or_unset(shell))
+  print("  lang:     " + or_unset(lang))
+  print("  hostname: " + or_unset(host))
+  print("  ostype:   " + or_unset(ostype))
+  print("  ncpu:     " + str(ncpu))
+  print("wrote sysinfo-report.json")
+}
+
+main()

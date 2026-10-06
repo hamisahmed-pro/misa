@@ -1,0 +1,282 @@
+// ============================================================================
+// budget — a personal budget tracker CLI in Misa.
+//
+// Demonstrates:
+//
+//   SQLite ................ `db.*` + `table entries` (compile-time checked SQL,
+//                           typed rows, bind args)
+//   Sum types ............. `Kind` (Income/Expense), `Cmd`, `Result<T>`
+//   Pattern matching ...... `match` for commands and kind parsing
+//   Generics .............. `filter<T>`, `sum_by<T>` with lambdas
+//   Time .................. `time.format` for monthly grouping
+//   Money as Int .......... amounts stored in *cents* — no float rounding
+//
+// CLI via environment variables (Misa has no argv yet):
+//
+//   BUDGET_CMD=add    BUDGET_ARG="Groceries" BUDGET_AMOUNT=42.50 BUDGET_KIND=expense
+//   BUDGET_CMD=list
+//   BUDGET_CMD=report
+//
+// The database lives at $HOME/.misa-budget.db.
+// ============================================================================
+
+// --- Domain model ------------------------------------------------------------
+type Kind { Income, Expense }
+
+type Cmd { Add, List, Report }
+
+type Result<T> { Ok(T), Err(Text) }
+
+// Compile-time checked table: unknown tables/columns in db.query are E224.
+table entries {
+  id: Int @primary,
+  label: Text,
+  kind: Text,
+  amount: Int,
+  created: Int,
+}
+
+type Entry { id: Int, label: Text, kind: Text, amount: Int, created: Int }
+
+// --- Kind helpers --------------------------------------------------------------
+fn kind_to_text(k: Kind) -> Text {
+  return match k {
+    Kind.Income => "Income",
+    Kind.Expense => "Expense",
+  }
+}
+
+fn kind_sign(k: Kind) -> Text {
+  return match k {
+    Kind.Income => "+",
+    Kind.Expense => "-",
+  }
+}
+
+fn kind_from_text(t: Text) -> Result<Kind> {
+  var out: Result<Kind> = Result<Kind>.Err("unknown kind '" + t + "': use income|expense")
+  if t == "income" {
+    out = Result<Kind>.Ok(Kind.Income)
+  }
+  if t == "expense" {
+    out = Result<Kind>.Ok(Kind.Expense)
+  }
+  return out
+}
+
+// --- Generic helpers -----------------------------------------------------------
+fn filter<T>(xs: [T], pred: (T) -> Bool) -> [T] {
+  var out: [T] = []
+  for x in xs {
+    if pred(x) {
+      out = out + [x]
+    }
+  }
+  return out
+}
+
+// Sum an Int projection over any list — the lambda picks the field.
+fn sum_by<T>(xs: [T], f: (T) -> Int) -> Int {
+  var total: Int = 0
+  for x in xs {
+    total = total + f(x)
+  }
+  return total
+}
+
+// --- Money ---------------------------------------------------------------------
+// Amounts are integer cents: 4250 means $42.50. Integers never round.
+// (`/` is float division in Misa, so dollars come from int(cents / 100).)
+fn fmt_money(cents: Int) -> Text {
+  let dollars = int(cents / 100)
+  let rest = cents % 100
+  var rest_text = str(rest)
+  if rest < 10 {
+    rest_text = "0" + rest_text
+  }
+  return str(dollars) + "." + rest_text
+}
+
+// Parse "42.50" (or "42") into cents. Rejects anything else.
+fn parse_amount(s: Text) -> Result<Int> {
+  var out: Result<Int> = Result<Int>.Err("bad amount '" + s + "': use 42.50")
+  let parts = str.split(s, ".")
+  if len(parts) == 1 {
+    try {
+      let d = int(parts[0])
+      if d >= 0 {
+        out = Result<Int>.Ok(d * 100)
+      }
+    } catch e {
+      out = Result<Int>.Err("bad amount '" + s + "': use 42.50")
+    }
+  }
+  if len(parts) == 2 {
+    try {
+      let d = int(parts[0])
+      let c = int(parts[1])
+      if d >= 0 and c >= 0 and c < 100 and len(parts[1]) <= 2 {
+        out = Result<Int>.Ok(d * 100 + c)
+      }
+    } catch e {
+      out = Result<Int>.Err("bad amount '" + s + "': use 42.50")
+    }
+  }
+  return out
+}
+
+// --- Small utilities -------------------------------------------------------------
+fn say(msg: Text) -> Void {
+  print(msg)
+}
+
+fn get_env_or(name: Text, default: Text) -> Text {
+  var out: Text = default
+  try {
+    out = env(name)
+  } catch e {
+    out = default
+  }
+  return out
+}
+
+fn db_path() -> Text {
+  let home = get_env_or("HOME", "/tmp")
+  return home + "/.misa-budget.db"
+}
+
+fn parse_cmd(s: Text) -> Result<Cmd> {
+  var out: Result<Cmd> = Result<Cmd>.Err("unknown command '" + s + "': use add|list|report")
+  if s == "add" {
+    out = Result<Cmd>.Ok(Cmd.Add)
+  }
+  if s == "list" {
+    out = Result<Cmd>.Ok(Cmd.List)
+  }
+  if s == "report" {
+    out = Result<Cmd>.Ok(Cmd.Report)
+  }
+  return out
+}
+
+// --- Database --------------------------------------------------------------------
+fn open_db() -> Db {
+  let db = db.open(db_path())
+  db.exec(db, "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY, label TEXT NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, created INTEGER NOT NULL)")
+  return db
+}
+
+fn load_entries(db: Db) -> [Entry] {
+  let rows = db.query(db, "SELECT id, label, kind, amount, created FROM entries ORDER BY id")
+  var out: [Entry] = []
+  for r in rows {
+    out = out + [{ id: r.id, label: r.label, kind: r.kind, amount: r.amount, created: r.created }]
+  }
+  return out
+}
+
+// --- Commands ----------------------------------------------------------------------
+fn cmd_add(db: Db, label: Text, amount_text: Text, kind_text: Text) -> Void {
+  let clean = str.trim(label)
+  if clean == "" {
+    print("Error: label is empty")
+    return
+  }
+  match parse_amount(amount_text) {
+    Result.Err(e) => say("Error: " + e),
+    Result.Ok(cents) => add_with_kind(db, clean, cents, kind_text),
+  }
+}
+
+fn add_with_kind(db: Db, label: Text, cents: Int, kind_text: Text) -> Void {
+  match kind_from_text(kind_text) {
+    Result.Err(e) => say("Error: " + e),
+    Result.Ok(k) => insert_entry(db, label, cents, k),
+  }
+}
+
+fn insert_entry(db: Db, label: Text, cents: Int, k: Kind) -> Void {
+  db.exec(db, "INSERT INTO entries (label, kind, amount, created) VALUES (?, ?, ?, ?)",
+    [label, kind_to_text(k), cents, time.now()])
+  // Confirmation prints no timestamp, so output is deterministic.
+  print("Added " + kind_sign(k) + "$" + fmt_money(cents) + " " + label)
+}
+
+fn cmd_list(db: Db) -> Void {
+  let entries = load_entries(db)
+  if len(entries) == 0 {
+    print("No entries yet. Add one with BUDGET_CMD=add ...")
+    return
+  }
+  for e in entries {
+    print(str(e.id) + ". " + entry_line(e))
+  }
+}
+
+fn entry_line(e: Entry) -> Text {
+  var sign = "+"
+  if e.kind == "Expense" {
+    sign = "-"
+  }
+  let when = time.format(e.created, "%Y-%m-%d")
+  return sign + "$" + fmt_money(e.amount) + " " + e.label + "  (" + when + ", " + e.kind + ")"
+}
+
+fn cmd_report(db: Db) -> Void {
+  let entries = load_entries(db)
+  if len(entries) == 0 {
+    print("No entries yet. Add one with BUDGET_CMD=add ...")
+    return
+  }
+  // Distinct months, in first-seen order.
+  var months: [Text] = []
+  for e in entries {
+    let m = time.format(e.created, "%Y-%m")
+    var seen = false
+    for x in months {
+      if x == m {
+        seen = true
+      }
+    }
+    if not seen {
+      months = months + [m]
+    }
+  }
+  var total_in: Int = 0
+  var total_out: Int = 0
+  for m in months {
+    let in_m = filter(entries, |e: Entry| time.format(e.created, "%Y-%m") == m and e.kind == "Income")
+    let out_m = filter(entries, |e: Entry| time.format(e.created, "%Y-%m") == m and e.kind == "Expense")
+    let got = sum_by(in_m, |e: Entry| e.amount)
+    let spent = sum_by(out_m, |e: Entry| e.amount)
+    total_in = total_in + got
+    total_out = total_out + spent
+    let net = got - spent
+    var net_text = "+$" + fmt_money(net)
+    if net < 0 {
+      net_text = "-$" + fmt_money(0 - net)
+    }
+    print(m + ": in +$" + fmt_money(got) + "  out -$" + fmt_money(spent) + "  net " + net_text)
+  }
+  print("total: in +$" + fmt_money(total_in) + "  out -$" + fmt_money(total_out))
+}
+
+// --- Entry point ---------------------------------------------------------------------
+fn dispatch(db: Db, c: Cmd) -> Void {
+  match c {
+    Cmd.Add => cmd_add(db, get_env_or("BUDGET_ARG", ""), get_env_or("BUDGET_AMOUNT", ""), get_env_or("BUDGET_KIND", "expense")),
+    Cmd.List => cmd_list(db),
+    Cmd.Report => cmd_report(db),
+  }
+}
+
+fn main() -> Void {
+  let db = open_db()
+  match parse_cmd(get_env_or("BUDGET_CMD", "")) {
+    Result.Err(e) => say("Error: " + e),
+    Result.Ok(c) => dispatch(db, c),
+  }
+  db.close(db)
+}
+
+main()

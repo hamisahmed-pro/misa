@@ -1,0 +1,115 @@
+// ============================================================================
+// apiclient — an HTTP API client CLI in Misa.
+//
+// Fetches a JSON resource from a public API, parses it, and prints a
+// formatted report. Demonstrates:
+//
+//   HTTP client ........... `http.get` (E304 on network failure)
+//   JSON .................. `json.parse` into dynamic values
+//   Sum types + match ..... `ApiResult<T>` for fallible fetch/parse,
+//                           `match` with exhaustiveness checking
+//   Typed records ......... converting dynamic JSON into a named `Todo`
+//   Errors as values ...... network/parse failures become clean messages,
+//                           never tracebacks
+//
+// Run:
+//
+//   misa run examples/apiclient.misa
+//
+// Override the endpoint (any URL returning a JSONPlaceholder-style todo):
+//
+//   API_URL=https://jsonplaceholder.typicode.com/todos/2 misa run examples/apiclient.misa
+//
+// The default endpoint (jsonplaceholder.typicode.com) is a stable public test
+// API, so the report below is deterministic.
+// ============================================================================
+
+// --- Domain model ------------------------------------------------------------
+// A todo as a typed record. Field names match the JSON keys exactly.
+type Todo { userId: Int, id: Int, title: Text, completed: Bool }
+
+// Fallible result: Ok carries a value, Err carries a human-readable message.
+type ApiResult<T> { Ok(T), Err(Text) }
+
+// --- Small utilities ---------------------------------------------------------
+fn say(msg: Text) -> Void {
+  print(msg)
+}
+
+fn get_env_or(name: Text, default: Text) -> Text {
+  var out: Text = default
+  try {
+    out = env(name)
+  } catch e {
+    out = default
+  }
+  return out
+}
+
+// --- Fetch + parse -----------------------------------------------------------
+// Each fallible step returns ApiResult, so the caller sees exactly one
+// error channel and `match` stays exhaustive. The `out`-variable idiom
+// below is how Misa writes try/catch in a value-returning function: both
+// branches assign, and the single trailing `return` satisfies the
+// checker's exhaustiveness analysis (E211).
+fn fetch_text(url: Text) -> ApiResult<Text> {
+  var out: ApiResult<Text> = ApiResult<Text>.Err("unreachable")
+  try {
+    out = ApiResult<Text>.Ok(http.get(url))
+  } catch e {
+    out = ApiResult<Text>.Err("request failed: " + e.message)
+  }
+  return out
+}
+
+fn parse_todo(body: Text) -> ApiResult<Todo> {
+  var out: ApiResult<Todo> = ApiResult<Todo>.Err("unreachable")
+  try {
+    let data = json.parse(body)
+    // Convert the dynamic JSON value into the typed Todo record. A missing
+    // or mistyped field throws here, which we turn into ApiResult.Err.
+    let t: Todo = {
+      userId: data.userId,
+      id: data.id,
+      title: data.title,
+      completed: data.completed,
+    }
+    out = ApiResult<Todo>.Ok(t)
+  } catch e {
+    out = ApiResult<Todo>.Err("invalid todo JSON: " + e.message)
+  }
+  return out
+}
+
+fn fetch_todo(url: Text) -> ApiResult<Todo> {
+  // `return match` keeps every arm's type visible to the checker; the
+  // explicit `<Todo>` pins the Err arm's type argument (E219 otherwise).
+  return match fetch_text(url) {
+    ApiResult.Err(e) => ApiResult<Todo>.Err(e),
+    ApiResult.Ok(body) => parse_todo(body),
+  }
+}
+
+// --- Report ------------------------------------------------------------------
+fn check_icon(done: Bool) -> Text {
+  if done {
+    return "[x] done"
+  }
+  return "[ ] open"
+}
+
+fn report(t: Todo) -> Void {
+  print("todo #" + str(t.id) + " (user " + str(t.userId) + ")")
+  print("  " + check_icon(t.completed) + "  " + t.title)
+}
+
+// --- Entry point ---------------------------------------------------------------
+fn main() -> Void {
+  let url = get_env_or("API_URL", "https://jsonplaceholder.typicode.com/todos/1")
+  match fetch_todo(url) {
+    ApiResult.Ok(t) => report(t),
+    ApiResult.Err(e) => say("Error: " + e),
+  }
+}
+
+main()
