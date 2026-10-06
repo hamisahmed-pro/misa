@@ -44,7 +44,7 @@ but what "better by a mile" looks like. Sources: `spec/SYNTAX.md`,
 |---|---|---|---|---|---|---|
 | B1 | Regex | `re` (stdlib) | `regex` crate (best-in-class) | `regexp` (stdlib) | ❌ None | **LAG** |
 | B2 | Crypto / hashing | `hashlib`, `hmac`, `secrets` | crates (`ring`, `sha2`) | `crypto/*` (stdlib) | ❌ None | **LAG** |
-| B3 | Sockets / TCP | `socket` | `std::net` | `net` (stdlib, best) | ❌ None — HTTP client only | **LAG** |
+| B3 | Sockets / TCP | `socket` | `std::net` | `net` (stdlib, best) | ✅ `net.*`/`socket.*` (Wave 3, 2026-10-07): connect/listen/accept/send/recv/close/set_timeout, method + function style, `spawn`-native, E304 | **PAR** |
 | B4 | Filesystem depth | `pathlib`, `os`, `shutil` | `std::fs` | `os` | `fs.read`/`fs.write` whole-file only. No metadata, permissions, directory listing, watching | **LAG** |
 | B5 | Datetime / timezones | `datetime` + `zoneinfo` | `chrono` crate | `time` (stdlib, best) | `time.now`/`now_ms`/`format`/`parse` — **UTC only**, strftime-style | **LAG** |
 | B6 | Unicode normalization | `unicodedata` | `unicode-normalization` crate | `x/text` | Code-point ops only (`str.*`) | **LAG** |
@@ -53,7 +53,7 @@ but what "better by a mile" looks like. Sources: `spec/SYNTAX.md`,
 | B9 | Random | `random`, `secrets` | `rand` crate | `math/rand` | ❌ None | **LAG** |
 | B10 | CLI arg parsing | `argparse` | `std::env::args` / `clap` | `flag` / `os.Args` | ❌ **No argv at all** — env-var workaround | **LAG** (flagged: blocks real CLI apps) |
 | B11 | Temp files | `tempfile` | `tempfile` crate | `os.CreateTemp` | ❌ None | **LAG** |
-| B12 | HTTP depth | `urllib`, `requests` | crates (`reqwest`, `hyper`) | `net/http` client **+ server** | `http.get`/`post`/`post_json` client only. No headers control, no server, 30s fixed timeout | **LAG** |
+| B12 | HTTP depth | `urllib`, `requests` | crates (`reqwest`, `hyper`) | `net/http` client **+ server** | ✅ `http.serve` (Wave 3, 2026-10-07): raw-socket HTTP/1.1 server, Request/Response records, per-connection error isolation. Client still `http.get`/`post`/`post_json` only (no headers control, 30s fixed timeout) | **PAR** |
 
 ### Overtake proposals (stdlib)
 

@@ -3944,6 +3944,11 @@ class Checker:
         if (got == "[unknown]" and want.startswith("[")
                 and want.endswith("]")):
             return True
+        # Wave 3 (stdlib): `set()` has no element type to infer; it
+        # coerces to any Set type (so `let s: Set<Text> = set()` checks).
+        if (got == "Set<unknown>" and want.startswith("Set<")
+                and want.endswith(">")):
+            return True
         # Phase 8 (overtake): a concrete type is assignable to an
         # interface it implements (`impl I for T` exists). Optional
         # interfaces accept the concrete type too.

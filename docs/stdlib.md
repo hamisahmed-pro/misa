@@ -81,6 +81,8 @@ All platforms ✅ except web: `spawn` raises E600 there.
 |---|---|
 | `fs.read` | `fs.read(path: Text) -> Text` — `E303` on failure |
 | `fs.write` | `fs.write(path: Text, text: Text)` — `E303` on failure |
+| `fs.temp_file` | `fs.temp_file() -> Text` — new empty temp file; returns its path (`E303` on failure) |
+| `fs.temp_dir` | `fs.temp_dir() -> Text` — new empty temp dir; returns its path (`E303` on failure) |
 
 ```misa
 fs.write("/tmp/note.txt", "hello file")
@@ -107,6 +109,62 @@ print(len(body) > 100)   // true
 30s timeout on all calls. Platforms: interp ✅, host ✅, Android ✅,
 iOS ✅ (device run not yet verified), web ✅.
 
+### `http.serve` — HTTP server
+
+```misa
+http.serve(8080, |req: Request| {
+  if req.path == "/hello" {
+    return {status: 200, body: "hi " + req.query["name"]}
+  }
+  return {status: 404, body: "not found"}
+})
+```
+
+`Request`: `{method, path, query, headers, body}`. `Response`: `{status,
+headers, body}` (defaults: `200`, `{}`, `text/plain`). Blocking serve loop;
+connections are handled sequentially in v1 — `spawn` the server or per-connection
+work for concurrency. Handler errors become `500` without killing the server.
+Parser limits: 64KB headers → `431`, 10MB body → `413`, 100 headers max → `431`,
+chunked bodies → `501`, malformed → `400`. Platforms: interp ✅, host ✅,
+Android/iOS (compiles, device run not yet verified), web ❌ → `E600`.
+
+## `net` — TCP sockets
+
+| Function | Signature |
+|---|---|
+| `net.connect` | `net.connect(host: Text, port: Int) -> Socket` — `E304` on failure |
+| `net.listen` | `net.listen(port: Int) -> Listener` — `port: 0` = ephemeral; `E304` on failure |
+| `net.accept` | `lis.accept() -> Socket` — blocks for the next client |
+| `net.port` | `lis.port() -> Int` — the bound port |
+| `listener.close` | `lis.close()` |
+| `socket.send` | `sock.send(data: Text) -> Int` — bytes sent |
+| `socket.recv` | `sock.recv(max: Int) -> Text` — `""` on clean EOF (not an error) |
+| `socket.close` | `sock.close()` |
+| `socket.set_timeout` | `sock.set_timeout(ms: Int)` — recv/send timeout; expiry raises `E304` |
+
+Method style (`sock.send(...)`, `lis.accept()`) or function style
+(`socket.send(sock, ...)`, `net.accept(lis)`) — both work. Sockets compose with
+`spawn`/`sleep`/`await`: spawn an echo server, `sleep` briefly, then connect.
+
+```misa
+let lis = net.listen(0)
+let port = lis.port()
+let srv = spawn {
+  let conn = lis.accept()
+  conn.send("echo:" + conn.recv(1024))
+  conn.close()
+}
+sleep(200)
+let c = net.connect("127.0.0.1", port)
+c.send("hello")
+print(c.recv(1024))   // echo:hello
+c.close()
+await srv
+```
+
+Platforms: interp ✅, host ✅, Android/iOS (compiles, device run not yet
+verified), web ❌ → `E600`.
+
 ## `str` — strings (code-point semantics)
 
 | Function | Signature |
@@ -118,6 +176,11 @@ iOS ✅ (device run not yet verified), web ✅.
 | `str.ord` | `str.ord(c: Text) -> Int` — code point of first char; `E300` on empty |
 | `str.chr` | `str.chr(code: Int) -> Text` — `E300` on negatives, surrogates, `> 0x10FFFF` |
 | `str.chars` | `str.chars(s: Text) -> [Text]` — code points as single-char texts (what `for x in s` iterates) |
+| `str.join` | `str.join(xs: [Text], sep: Text) -> Text` — inverse of `split` |
+| `str.replace` | `str.replace(s: Text, old: Text, new: Text) -> Text` — `E300` on empty `old` |
+| `str.ends_with` | `str.ends_with(s: Text, suffix: Text) -> Bool` |
+| `str.to_upper` / `str.to_lower` | case mapping — v1 is ASCII-only (`a`–`z`); full Unicode casefold is future work |
+| `str.pad_left` / `str.pad_right` | `str.pad_left(s: Text, width: Int, pad: Text) -> Text` — `E300` on empty `pad` |
 
 ```misa
 print(str.slice("hello", 1, 4))      // ell
@@ -126,6 +189,9 @@ print(str.split("a,b,c", ","))       // [a, b, c]
 print(str.trim("  hi  "))             // hi
 print(str.ord("A"))                  // 65
 print(str.chr(128512))               // 😀
+print(str.join(["a", "b"], "-"))     // a-b
+print(str.replace("aaa", "a", "bb")) // bbbbbb
+print(str.pad_left("42", 5, "0"))    // 00042
 ```
 
 Byte-identical on interpreter and AOT. All platforms ✅.
@@ -166,6 +232,121 @@ print(time.format(1705276800, "%Y-%m-%d"))  // 2024-01-15
 print(time.parse("2024-01-15", "%Y-%m-%d")) // 1705276800
 ```
 
+| Function | Signature |
+|---|---|
+| `time.now_utc` | `time.now_utc() -> Int` — epoch seconds (always UTC) |
+| `time.to_utc` | `time.to_utc(t: Int) -> Int` — identity; epoch timestamps are always UTC |
+| `time.from_parts` | `time.from_parts(y, mo, d, h, mi, s: Int) -> Int` — UTC epoch; `E300` on invalid dates (no silent normalization) |
+| `time.add` | `time.add(t: Int, seconds: Int) -> Int` |
+| `time.add_hours` | `time.add_hours(t: Int, h: Int) -> Int` |
+| `time.in_tz` | `time.in_tz(t: Int, offset_hours: Float) -> Int` — shift so UTC formatting shows wall-clock at the offset (v1: offset-based, no tz database, no DST) |
+| `time.weekday` | `time.weekday(t: Int) -> Text` — `"Monday"` … `"Sunday"` (UTC) |
+| `time.is_leap` | `time.is_leap(year: Int) -> Bool` |
+
+```misa
+let t = time.from_parts(2026, 10, 7, 12, 0, 0)
+print(time.weekday(t))            // Wednesday
+print(time.in_tz(t, 1) - t)      // 3600
+```
+
+All platforms ✅.
+
+## `regex` — patterns checked at compile time
+
+`regex("...")` validates the pattern **while checking**: a bad pattern is
+`E200` with the index of the problem, not a runtime surprise. (A pattern
+built at runtime is validated when `regex()` runs — `E300`.)
+
+```misa
+let email = regex("([A-Za-z0-9_]+)@([A-Za-z0-9_]+)\\.([a-z]+)")
+print(regex.matches(email, "user@example.com"))  // true
+print(regex.find_all(regex("[0-9]+"), "a1 b22")) // [1, 22]
+print(regex.replace(email, "u@x.com", "$2@$1"))   // x@u
+```
+
+| Function | Signature |
+|---|---|
+| `regex` | `regex(pattern: Text) -> Regex` |
+| `regex.matches` | `regex.matches(re: Regex, text: Text) -> Bool` — whole-text match |
+| `regex.find` | `regex.find(re: Regex, text: Text) -> Text?` — first match or `nil` |
+| `regex.find_all` | `regex.find_all(re: Regex, text: Text) -> [Text]` |
+| `regex.replace` | `regex.replace(re: Regex, text: Text, repl: Text) -> Text` — `$1`–`$9`, `$$` |
+| `regex.captures` | `regex.captures(re: Regex, text: Text) -> [Text]?` — groups or `nil` |
+
+Supported: literals, `.`, `^` `$`, `*` `+` `?` `{m,n}`, `(...)`, `|`,
+`[...]`, `\n` `\t` and escaped metacharacters. Backtracking matches PCRE
+(verified against Python `re`). Not in v1: `\d` `\w` `\s` (use `[...]`),
+`(?...)`, backreferences, lazy quantifiers, lookaround — the checker
+rejects these with a helpful `E200` instead of miscompiling them.
+
+Both backends run the same algorithm, so patterns behave identically in
+`misa run` and compiled binaries.
+
+All platforms ✅.
+
+## `crypto` — hashes
+
+| Function | Signature |
+|---|---|
+| `crypto.sha256` | `crypto.sha256(data: Text) -> Text` — 64-char hex |
+| `crypto.sha1` | `crypto.sha1(data: Text) -> Text` — 40-char hex |
+| `crypto.md5` | `crypto.md5(data: Text) -> Text` — 32-char hex |
+| `crypto.hmac_sha256` | `crypto.hmac_sha256(key: Text, msg: Text) -> Text` — 64-char hex |
+
+```misa
+print(crypto.sha256("hello"))  // 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+```
+
+Self-contained C in the AOT runtime (no OpenSSL); `hashlib` in the
+interpreter. Digests agree bit-for-bit. All platforms ✅.
+
+## `random` — seeded PRNG
+
+| Function | Signature |
+|---|---|
+| `random.seed` | `random.seed(n: Int)` — seed; same seed ⇒ same sequence **within a backend** |
+| `random.int` | `random.int(min: Int, max: Int) -> Int` — inclusive; `E300` if `min > max` |
+| `random.float` | `random.float() -> Float` — in `[0, 1)` |
+| `random.choice` | `random.choice(xs: [T]) -> T` — `E300` on empty |
+| `random.shuffle` | `random.shuffle(xs: [T]) -> [T]` — new shuffled list |
+
+```misa
+random.seed(42)
+print(random.int(1, 100))
+print(random.shuffle([1, 2, 3]))
+```
+
+Determinism is per-backend (splitmix64 in AOT, Mersenne Twister in the
+interpreter) — the streams differ across backends by necessity. All
+platforms ✅.
+
+## Collections — `map`/`filter`/`fold`, `Set<T>`, `list.*`
+
+```misa
+print(map([1, 2, 3], |x| x * 2))          // [2, 4, 6]
+print(filter([1, 2, 3, 4], |x| x % 2 == 0)) // [2, 4]
+print(fold([1, 2, 3, 4], 0, |a, b| a + b))  // 10
+print(sort_by(["bb", "a"], |a, b| len(a) < len(b))) // [a, bb]
+
+let s = set()
+s.add(1)
+s.add(1)
+print(set.len(s))              // 1
+print(set.to_list(s))          // [1]
+print(list.zip([1, 2], ["a"])) // [[1, a]]
+print(list.unique([2, 1, 2]))   // [2, 1]
+```
+
+| Function | Signature |
+|---|---|
+| `map` / `filter` / `fold` / `sort_by` | higher-order list functions (`sort_by` takes a `less` comparator and is stable) |
+| `list.flat` / `list.zip` / `list.unique` | `[[T]] -> [T]` / pair up / dedupe (first-occurrence order) |
+| `set()` | `set() -> Set<T>` — empty set; `s.add(x)` method syntax works too |
+| `set.add` / `set.contains` / `set.remove` | mutate / test / delete |
+| `set.union` / `set.intersect` / `set.diff` | set algebra (insertion-ordered) |
+| `set.to_list` / `set.len` | to list / count (`len(s)` works as well) |
+
+Sets are insertion-ordered with value-equality membership (v1: O(n)).
 All platforms ✅.
 
 ## `math`

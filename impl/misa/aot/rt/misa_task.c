@@ -2227,8 +2227,10 @@ static int http_serve_one(int fd, MVal *handler, int line, int col) {
                     char *lp = eol + 2;
                     char *hend = buf + head_len - 4;
                     while (!err_status && lp < hend) {
+                        /* hend points AT the last header line's '\r',
+                           so the search must include it (+1). */
                         char *le = memchr(lp, '\r',
-                                          (size_t)(hend - lp));
+                                          (size_t)(hend - lp) + 1);
                         if (!le) {
                             err_status = 400;
                             break;

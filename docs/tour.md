@@ -368,6 +368,33 @@ print(u.name)   // Ada
 
 Field names and types are checked at compile time (E202 on mismatch).
 
+**Sets** — `Set<T>`, insertion-ordered, deduplicated:
+
+```misa
+let seen = set()
+seen.add("a")
+seen.add("a")
+print(set.len(seen))      // 1
+print(set.contains(seen, "a"))  // true
+```
+
+**Transforming lists** — `map`, `filter`, `fold`, and stable `sort_by`:
+
+```misa
+print(map([1, 2, 3], |x| x * 2))            // [2, 4, 6]
+print(filter([1, 2, 3, 4], |x| x % 2 == 0)) // [2, 4]
+print(fold([1, 2, 3], 0, |a, b| a + b))      // 6
+```
+
+**Regex** — patterns are validated at check time (a bad pattern is `E200`,
+not a runtime surprise):
+
+```misa
+let re = regex("([0-9]+)-([0-9]+)")
+print(regex.matches(re, "123-456"))  // true
+print(regex.captures(re, "123-456")) // [123, 456]
+```
+
 ## Control flow
 
 ```misa
@@ -467,6 +494,91 @@ Rules that keep you out of trouble:
 On the web target, `spawn` raises E600 (fibers aren't available there);
 everywhere else — interpreter, host binaries, Android, iOS — behaves
 identically.
+
+## Networking
+
+TCP sockets and an HTTP server, built for the task system. Every network
+operation throws `E304` on failure — the same error as the `http.*` client —
+so one `catch` covers DNS failures, refused connections, and timeouts.
+
+**Echo server** — the canonical first program. `net.listen(0)` asks the OS
+for an ephemeral port (no more "address already in use" flakes); `lis.port()`
+reads it back:
+
+```misa
+let lis = net.listen(0)
+let port = lis.port()
+
+// the server lives in a child task; it dies with our scope
+let srv = spawn {
+  let conn = lis.accept()          // blocks until a client arrives
+  let msg = conn.recv(1024)
+  conn.send("echo:" + msg)
+  conn.close()
+}
+
+sleep(200)                          // let the server reach accept()
+
+let c = net.connect("127.0.0.1", port)
+c.send("hello")
+print(c.recv(1024))                 // echo:hello
+c.close()
+
+await srv
+print("done")
+```
+
+Method style (`conn.send(...)`, `lis.accept()`) and function style
+(`socket.send(conn, ...)`, `net.accept(lis)`) are interchangeable.
+`recv` returns `""` on clean EOF — it is never an error. `set_timeout(ms)`
+arms a recv/send deadline; expiry raises `E304`.
+
+**Chat server** — one task per client, a channel for broadcast:
+
+```misa
+let lis = net.listen(9000)
+let broadcast = chan<Text>()
+
+// fan-out: one task reads the channel, tracks clients via a second channel
+spawn {
+  let clients = chan<Socket>()
+  // (client registry omitted for brevity — a Map<Socket> works too)
+  for msg in broadcast {
+    print("broadcast: " + msg)
+  }
+}
+
+while true {
+  let conn = lis.accept()
+  spawn {
+    broadcast.send(conn.recv(1024))  // one message per client, v1
+    conn.close()
+  }
+}
+```
+
+**HTTP server** — `http.serve` takes a port and a handler lambda. The
+handler receives a `Request` (`method`, `path`, `query`, `headers`, `body`)
+and returns a `Response` (`status`, `headers`, `body`; defaults are `200`,
+`{}`, `"text/plain"`):
+
+```misa
+http.serve(8080, |req: Request| {
+  if req.path == "/hello" {
+    return {status: 200, body: "hi " + req.query["name"]}
+  }
+  return {status: 404, body: "not found"}
+})
+```
+
+Connections are handled sequentially in v1 — for concurrency, do the work
+in `spawn`ed tasks inside the handler. A throwing handler becomes a `500`
+for that connection; the server keeps running. Malformed requests get
+`400`, oversize headers `431`, oversize bodies `413`, chunked bodies `501`.
+
+Platforms: interpreter and host binaries fully work; Android/iOS compile the
+POSIX code but haven't run it on device yet; web raises `E600` (browsers
+can't open TCP sockets).
 
 ## Modules
 

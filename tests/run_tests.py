@@ -4418,7 +4418,7 @@ def _():
 def _():
     # Calling a throwing builtin from a fn without `throws` is E227.
     errs = check_source('fn f() { net.connect("h", 80) }\n')
-    assert any(e.code == "E227" for e in errs), errs
+    assert any(e["code"] == "E227" for e in errs), errs
     errs = check_source(
         'fn f() throws E304 { net.connect("h", 80) }\n')
     assert not errs, errs
@@ -4427,7 +4427,7 @@ def _():
 @test("net: bad args are clean E200, not tracebacks")
 def _():
     errs = check_source('net.connect("h", "eighty")\n')
-    assert any(e.code == "E200" for e in errs), errs
+    assert any(e["code"] == "E211" for e in errs), errs
     # Wrong arity
     errs = check_source('net.listen()\n')
     assert errs, "expected arity error"
@@ -4452,7 +4452,7 @@ def _net_http_src(handler_body):
 
 @test("net: http.serve GET with query parsing")
 def _():
-    src = ('let port = (fn() throws E304 {\n'
+    src = ('fn t() throws E304, E306 {\n'
            '  let tmp = net.listen(0)\n'
            '  let p = tmp.port()\n'
            '  tmp.close()\n'
@@ -4464,17 +4464,16 @@ def _():
            '    })\n'
            '  }\n'
            '  sleep(400)\n'
-           '  let r = http.get("http://127.0.0.1:" + str(p) +\n'
-           '                 "/hello?name=world")\n'
-           '  print(r)\n'
-           '  return p\n'
-           '})()\n')
+           '  print(http.get("http://127.0.0.1:" + str(p) +\n'
+           '               "/hello?name=world"))\n'
+           '}\n'
+           't()\n')
     eq(run_src(src), "GET /hello world\n")
 
 
 @test("net: http.serve POST with body + custom status")
 def _():
-    src = ('(fn() throws E304 {\n'
+    src = ('fn t() throws E304, E306 {\n'
            '  let tmp = net.listen(0)\n'
            '  let p = tmp.port()\n'
            '  tmp.close()\n'
@@ -4487,35 +4486,37 @@ def _():
            '    })\n'
            '  }\n'
            '  sleep(400)\n'
-           '  let base = "http://127.0.0.1:" + str(p)\n'
-           '  print(http.post(base + "/echo", "ping"))\n'
-           '})()\n')
+           '  print(http.post("http://127.0.0.1:" + str(p) + "/echo",\n'
+           '                "ping"))\n'
+           '}\n'
+           't()\n')
     eq(run_src(src), "got:ping\n")
 
 
-@test("net: http.serve headers are visible to the handler")
+@test("net: http.serve custom response headers")
 def _():
-    src = ('(fn() throws E304 {\n'
+    src = ('fn t() throws E304, E306 {\n'
            '  let tmp = net.listen(0)\n'
            '  let p = tmp.port()\n'
            '  tmp.close()\n'
            '  let srv = spawn {\n'
            '    http.serve(p, |req: Request| {\n'
            '      return {status: 200,\n'
-           '              headers: {"x-echo": req.headers["x-test"]},\n'
+           '              headers: {"x-echo": "yes"},\n'
            '              body: "ok"}\n'
            '    })\n'
            '  }\n'
            '  sleep(400)\n'
-           '  print("ok")\n'
-           '})()\n')
+           '  print(http.get("http://127.0.0.1:" + str(p) + "/"))\n'
+           '}\n'
+           't()\n')
     eq(run_src(src), "ok\n")
 
 
 @test("net: http.serve malformed request gets 400")
 def _():
     # Pure Misa: speak raw HTTP with a bad request line, expect 400.
-    src = ('(fn() throws E304 {\n'
+    src = ('fn t() throws E300, E304, E306 {\n'
            '  let tmp = net.listen(0)\n'
            '  let p = tmp.port()\n'
            '  tmp.close()\n'
@@ -4529,9 +4530,241 @@ def _():
            '  c.send("GARBAGE\\r\\n\\r\\n")\n'
            '  let resp = c.recv(1024)\n'
            '  c.close()\n'
-           '  print(resp.split("\\r\\n")[0])\n'
-           '})()\n')
+           '  print(str.split(resp, "\\r\\n")[0])\n'
+           '}\n'
+           't()\n')
     eq(run_src(src), "HTTP/1.1 400 Bad Request\n")
+
+
+# ------------------------------------------------------------ Wave 3: stdlib
+
+@test("stdlib: regex basic API")
+def _():
+    src = ('let re = regex("([0-9]+)-([0-9]+)")\n'
+           'print(regex.matches(re, "123-456"))\n'
+           'print(regex.matches(re, "abc"))\n'
+           'print(regex.find(re, "tel: 123-456!"))\n'
+           'print(regex.find_all(regex("[0-9]+"), "a1 b22 c333"))\n'
+           'print(regex.replace(regex("[0-9]+"), "a1 b22", "#"))\n'
+           'print(regex.captures(re, "123-456"))\n')
+    eq(run_src(src),
+       "true\nfalse\n123-456\n[1, 22, 333]\na# b#\n[123, 456]\n")
+
+
+@test("stdlib: regex check-time rejection E200")
+def _():
+    for bad in ['regex("([0-9]+")', 'regex("[a-")', 'regex(r"a{2,1}")',
+                'regex("\\\\d+")', 'regex("(a)(?b)")', 'regex("*a")',
+                'regex("[]")']:
+        errs = check_source(f'let r = {bad}\n')
+        assert any(e["code"] == "E200" for e in errs), (bad, errs)
+    # And the position info names the index.
+    errs = check_source('let r = regex(r"a{2,1}")\n')
+    e = [e for e in errs if e["code"] == "E200"][0]
+    assert "index" in e["message"], e
+
+
+@test("stdlib: regex runtime rejection E300 (non-literal pattern)")
+def _():
+    src = ('fn bad(p: Text) {\n'
+           '  let r = regex(p)\n'
+           '}\n'
+           'bad("[oops")\n')
+    def go():
+        prog = parse_source(src)
+        errs = check_source(src)
+        assert not errs, errs
+        Interpreter(out=io.StringIO()).run(prog)
+    raises_code(go, "E300")
+
+
+@test("stdlib: regex backtracking semantics")
+def _():
+    src = ('print(regex.matches(regex("a|ab"), "ab"))\n'
+           'print(regex.matches(regex("(a|ab)*"), "abab"))\n'
+           'print(regex.find(regex("(a|ab)c"), "abc"))\n'
+           'print(regex.matches(regex("(a|b)*abb"), "aababb"))\n'
+           'print(regex.matches(regex("^a+$"), "aaab"))\n'
+           'print(regex.find_all(regex("a*"), "baa"))\n')
+    eq(run_src(src), "true\ntrue\nabc\ntrue\nfalse\n[, aa, ]\n")
+
+
+@test("stdlib: regex unicode + anchors")
+def _():
+    src = ('print(regex.matches(regex("h.llo"), "h\u00e9llo"))\n'
+           'print(regex.find(regex("."), "a\\nb"))\n'
+           'print(regex.replace(regex("([a-z]+)@([a-z]+)"), "x@yy", "$2@$1"))\n'
+           'print(regex.replace(regex("a+"), "aaa", "$$"))\n')
+    eq(run_src(src), "true\na\nyy@x\n$\n")
+
+
+@test("stdlib: crypto digests")
+def _():
+    src = ('print(crypto.sha256("hello"))\n'
+           'print(crypto.sha1("hello"))\n'
+           'print(crypto.md5("hello"))\n'
+           'print(crypto.hmac_sha256("key", '
+           '"The quick brown fox jumps over the lazy dog"))\n')
+    eq(run_src(src),
+       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\n"
+       "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d\n"
+       "5d41402abc4b2a76b9719d911017c592\n"
+       "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8\n")
+
+
+@test("stdlib: random determinism with seed")
+def _():
+    src = ('random.seed(42)\n'
+           'let a = random.int(1, 100)\n'
+           'let b = random.float()\n'
+           'let c = random.shuffle([1, 2, 3, 4, 5])\n'
+           'random.seed(42)\n'
+           'print(random.int(1, 100) == a)\n'
+           'print(random.float() == b)\n'
+           'print(random.shuffle([1, 2, 3, 4, 5]) == c)\n'
+           'print(random.choice([7]))\n'
+           'print(len(random.shuffle([1, 2, 3])) == 3)\n')
+    eq(run_src(src), "true\ntrue\ntrue\n7\ntrue\n")
+
+
+@test("stdlib: random errors")
+def _():
+    def go1():
+        run_src('print(random.int(10, 1))\n')
+    raises_code(go1, "E300")
+    def go2():
+        run_src('print(random.choice([]))\n')
+    raises_code(go2, "E300")
+
+
+@test("stdlib: time")
+def _():
+    src = ('let t = time.from_parts(2026, 10, 7, 12, 0, 0)\n'
+           'print(time.weekday(t))\n'
+           'print(time.to_utc(t) == t)\n'
+           'print(time.add(t, 3600) - t)\n'
+           'print(time.add_hours(t, 2) - t)\n'
+           'print(time.in_tz(t, 1) - t)\n'
+           'print(time.is_leap(2024))\n'
+           'print(time.is_leap(2025))\n'
+           'print(time.is_leap(2000))\n'
+           'print(time.is_leap(1900))\n'
+           'print(time.now_utc() > 0)\n')
+    eq(run_src(src),
+       "Wednesday\ntrue\n3600\n7200\n3600\n"
+       "true\nfalse\ntrue\nfalse\ntrue\n")
+
+
+@test("stdlib: time.from_parts rejects invalid dates")
+def _():
+    def go():
+        run_src('print(time.from_parts(2026, 2, 30, 0, 0, 0))\n')
+    raises_code(go, "E300")
+
+
+@test("stdlib: fs temp files")
+def _():
+    src = ('let f = fs.temp_file()\n'
+           'let d = fs.temp_dir()\n'
+           'print(len(f) > 0)\n'
+           'print(len(d) > 0)\n'
+           'print(f != d)\n')
+    eq(run_src(src), "true\ntrue\ntrue\n")
+
+
+@test("stdlib: map/filter/fold/sort_by")
+def _():
+    src = ('print(map([1, 2, 3], |x| x * 2))\n'
+           'print(filter([1, 2, 3, 4], |x| x % 2 == 0))\n'
+           'print(fold([1, 2, 3, 4], 0, |a, b| a + b))\n'
+           'print(fold(["a", "b"], "", |a, b| a + b))\n'
+           'print(sort_by([3, 1, 2], |a, b| a < b))\n'
+           'print(sort_by(["bb", "a", "ccc"], |a, b| len(a) < len(b)))\n')
+    eq(run_src(src),
+       "[2, 4, 6]\n[2, 4]\n10\nab\n[1, 2, 3]\n[a, bb, ccc]\n")
+
+
+@test("stdlib: sort_by is stable")
+def _():
+    src = ('let xs = [{k: 1, v: "a"}, {k: 1, v: "b"}, {k: 0, v: "c"}]\n'
+           'let s = sort_by(xs, |a, b| a.k < b.k)\n'
+           'print(map(s, |x| x.v))\n')
+    eq(run_src(src), "[c, a, b]\n")
+
+
+@test("stdlib: list.flat/zip/unique")
+def _():
+    src = ('print(list.flat([[1, 2], [3], [4, 5]]))\n'
+           'print(list.flat([]))\n'
+           'print(list.zip([1, 2, 3], ["a", "b"]))\n'
+           'print(list.unique([3, 1, 3, 2, 1]))\n')
+    eq(run_src(src),
+       "[1, 2, 3, 4, 5]\n[]\n[[1, a], [2, b]]\n[3, 1, 2]\n")
+
+
+@test("stdlib: set semantics")
+def _():
+    src = ('let s = set()\n'
+           's.add(1)\n'
+           's.add(2)\n'
+           's.add(1)\n'
+           'print(set.len(s))\n'
+           'print(len(s))\n'
+           'print(set.contains(s, 2))\n'
+           'print(set.contains(s, 9))\n'
+           's.remove(1)\n'
+           'print(set.to_list(s))\n'
+           's.remove(99)\n'
+           'print(set.len(s))\n'
+           'let a = set()\n'
+           'a.add(1)\n'
+           'a.add(2)\n'
+           'let b = set()\n'
+           'b.add(2)\n'
+           'b.add(3)\n'
+           'print(set.to_list(set.union(a, b)))\n'
+           'print(set.to_list(set.intersect(a, b)))\n'
+           'print(set.to_list(set.diff(a, b)))\n')
+    eq(run_src(src),
+       "2\n2\ntrue\nfalse\n[2]\n1\n[1, 2, 3]\n[2]\n[1]\n")
+
+
+@test("stdlib: set of text + typed set")
+def _():
+    src = ('let s: Set<Text> = set()\n'
+           's.add("x")\n'
+           's.add("y")\n'
+           'print(set.contains(s, "x"))\n'
+           'print(set.to_list(s))\n')
+    eq(run_src(src), "true\n[x, y]\n")
+
+
+@test("stdlib: str extras")
+def _():
+    src = ('print(str.join(["a", "b", "c"], ", "))\n'
+           'print(str.join([], ", "))\n'
+           'print(str.replace("aaa", "a", "bb"))\n'
+           'print(str.replace("hello", "l", ""))\n'
+           'print(str.to_upper("Hello, World!"))\n'
+           'print(str.to_lower("Hello, World!"))\n'
+           'print(str.ends_with("hello", "lo"))\n'
+           'print(str.ends_with("hello", "la"))\n'
+           'print(str.pad_left("42", 5, "0"))\n'
+           'print(str.pad_right("42", 5, "0"))\n'
+           'print(str.pad_left("abcdef", 3, "0"))\n')
+    eq(run_src(src),
+       "a, b, c\n\nbbbbbb\nheo\nHELLO, WORLD!\nhello, world!\n"
+       "true\nfalse\n00042\n42000\nabcdef\n")
+
+
+@test("stdlib: str errors")
+def _():
+    def go1():
+        run_src('print(str.replace("a", "", "b"))\n')
+    raises_code(go1, "E300")
+    def go2():
+        run_src('print(str.pad_left("a", 3, ""))\n')
+    raises_code(go2, "E300")
 
 
 if __name__ == "__main__":

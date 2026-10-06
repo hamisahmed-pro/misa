@@ -1229,7 +1229,10 @@ class Interpreter:
         # M-4: `<handle>.exec/query/close(...)` where the handle variable
         # holds a DbHandle, regardless of its name. (The checker rewrites
         # the checked AST; this covers ASTs that bypass checking.)
-        if name not in ("db.exec", "db.query", "db.close") \
+        if name not in ("db.exec", "db.query", "db.close",
+                        "net.accept", "net.port", "listener.close",
+                        "socket.send", "socket.recv", "socket.close",
+                        "socket.set_timeout") \
                 and "." in name:
             recv, _, field = name.partition(".")
             if field in ("exec", "query", "close"):
@@ -1239,6 +1242,14 @@ class Interpreter:
                     rv = None
                 if isinstance(rv, DbHandle):
                     name = "db." + field
+                elif isinstance(rv, ListenerHandle) and field == "close":
+                    # Wave 3: `lis.close()`.
+                    name = "listener.close"
+                    args = [rv] + args
+                elif isinstance(rv, SocketHandle) and field == "close":
+                    # Wave 3: `sock.close()`.
+                    name = "socket.close"
+                    args = [rv] + args
             elif field in ("send", "recv", "close") \
                     and recv != "chan":
                 # Phase 7: `<ch>.send/.recv/.close(...)` where the
@@ -1260,6 +1271,43 @@ class Interpreter:
                     # variable holds a TextBuilder (checker rewrites the
                     # checked AST; this covers ASTs that bypass checking).
                     name = "builder." + field
+                    args = [rv] + args
+                elif isinstance(rv, SocketHandle) \
+                        and field in ("send", "recv", "close"):
+                    # Wave 3: `sock.send(d)` / `sock.recv(n)` /
+                    # `sock.close()` where the variable holds a
+                    # SocketHandle.
+                    name = "socket." + field
+                    args = [rv] + args
+            elif field in ("add", "contains", "remove", "union",
+                           "intersect", "diff", "to_list", "len"):
+                # Wave 3 (stdlib): `s.add(x)` etc. where the variable
+                # holds a SetValue (the checker rewrites the checked
+                # AST; this covers ASTs that bypass checking).
+                try:
+                    rv = env.lookup(recv)[0]
+                except UndefinedName:
+                    rv = None
+                if isinstance(rv, SetValue):
+                    name = "set." + field
+                    args = [rv] + args
+            elif field in ("accept", "port", "set_timeout"):
+                # Wave 3: `lis.accept()` / `lis.port()` /
+                # `sock.set_timeout(ms)` — fields no other handle type
+                # uses, so the receiver type alone decides. (The checker
+                # rejects cross-type uses on the checked path.)
+                try:
+                    rv = env.lookup(recv)[0]
+                except UndefinedName:
+                    rv = None
+                if isinstance(rv, ListenerHandle) \
+                        and field in ("accept", "port"):
+                    name = {"accept": "net.accept",
+                            "port": "net.port"}[field]
+                    args = [rv] + args
+                elif isinstance(rv, SocketHandle) \
+                        and field == "set_timeout":
+                    name = "socket.set_timeout"
                     args = [rv] + args
         if name in self.models:
             return self.call_model(self.models[name], args, e)

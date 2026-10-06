@@ -41,6 +41,8 @@ let s = b.build()
 |---|---|---|
 | `fs.read` | `fs.read(path: Text) -> Text` | Read a whole file as text; throws `Error{code: "E303"}` on failure. |
 | `fs.write` | `fs.write(path: Text, text: Text)` | Write text to a file (creates/overwrites); throws `Error{code: "E303"}` on failure. |
+| `fs.temp_file` | `fs.temp_file() -> Text` | Create an empty temp file, return its path; throws `Error{code: "E303"}` on failure. |
+| `fs.temp_dir` | `fs.temp_dir() -> Text` | Create an empty temp directory, return its path; throws `Error{code: "E303"}` on failure. |
 
 Paths are resolved against the process working directory. `misa run`
 is a developer tool and runs with the user's privileges; do not run
@@ -53,6 +55,54 @@ untrusted Misa programs — a program can read and write your files.
 | `http.get` | `http.get(url: Text) -> Text` | GET a URL, return the body as text; throws `Error{code: "E304"}` on network failure or non-2xx status (30s timeout). |
 | `http.post` | `http.post(url: Text, body: Text) -> Text` | POST `body` as `text/plain`; returns the response body as text; `E304` on failure (30s timeout). |
 | `http.post_json` | `http.post_json(url: Text, v: value) -> Text` | `json.stringify(v)` POSTed as `application/json`; returns the response body; `E304` on failure. |
+| `http.serve` | `http.serve(port: Int, handler: fn(Request) -> Response) -> Void` | Run a blocking HTTP/1.1 server on `port`. Each connection is handled sequentially (v1); use `spawn` for concurrency (see example). Throws `E304` on bind failure. See "HTTP server" below. |
+
+## 3b. TCP sockets (`net` namespace) — Wave 3
+
+All socket operations throw `E304` on failure (consistent with the `http.*`
+client). Sockets integrate with structured concurrency: a `spawn`ed task can
+`accept()` while the main task `connect()`s; child tasks are cancelled when
+their scope exits.
+
+| Function | Signature | Description |
+|---|---|---|
+| `net.connect` | `net.connect(host: Text, port: Int) -> Socket` | TCP-connect to `host:port`; `E304` on failure (DNS, refused, timeout). |
+| `net.listen` | `net.listen(port: Int) -> Listener` | Bind `127.0.0.1:port` and listen; `port: 0` picks an ephemeral port (read it back with `lis.port()`). `E304` on failure. |
+| `net.accept` | `net.accept(lis: Listener) -> Socket` | Block until a client connects; returns the connected `Socket`. `E304` on failure. Method style: `lis.accept()`. |
+| `net.port` | `net.port(lis: Listener) -> Int` | The bound port (useful with `net.listen(0)`). Method style: `lis.port()`. |
+| `listener.close` | `listener.close(lis: Listener)` | Close the listener. Method style: `lis.close()`. |
+| `socket.send` | `socket.send(s: Socket, data: Text) -> Int` | Send UTF-8 bytes; returns bytes sent. Method style: `s.send(data)`. |
+| `socket.recv` | `socket.recv(s: Socket, max: Int) -> Text` | Receive up to `max` bytes, decoded as UTF-8 (incremental decoder handles splits). Returns `""` on clean EOF — never an error. Method style: `s.recv(max)`. |
+| `socket.close` | `socket.close(s: Socket)` | Close the socket. Method style: `s.close()`. |
+| `socket.set_timeout` | `socket.set_timeout(s: Socket, ms: Int)` | Set recv/send timeout in milliseconds; `0` disables. A timeout raises `E304`. Method style: `s.set_timeout(ms)`. |
+
+### HTTP server (`http.serve`)
+
+```misa
+http.serve(8080, |req: Request| {
+  return {status: 200, body: "hello " + req.path}
+})
+```
+
+`Request` is `{method: Text, path: Text, query: Map<Text,Text>,
+headers: Map<Text,Text>, body: Text}`. `Response` is `{status: Int,
+headers: Map<Text,Text>, body: Text}` — omitted fields default to `200`,
+`{}`, and `"text/plain"`.
+
+**Parser limits** (identical on both backends; violations get clean status
+codes, never a crash): max 64KB headers → `431`; max 10MB body →
+`413`; max 100 headers → `431`; `Transfer-Encoding: chunked` → `501`
+(not implemented); malformed request line/headers → `400`. A handler that
+throws is isolated per-connection → `500`, and the server keeps running.
+
+**Concurrency:** v1 handles connections sequentially. For concurrent
+connections, `spawn` a task per connection inside the handler, or run the
+server in a `spawn`ed task alongside clients (see `docs/tour.md`).
+
+**Per-target status:** interpreter ✅ (Python `socket`); Linux/macOS AOT ✅
+(POSIX sockets, non-blocking + fiber-scheduler parking); Android ✅/iOS ✅
+(compiles — POSIX code is in the runtime — but not yet verified on device);
+web ❌ → clean `E600` (browsers cannot open TCP sockets).
 
 ## 3b. Strings (`str` namespace) — Phase 6 prerequisite
 
@@ -68,6 +118,13 @@ surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
 | `str.trim` | `str.trim(s: Text) -> Text` | Strip leading/trailing whitespace. |
 | `str.ord` | `str.ord(c: Text) -> Int` | Unicode code point of the first character; error on empty input. |
 | `str.chr` | `str.chr(code: Int) -> Text` | Character for a Unicode code point; error on invalid code. |
+| `str.join` | `str.join(xs: [Text], sep: Text) -> Text` | Join with separator (the inverse of `str.split`). |
+| `str.replace` | `str.replace(s: Text, old: Text, new: Text) -> Text` | Replace all non-overlapping occurrences of `old`; error when `old` is empty. |
+| `str.ends_with` | `str.ends_with(s: Text, suffix: Text) -> Bool` | True when `s` ends with `suffix`. |
+| `str.to_upper` | `str.to_upper(s: Text) -> Text` | Uppercase. v1 maps ASCII `a`–`z` only (documented); full Unicode case mapping is future work. |
+| `str.to_lower` | `str.to_lower(s: Text) -> Text` | Lowercase (ASCII-only in v1, as above). |
+| `str.pad_left` | `str.pad_left(s: Text, width: Int, pad: Text) -> Text` | Pad on the left with `pad`'s first char to `width` chars; error when `pad` is empty. |
+| `str.pad_right` | `str.pad_right(s: Text, width: Int, pad: Text) -> Text` | Pad on the right (as above). |
 
 ## 3c. Processes (`process` namespace) — Phase 6 prerequisite
 
@@ -82,7 +139,7 @@ surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
 | `json.parse` | `json.parse(s: Text) -> value` | Parse JSON text. Objects become records, arrays become lists, strings become `Text`, `true`/`false` become `Bool`, `null` becomes `nil`. Numbers become `Int` when they have no fraction or exponent and fit in int64, otherwise `Float`. Throws `Error{code: "E300"}` on invalid JSON. |
 | `json.stringify` | `json.stringify(v) -> Text` | Canonical compact JSON (`{"a":1}`, `ensure_ascii=False` semantics). Throws `Error{code: "E300"}` for non-JSON values (functions/closures, `Ptr`, `Db` handles, `Media`, `Iter`, `Error`). |
 
-## 3f. Time (`time` namespace) — Phase 5
+## 3f. Time (`time` namespace) — Phase 5, extended Wave 3
 
 | Function | Signature | Description |
 |---|---|---|
@@ -90,6 +147,14 @@ surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
 | `time.now_ms` | `time.now_ms() -> Int` | Current Unix epoch time in milliseconds. |
 | `time.format` | `time.format(epoch: Int, fmt: Text) -> Text` | Format an epoch timestamp with `strftime`-style directives, in UTC (e.g. `"%Y-%m-%d %H:%M:%S"`). |
 | `time.parse` | `time.parse(s: Text, fmt: Text) -> Int` | Parse `s` with `strptime`-style `fmt` (UTC); returns epoch seconds. Throws `Error{code: "E300"}` when `s` does not match `fmt`. |
+| `time.now_utc` | `time.now_utc() -> Int` | Current Unix epoch time in seconds (identical to `time.now`; the name documents that epoch timestamps are always UTC). |
+| `time.to_utc` | `time.to_utc(t: Int) -> Int` | Identity — epoch timestamps are always UTC; exists for clarity at API boundaries. |
+| `time.from_parts` | `time.from_parts(year: Int, month: Int, day: Int, hour: Int, min: Int, sec: Int) -> Int` | Epoch seconds for the given UTC date/time. Throws `Error{code: "E300"}` for invalid dates (e.g. month 13, Feb 30 — no silent normalization). |
+| `time.add` | `time.add(t: Int, seconds: Int) -> Int` | `t + seconds`. |
+| `time.add_hours` | `time.add_hours(t: Int, h: Int) -> Int` | `t + h * 3600`. |
+| `time.in_tz` | `time.in_tz(t: Int, offset_hours: Float) -> Int` | Shift `t` so UTC formatting shows wall-clock time at the given offset (fractional hours OK, e.g. `5.5`). v1 is offset-based — there is no tz database (no DST rules, no named zones). |
+| `time.weekday` | `time.weekday(t: Int) -> Text` | English weekday name in UTC (`"Monday"` … `"Sunday"`). |
+| `time.is_leap` | `time.is_leap(year: Int) -> Bool` | Gregorian leap-year rule. |
 
 ## 3g. Math (`math` namespace) — Phase 5
 
@@ -101,6 +166,70 @@ surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
 | `math.floor` | `math.floor(x: Float) -> Int` | Round down. |
 | `math.ceil` | `math.ceil(x: Float) -> Int` | Round up. |
 | `math.round` | `math.round(x: Float) -> Int` | Round half away from zero (`2.5 -> 3`, `-2.5 -> -3`). |
+
+## 3h. Regex (`regex` namespace) — Wave 3
+
+`regex(pattern: Text) -> Regex` compiles a pattern **at check time** when
+the pattern is a literal: an invalid pattern is `E200` (with the index of
+the problem), not a runtime surprise. A non-literal pattern is validated
+at runtime (`E300`).
+
+Supported grammar (v1): literals, `.` (any char except `\n`), `^`/`$`
+anchors, `*` `+` `?` `{m}` `{m,}` `{m,n}` (greedy, backtracking), `(...)`
+groups, `|` alternation, `[...]` classes (ranges, negation `[^...]`),
+escapes for metacharacters (`\.`, `\*`, …) and `\n`/`\t`. Matching is by
+Unicode code point on both backends. Backtracking follows PCRE semantics
+(leftmost match wins; a later failure backtracks into earlier choices —
+verified against Python `re` on the supported subset).
+
+Rejected at check time with guidance: `\d`/`\w`/`\s`/`\b` (hints name the
+`[...]` equivalent), `(?...)` groups, backreferences, lazy quantifiers,
+lookaround. These are future work, not silent miscompiles.
+
+| Function | Signature | Description |
+|---|---|---|
+| `regex` | `regex(pattern: Text) -> Regex` | Compile; `E200` at check time for a bad literal pattern, `E300` at runtime for a bad dynamic pattern. |
+| `regex.matches` | `regex.matches(re: Regex, text: Text) -> Bool` | True if the whole text matches. |
+| `regex.find` | `regex.find(re: Regex, text: Text) -> Text?` | First match, or `nil`. |
+| `regex.find_all` | `regex.find_all(re: Regex, text: Text) -> [Text]` | All non-overlapping matches (empty matches advance one char). |
+| `regex.replace` | `regex.replace(re: Regex, text: Text, repl: Text) -> Text` | Replace all matches; `$1`–`$9` refer to groups, `$$` is a literal `$`. |
+| `regex.captures` | `regex.captures(re: Regex, text: Text) -> [Text]?` | Capture groups of the first match, or `nil`. Unmatched groups are `""`. |
+
+Implementation note: both backends run the *same* backtracking
+algorithm — the interpreter runs `impl/misa/regexp.py`, the AOT runtime a
+C mirror of it (`misa_rt.c`). There is deliberately no POSIX
+`regcomp`/`regexec` or Python `re` underneath, so the two backends cannot
+diverge by construction.
+
+## 3i. Crypto (`crypto` namespace) — Wave 3
+
+| Function | Signature | Description |
+|---|---|---|
+| `crypto.sha256` | `crypto.sha256(data: Text) -> Text` | SHA-256 hex digest (64 chars). |
+| `crypto.sha1` | `crypto.sha1(data: Text) -> Text` | SHA-1 hex digest (40 chars). |
+| `crypto.md5` | `crypto.md5(data: Text) -> Text` | MD5 hex digest (32 chars). |
+| `crypto.hmac_sha256` | `crypto.hmac_sha256(key: Text, msg: Text) -> Text` | HMAC-SHA-256 hex digest. |
+
+The AOT runtime carries self-contained C implementations (no OpenSSL
+dependency); the interpreter uses `hashlib`/`hmac`. Digests agree
+bit-for-bit across backends.
+
+## 3j. Random (`random` namespace) — Wave 3
+
+| Function | Signature | Description |
+|---|---|---|
+| `random.seed` | `random.seed(n: Int) -> Void` | Seed the generator. The same seed reproduces the same sequence **within a backend**. |
+| `random.int` | `random.int(min: Int, max: Int) -> Int` | Uniform int in `[min, max]` (inclusive); `E300` if `min > max`. |
+| `random.float` | `random.float() -> Float` | Uniform float in `[0, 1)`. |
+| `random.choice` | `random.choice(xs: [T]) -> T` | Uniform element; `E300` on an empty list. |
+| `random.shuffle` | `random.shuffle(xs: [T]) -> [T]` | New list, Fisher-Yates shuffled (input untouched). |
+
+Determinism is per-backend, not cross-backend: the AOT runtime uses
+splitmix64, the interpreter Python's Mersenne Twister — no two PRNGs can
+produce the same stream, so `random.seed(42); random.int(1,100)` may differ
+between `misa run` and a compiled binary. Within one backend the stream is
+exactly reproducible. (Documented honestly; cross-backend determinism is
+future work.)
 
 ## 3d. Database (`db` namespace) — Phase 5
 
@@ -136,6 +265,41 @@ let rows = db.query(db, "SELECT id, name FROM users")
 Queries over undeclared tables return dynamic `[record]` (no static
 checking, not an error). v1 validates names in SELECT/FROM/WHERE only —
 no JOIN or expression type-checking.
+
+## 3k. Collections — Wave 3
+
+Higher-order functions take a lambda (or any function value). A
+user-defined function with the same name shadows the builtin.
+
+| Function | Signature | Description |
+|---|---|---|
+| `map` | `map(xs: [T], f: (T) -> U) -> [U]` | Transform each element. |
+| `filter` | `filter(xs: [T], f: (T) -> Bool) -> [T]` | Keep elements where `f` returns true. |
+| `fold` | `fold(xs: [T], init: U, f: (U, T) -> U) -> U` | Left fold (the one name — there is no `reduce` alias). |
+| `sort_by` | `sort_by(xs: [T], less: (T, T) -> Bool) -> [T]` | Stable sort by a less-than comparator (mergesort). |
+| `list.flat` | `list.flat(xss: [[T]]) -> [T]` | Concatenate a list of lists. |
+| `list.zip` | `list.zip(xs: [T], ys: [U]) -> [[any]]` | Pair up elements; stops at the shorter list. (Pairs are 2-element lists — Misa has no tuple type.) |
+| `list.unique` | `list.unique(xs: [T]) -> [T]` | Deduplicate, keeping first-occurrence order. |
+
+### `Set<T>` — Wave 3
+
+`set()` constructs an empty set (`set<Text>()` pins the element type).
+Sets are insertion-ordered; `set.to_list` returns elements in insertion
+order. Membership uses value equality (`==` semantics). v1 is O(n)
+membership — a hashed implementation is future work; semantics are
+identical on both backends.
+
+| Function | Signature | Description |
+|---|---|---|
+| `set` | `set() -> Set<unknown>` | Empty set. Method syntax also works: `s.add(x)`. |
+| `set.add` | `set.add(s: Set<T>, x: T) -> Void` | Insert (no-op if present). |
+| `set.contains` | `set.contains(s: Set<T>, x: T) -> Bool` | Membership test. |
+| `set.remove` | `set.remove(s: Set<T>, x: T) -> Void` | Delete (no-op if absent). |
+| `set.union` | `set.union(a: Set<T>, b: Set<T>) -> Set<T>` | All elements of both. |
+| `set.intersect` | `set.intersect(a: Set<T>, b: Set<T>) -> Set<T>` | Elements in both. |
+| `set.diff` | `set.diff(a: Set<T>, b: Set<T>) -> Set<T>` | Elements in `a` but not `b`. |
+| `set.to_list` | `set.to_list(s: Set<T>) -> [T]` | Elements in insertion order. |
+| `set.len` | `set.len(s: Set<T>) -> Int` | Element count. `len(s)` also works. |
 
 ## 4. Maps
 

@@ -1,0 +1,19 @@
+// a29_net.misa — Wave 3 networking parity: TCP echo via spawn.
+// Both backends must print byte-identical output. Uses an ephemeral
+// port (net.listen(0) + lis.port()) so it never flakes on busy ports.
+let lis = net.listen(0)
+let port = lis.port()
+let srv = spawn {
+  let conn = lis.accept()
+  let msg = conn.recv(1024)
+  conn.send("echo:" + msg)
+  conn.close()
+}
+sleep(200)
+let c = net.connect("127.0.0.1", port)
+c.send("hello")
+print(c.recv(1024))
+c.close()
+lis.close()
+await srv
+print("done")
