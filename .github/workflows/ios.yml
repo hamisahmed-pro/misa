@@ -95,7 +95,8 @@ jobs:
           echo "$LOGS" | grep -q "misa: heartbeat" \
             || { echo "SMOKE TEST FAILED: no heartbeat trace"; FAIL=1; }
           # ...and the Home screen must own real views, not a blank window
-          # (PlantDoc Home = 7: screen root + Column + 5 components).
+          # (PlantDoc Home = 10: screen root + Column + 5 components +
+          # their internal subviews, e.g. the button title label).
           CENSUS=$(echo "$LOGS" | grep -o "misa: view census: [0-9]*" | tail -1 \
             | grep -o "[0-9]*")
           echo "view census: ${CENSUS:-<none>}"

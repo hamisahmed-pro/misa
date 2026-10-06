@@ -86,6 +86,10 @@ static int g_capture_seq = 0;
  * (UITableView has no intrinsic height; see misa_ui_begin_comp). */
 static const char kMisaListHeightKey;
 
+/* Associated-object key marking a screen-root stack that already
+ * received its bottom spacer (see misa_ui_show_screen). */
+static const char kMisaRootSpacerKey;
+
 static void ui_main_sync(void (^block)(void)) {
     if ([NSThread isMainThread]) {
         block();
@@ -515,6 +519,21 @@ void misa_ui_show_screen(MisaUI *ui, MisaWidget root) {
         if (!rv || !container) return;
         for (UIView *s in [container.subviews copy])
             [s removeFromSuperview];
+        /* Screens lay out top-down: give the root stack a flexible
+         * trailing spacer so spare vertical space becomes empty air
+         * instead of stretching the last component (its text would
+         * float mid-screen, vertically centered in a tall frame). */
+        if ([rv isKindOfClass:[UIStackView class]] &&
+            !objc_getAssociatedObject(rv, &kMisaRootSpacerKey)) {
+            UIView *spacer = [UIView new];
+            [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow
+                                     forAxis:UILayoutConstraintAxisVertical];
+            [spacer setContentHuggingPriority:UILayoutPriorityDefaultLow
+                                     forAxis:UILayoutConstraintAxisHorizontal];
+            [(UIStackView *)rv addArrangedSubview:spacer];
+            objc_setAssociatedObject(rv, &kMisaRootSpacerKey, spacer,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         rv.translatesAutoresizingMaskIntoConstraints = NO;
         [container addSubview:rv];
         [NSLayoutConstraint activateConstraints:@[
