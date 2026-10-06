@@ -9,12 +9,14 @@
 #include "misa_platform.h" /* P1-P4: logging, fatal, env, fs root */
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef MISA_USE_GC
 #include <gc.h>
@@ -783,6 +785,20 @@ int64_t misa_len(MVal *v, int line, int col) {
 int64_t misa_list_len(MVal *l) { return l->u.list.len; }
 MVal *misa_list_get(MVal *l, int64_t i) { return l->u.list.items[i]; }
 
+/* Phase 5 (stdlib2): struct iteration for misa_json.c. */
+int64_t misa_record_len(MVal *rec) { return rec->u.record.len; }
+const char *misa_record_field_name(MVal *rec, int64_t i) {
+    return rec->u.record.names[i];
+}
+MVal *misa_record_field_val(MVal *rec, int64_t i) {
+    return rec->u.record.vals[i];
+}
+int64_t misa_map_len(MVal *m) { return m->u.map.len; }
+MVal *misa_map_key(MVal *m, int64_t i) { return m->u.map.keys[i]; }
+MVal *misa_map_val(MVal *m, int64_t i) { return m->u.map.vals[i]; }
+int misa_bool_val(MVal *v) { return (int)v->u.b; }
+const char *misa_text_data(MVal *v) { return v->u.text.data; }
+
 MVal *misa_index_get(MVal *obj, MVal *idx, int line, int col) {
     if (obj->tag == M_TAG_MAP) {
         for (int64_t i = 0; i < obj->u.map.len; i++) {
@@ -1150,6 +1166,249 @@ MVal *misa_http_get(MVal *url, int line, int col) {
     MVal *t = misa_text((const char *)d, len);
     misa_platform_http_free(&r);
     return t;
+}
+
+/* ---------------- http.post (platform transport) ------------------ */
+/* Phase 5 (stdlib2): POST with a caller-chosen Content-Type. Error
+ * shapes mirror http.get (E304, interpreter parity). */
+
+MVal *misa_http_post(MVal *url, MVal *body, const char *content_type,
+                     int line, int col) {
+    const char *u = misa_text_z(url);
+    if (strncmp(u, "http://", 7) != 0 && strncmp(u, "https://", 8) != 0) {
+        misa_raise_fmt("E304", line, col,
+                       "http.post needs an http(s) URL, got '%s'", u);
+        return NULL;
+    }
+    const char *b = misa_text_z(body);
+    /* content_type arrives as a raw C string constant from the
+     * emitter (always "text/plain" or "application/json"). */
+    const char *ct = content_type;
+    MisaHttpResp r;
+    memset(&r, 0, sizeof r);
+    if (!misa_platform_http_post(u, ct, NULL, 0, b, 30.0, &r)) {
+        misa_raise_fmt("E304", line, col, "http.post failed: %s", r.err);
+        misa_platform_http_free(&r);
+        return NULL;
+    }
+    long status = r.status;
+    if (status < 200 || status >= 300) {
+        misa_raise_fmt("E304", line, col, "http.post %s -> HTTP %d", u,
+                       (int)status);
+        misa_platform_http_free(&r);
+        return NULL;
+    }
+    const unsigned char *d = (const unsigned char *)(r.body ? r.body : "");
+    size_t len = r.len;
+    for (size_t i = 0; i < len;) {
+        unsigned char c = d[i];
+        size_t w = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
+                 : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 0;
+        if (!w || i + w > len) {
+            misa_raise_fmt("E304", line, col,
+                           "http.post %s: body is not UTF-8 text", u);
+            misa_platform_http_free(&r);
+            return NULL;
+        }
+        i += w;
+    }
+    MVal *t = misa_text((const char *)d, len);
+    misa_platform_http_free(&r);
+    return t;
+}
+
+/* ---------------- time namespace ------------------ */
+/* Phase 5 (stdlib2). time.format/parse use UTC (interpreter parity:
+ * time.gmtime / calendar.timegm). */
+
+MVal *misa_time_now(void) {
+    return misa_int((int64_t)time(NULL));
+}
+
+MVal *misa_time_now_ms(void) {
+    struct timespec ts;
+#if defined(CLOCK_REALTIME)
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return misa_int((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#else
+    return misa_int((int64_t)time(NULL) * 1000);
+#endif
+}
+
+MVal *misa_time_format(MVal *epoch, MVal *fmt, int line, int col) {
+    time_t t = (time_t)epoch->u.i;
+    struct tm tmv;
+#if defined(_WIN32)
+    if (gmtime_s(&tmv, &t) != 0) {
+#else
+    if (gmtime_r(&t, &tmv) == NULL) {
+#endif
+        misa_raise_fmt("E300", line, col, "time.format: bad epoch");
+        return NULL;
+    }
+    char buf[256];
+    size_t n = strftime(buf, sizeof buf, misa_text_z(fmt), &tmv);
+    if (n == 0) {
+        misa_raise_fmt("E300", line, col, "time.format failed");
+        return NULL;
+    }
+    return misa_text(buf, n);
+}
+
+/* Minimal strptime for the formats we document; falls back to the
+ * libc strptime where available. */
+static int time_parse_fields(const char *s, const char *fmt, struct tm *tmv) {
+#if defined(_XOPEN_SOURCE) || defined(__linux__) || defined(__APPLE__)
+    memset(tmv, 0, sizeof *tmv);
+    char *r = strptime(s, fmt, tmv);
+    return r != NULL && *r == '\0';
+#else
+    /* Portable fallback: only "%Y-%m-%d" and "%Y-%m-%d %H:%M:%S". */
+    memset(tmv, 0, sizeof *tmv);
+    int y, mo, d, h = 0, mi = 0, se = 0;
+    if (strcmp(fmt, "%Y-%m-%d") == 0) {
+        if (sscanf(s, "%d-%d-%d", &y, &mo, &d) != 3)
+            return 0;
+    } else if (strcmp(fmt, "%Y-%m-%d %H:%M:%S") == 0) {
+        if (sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi,
+                   &se) != 6)
+            return 0;
+    } else {
+        return 0;
+    }
+    tmv->tm_year = y - 1900;
+    tmv->tm_mon = mo - 1;
+    tmv->tm_mday = d;
+    tmv->tm_hour = h;
+    tmv->tm_min = mi;
+    tmv->tm_sec = se;
+    return 1;
+#endif
+}
+
+MVal *misa_time_parse(MVal *s, MVal *fmt, int line, int col) {
+    struct tm tmv;
+    if (!time_parse_fields(misa_text_z(s), misa_text_z(fmt), &tmv)) {
+        misa_raise_fmt("E300", line, col, "time.parse: bad time string");
+        return NULL;
+    }
+    /* timegm: days since epoch in UTC. Not in strict C99; provide a
+     * portable fallback via mktime + timezone correction. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    time_t t = timegm(&tmv);
+#else
+    {
+        /* Portable: interpret as UTC by round-tripping through mktime
+         * in a forced-UTC environment is racy; instead compute the
+         * civil-days formula directly. */
+        int y = tmv.tm_year + 1900, m = tmv.tm_mon + 1, d = tmv.tm_mday;
+        y -= m <= 2;
+        int era = (y >= 0 ? y : y - 399) / 400;
+        unsigned yoe = (unsigned)(y - era * 400);
+        unsigned doy =
+            (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + (unsigned)(d - 1);
+        unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
+        time_t t2 = (time_t)(days * 86400 + tmv.tm_hour * 3600 +
+                             tmv.tm_min * 60 + tmv.tm_sec);
+        return misa_int((int64_t)t2);
+    }
+#endif
+    if (t == (time_t)-1) {
+        misa_raise_fmt("E300", line, col, "time.parse: bad time string");
+        return NULL;
+    }
+    return misa_int((int64_t)t);
+}
+
+/* ---------------- math namespace ------------------ */
+/* Phase 5 (stdlib2). Proper builtins (not FFI) so mobile targets get
+ * them too. libm is already linked on host and Android. */
+
+static double math_num(MVal *v, int line, int col, const char *op) {
+    if (v->tag == M_TAG_INT)
+        return (double)v->u.i;
+    if (v->tag == M_TAG_FLOAT)
+        return v->u.f;
+    misa_raise_fmt("E300", line, col, "math.%s needs a numeric arg", op);
+    return 0;
+}
+
+MVal *misa_math_sqrt(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "sqrt");
+    if (misa_pending())
+        return NULL;
+    if (d < 0) {
+        misa_raise_fmt("E300", line, col,
+                       "math.sqrt: domain error (negative input)");
+        return NULL;
+    }
+    return misa_float(sqrt(d));
+}
+
+MVal *misa_math_pow(MVal *x, MVal *y, int line, int col) {
+    double a = math_num(x, line, col, "pow");
+    if (misa_pending())
+        return NULL;
+    double b = math_num(y, line, col, "pow");
+    if (misa_pending())
+        return NULL;
+    errno = 0;
+    double r = pow(a, b);
+    if (errno == EDOM) {
+        misa_raise_fmt("E300", line, col, "math.pow: domain error");
+        return NULL;
+    }
+    return misa_float(r);
+}
+
+MVal *misa_math_abs(MVal *x, int line, int col) {
+    if (x->tag == M_TAG_INT) {
+        int64_t v = x->u.i;
+        /* INT64_MIN abs overflows; keep as-is is wrong — raise. */
+        if (v == INT64_MIN) {
+            misa_raise_fmt("E300", line, col,
+                           "math.abs: result out of Int range");
+            return NULL;
+        }
+        return misa_int(v < 0 ? -v : v);
+    }
+    double d = math_num(x, line, col, "abs");
+    if (misa_pending())
+        return NULL;
+    return misa_float(fabs(d));
+}
+
+static MVal *math_to_int(double d, int line, int col, const char *op) {
+    if (!isfinite(d) || d > 9.223372036854776e18 ||
+        d < -9.223372036854776e18) {
+        misa_raise_fmt("E300", line, col,
+                       "math.%s: result out of Int range", op);
+        return NULL;
+    }
+    return misa_int((int64_t)d);
+}
+
+MVal *misa_math_floor(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "floor");
+    if (misa_pending())
+        return NULL;
+    return math_to_int(floor(d), line, col, "floor");
+}
+
+MVal *misa_math_ceil(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "ceil");
+    if (misa_pending())
+        return NULL;
+    return math_to_int(ceil(d), line, col, "ceil");
+}
+
+MVal *misa_math_round(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "round");
+    if (misa_pending())
+        return NULL;
+    /* C round() is already half-away-from-zero. */
+    return math_to_int(round(d), line, col, "round");
 }
 
 /* ---------------- screens ------------------ */

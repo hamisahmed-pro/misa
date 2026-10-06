@@ -1,0 +1,31 @@
+// json_demo.misa — stdlib2 showcase: json, http, time, math.
+// Builds a small report: fetches JSON over HTTP, parses it,
+// does math on the numbers, and timestamps the result.
+
+print("=== JSON parse / stringify ===")
+let user = json.parse("{{\"name\": \"Ada\", \"scores\": [9.5, 8.0, 7.5], \"active\": true}")
+print(user.name)
+print(user.scores[0])
+
+let avg = (user.scores[0] + user.scores[1] + user.scores[2]) / 3.0
+print("average: " + str(avg))
+print("rounded: " + str(math.round(avg)))
+print("sqrt(2): " + str(math.sqrt(2.0)))
+
+let out = {"name": user.name, "avg": avg, "at": time.format(time.now(), "%Y-%m-%d %H:%M:%S")}
+let body = json.stringify(out)
+print(body)
+
+// round-trip check
+let back = json.parse(body)
+print("round-trip ok: " + str(back.name == "Ada"))
+
+print("=== HTTP POST (local echo) ===")
+print("NOTE: needs a local echo server; see tests/run_tests.py for the pattern.")
+print("=== time ===")
+let t0 = time.now()
+print("now: " + str(t0))
+print("now_ms: " + str(time.now_ms()))
+let e = time.parse("2026-10-06", "%Y-%m-%d")
+print("parsed: " + time.format(e, "%A, %d %B %Y"))
+print("done")

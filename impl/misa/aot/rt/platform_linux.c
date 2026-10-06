@@ -107,7 +107,7 @@ static size_t curl_write(char *ptr, size_t size, size_t nmemb, void *ud) {
     return b->oom ? 0 : size * nmemb; /* 0 aborts the transfer */
 }
 
-int misa_platform_http_post(const char *url,
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out) {
@@ -118,7 +118,15 @@ int misa_platform_http_post(const char *url,
         return 0;
     }
     struct curl_slist *hs = NULL;
-    hs = curl_slist_append(hs, "Content-Type: application/json");
+    {
+        /* Phase 5 (stdlib2): content type comes from the caller
+         * (application/json for model calls, text/plain or
+         * application/json for http.post). */
+        char ct[128];
+        snprintf(ct, sizeof ct, "Content-Type: %s",
+                 content_type ? content_type : "application/json");
+        hs = curl_slist_append(hs, ct);
+    }
     for (int i = 0; i < nheaders; i++)
         hs = curl_slist_append(hs, headers[i]);
     CurlBuf b = {0};
@@ -190,11 +198,11 @@ int misa_platform_http_get(const char *url, double timeout_s,
 
 #else /* !MISA_USE_CURL: no transport on this build */
 
-int misa_platform_http_post(const char *url,
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out) {
-    (void)url; (void)headers; (void)nheaders;
+    (void)url; (void)content_type; (void)headers; (void)nheaders;
     (void)body; (void)timeout_s;
     memset(out, 0, sizeof *out);
     snprintf(out->err, sizeof out->err,

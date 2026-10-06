@@ -1518,7 +1518,6 @@ static int provider_complete(const MModelMeta *meta, const char *prompt,
      * empty (seen live: hcnsec 403 "no access to model "). */
     const char *hdrs[2];
     int nhdrs = 0;
-    hdrs[nhdrs++] = "Content-Type: application/json";
     if (auth_hdr) hdrs[nhdrs++] = auth_hdr;
     /* Phase 4 (M2): the transport is the platform layer. The curl
      * backend lives in rt/platform_linux.c when built with
@@ -1527,7 +1526,7 @@ static int provider_complete(const MModelMeta *meta, const char *prompt,
      * plug in their own. */
     MisaHttpResp presp;
     memset(&presp, 0, sizeof presp);
-    if (!misa_platform_http_post(url, hdrs, nhdrs,
+    if (!misa_platform_http_post(url, "application/json", hdrs, nhdrs,
                                  body.buf ? body.buf : "",
                                  timeout_s, &presp)) {
         snprintf(errbuf, errcap, "provider network error: %s", presp.err);

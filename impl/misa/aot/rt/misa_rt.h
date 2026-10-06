@@ -125,6 +125,16 @@ void  misa_record_set(MVal *obj, const char *field, MVal *val,
                       int line, int col);
 int64_t misa_list_len(MVal *l);
 MVal   *misa_list_get(MVal *l, int64_t i);
+/* Phase 5 (stdlib2): struct iteration for misa_json.c. */
+int64_t misa_record_len(MVal *rec);
+const char *misa_record_field_name(MVal *rec, int64_t i);
+MVal   *misa_record_field_val(MVal *rec, int64_t i);
+int64_t misa_map_len(MVal *m);
+MVal   *misa_map_key(MVal *m, int64_t i);
+MVal   *misa_map_val(MVal *m, int64_t i);
+int     misa_bool_val(MVal *v);
+/* Raw text bytes (NOT NUL-terminated; use with misa_text_len). */
+const char *misa_text_data(MVal *v);
 
 /* -- for-loop iterator --------------------------------------------- */
 /* Returns NULL (no pending error) when exhausted. */
@@ -145,6 +155,21 @@ MVal *misa_builtin_media(int kind, MVal *path, int line, int col);
 MVal *misa_fs_read(MVal *path, int line, int col);          /* E303 */
 MVal *misa_fs_write(MVal *path, MVal *text, int line, int col); /* E303 */
 MVal *misa_http_get(MVal *url, int line, int col);           /* E304 */
+/* Phase 5 (stdlib2): HTTP POST, JSON, time, math. */
+MVal *misa_http_post(MVal *url, MVal *body, const char *content_type,
+                     int line, int col);                    /* E304 */
+MVal *misa_json_parse(MVal *s, int line, int col);          /* E300 */
+MVal *misa_json_stringify(MVal *v, int line, int col);      /* E300 */
+MVal *misa_time_now(void);
+MVal *misa_time_now_ms(void);
+MVal *misa_time_format(MVal *epoch, MVal *fmt, int line, int col);
+MVal *misa_time_parse(MVal *s, MVal *fmt, int line, int col); /* E300 */
+MVal *misa_math_sqrt(MVal *x, int line, int col);
+MVal *misa_math_pow(MVal *x, MVal *y, int line, int col);
+MVal *misa_math_abs(MVal *x, int line, int col);
+MVal *misa_math_floor(MVal *x, int line, int col);
+MVal *misa_math_ceil(MVal *x, int line, int col);
+MVal *misa_math_round(MVal *x, int line, int col);
 
 /* -- db (Phase 5): SQLite bindings (misa_db.c) ------------------------ */
 MVal *misa_db_open(MVal *path, int line, int col);           /* E303 */

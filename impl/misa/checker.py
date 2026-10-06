@@ -50,6 +50,21 @@ NS_BUILTINS = {
     "db.exec": (["Db", "Text", "[Text]"], "Int"),
     "db.query": (["Db", "Text", "[Text]"], "[record]"),
     "db.close": (["Db"], "Void"),
+    # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
+    "json.parse": (["Text"], "unknown"),
+    "json.stringify": (["any"], "Text"),
+    "http.post": (["Text", "Text"], "Text"),
+    "http.post_json": (["Text", "any"], "Text"),
+    "time.now": ([], "Int"),
+    "time.now_ms": ([], "Int"),
+    "time.format": (["Int", "Text"], "Text"),
+    "time.parse": (["Text", "Text"], "Int"),
+    "math.sqrt": (["Float"], "Float"),
+    "math.pow": (["Float", "Float"], "Float"),
+    "math.abs": (["Float"], "Float"),
+    "math.floor": (["Float"], "Int"),
+    "math.ceil": (["Float"], "Int"),
+    "math.round": (["Float"], "Int"),
 }
 # Phase 5 (DB): namespaced builtins with optional trailing args:
 # name -> (min_arity, max_arity). Absent = exact arity from NS_BUILTINS.
@@ -1992,6 +2007,10 @@ class Checker:
 
     def _assignable(self, want: str, got: str) -> bool:
         if want == got:
+            return True
+        # Phase 5 (stdlib2): "any" accepts any value (json.stringify,
+        # http.post_json — the dynamic value universe, like print).
+        if want == "any":
             return True
         # Phase 5a: structural function subtyping — params
         # contravariant, return covariant.

@@ -140,6 +140,20 @@ _RT_SIGS = {
     "misa_fs_read": (PTR, [PTR, I32, I32]),
     "misa_fs_write": (PTR, [PTR, PTR, I32, I32]),
     "misa_http_get": (PTR, [PTR, I32, I32]),
+    # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
+    "misa_http_post": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_json_parse": (PTR, [PTR, I32, I32]),
+    "misa_json_stringify": (PTR, [PTR, I32, I32]),
+    "misa_time_now": (PTR, []),
+    "misa_time_now_ms": (PTR, []),
+    "misa_time_format": (PTR, [PTR, PTR, I32, I32]),
+    "misa_time_parse": (PTR, [PTR, PTR, I32, I32]),
+    "misa_math_sqrt": (PTR, [PTR, I32, I32]),
+    "misa_math_pow": (PTR, [PTR, PTR, I32, I32]),
+    "misa_math_abs": (PTR, [PTR, I32, I32]),
+    "misa_math_floor": (PTR, [PTR, I32, I32]),
+    "misa_math_ceil": (PTR, [PTR, I32, I32]),
+    "misa_math_round": (PTR, [PTR, I32, I32]),
     # Phase 5 (DB): SQLite bindings.
     "misa_db_open": (PTR, [PTR, I32, I32]),
     "misa_db_exec": (PTR, [PTR, PTR, PTR, I32, I32]),
@@ -1275,6 +1289,52 @@ class Emitter:
         if name == "http.get":
             return self.call(ctx, "misa_http_get", [arg(0), line, col],
                              e)
+        # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
+        if name == "json.parse":
+            return self.call(ctx, "misa_json_parse",
+                             [arg(0), line, col], e)
+        if name == "json.stringify":
+            return self.call(ctx, "misa_json_stringify",
+                             [arg(0), line, col], e)
+        if name == "http.post":
+            ct = self.cstr("text/plain")
+            return self.call(ctx, "misa_http_post",
+                             [arg(0), arg(1), ct, line, col], e)
+        if name == "http.post_json":
+            body = self.call(ctx, "misa_json_stringify",
+                             [arg(1), line, col], e)
+            self.check(ctx, e)
+            ct = self.cstr("application/json")
+            return self.call(ctx, "misa_http_post",
+                             [arg(0), body, ct, line, col], e)
+        if name == "time.now":
+            return self.call(ctx, "misa_time_now", [], e)
+        if name == "time.now_ms":
+            return self.call(ctx, "misa_time_now_ms", [], e)
+        if name == "time.format":
+            return self.call(ctx, "misa_time_format",
+                             [arg(0), arg(1), line, col], e)
+        if name == "time.parse":
+            return self.call(ctx, "misa_time_parse",
+                             [arg(0), arg(1), line, col], e)
+        if name == "math.sqrt":
+            return self.call(ctx, "misa_math_sqrt",
+                             [arg(0), line, col], e)
+        if name == "math.pow":
+            return self.call(ctx, "misa_math_pow",
+                             [arg(0), arg(1), line, col], e)
+        if name == "math.abs":
+            return self.call(ctx, "misa_math_abs",
+                             [arg(0), line, col], e)
+        if name == "math.floor":
+            return self.call(ctx, "misa_math_floor",
+                             [arg(0), line, col], e)
+        if name == "math.ceil":
+            return self.call(ctx, "misa_math_ceil",
+                             [arg(0), line, col], e)
+        if name == "math.round":
+            return self.call(ctx, "misa_math_round",
+                             [arg(0), line, col], e)
         # Phase 5 (DB): SQLite bindings. The optional `args` list
         # defaults to an empty list.
         if name == "db.open":

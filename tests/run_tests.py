@@ -802,6 +802,174 @@ def _():
     eq(run_src(src).strip(), "E304")
 
 
+# ---------------------------------------------------------------- v0.2 stdlib2: JSON
+
+@test("stdlib2: json.parse basics")
+def _():
+    src = ('let v = json.parse("{{\\"a\\": 1, \\"b\\": true, \\"c\\": null}")\n'
+           'print(v.a)\nprint(v.b)\nprint(v.c)\n')
+    eq(run_src(src).strip().splitlines(), ["1", "true", "nil"])
+
+
+@test("stdlib2: json.parse number kinds")
+def _():
+    src = ('let v = json.parse("[42, 4.0, 1e3, -7, 0]")\n'
+           'print(v[0])\nprint(v[1])\nprint(v[2])\nprint(v[3])\n')
+    eq(run_src(src).strip().splitlines(), ["42", "4.0", "1000.0", "-7"])
+
+
+@test("stdlib2: json.parse nested + unicode")
+def _():
+    # Misa string: {{ -> { . JSON text uses a literal é (Misa has no \u).
+    src = ('let v = json.parse('
+           '"{{\\"u\\": \\"h\u00e9llo\\", '
+           '\\"n\\": {{\\"x\\": [1, {{\\"y\\": 2}]}}")\n'
+           'print(v.u)\nprint(v.n.x[1].y)\n')
+    eq(run_src(src).strip().splitlines(), ["héllo", "2"])
+
+
+@test("stdlib2: json.parse empty object/array")
+def _():
+    src = ('print(json.stringify(json.parse("{{}")))\n'
+           'print(json.stringify(json.parse("[]")))\n')
+    eq(run_src(src).strip().splitlines(), ["{}", "[]"])
+
+
+@test("stdlib2: json.parse errors E300")
+def _():
+    for bad in ['"{{"', '"[1,]"', '"{{\\"a\\":}}"', '"tru"', '""']:
+        src = (f'try {{\n    json.parse({bad})\n'
+               '} catch e {\n    print(e.code)\n}\n')
+        eq(run_src(src).strip(), "E300", bad)
+
+
+@test("stdlib2: json.stringify canonical")
+def _():
+    src = ('print(json.stringify({"b": [1, "x"], "a": true}))\n'
+           'print(json.stringify(nil))\n'
+           'print(json.stringify("hi"))\n')
+    eq(run_src(src).strip().splitlines(),
+       ['{"b":[1,"x"],"a":true}', 'null', '"hi"'])
+
+
+@test("stdlib2: json.stringify escapes")
+def _():
+    # Misa strings support \" \\ \n etc.; str.chr(1) for \u0001.
+    src = ('print(json.stringify("a\\"b\\\\c\\nd" + str.chr(1)))\n')
+    eq(run_src(src).strip(), '"a\\"b\\\\c\\nd\\u0001"')
+
+
+@test("stdlib2: json.stringify rejects non-JSON E300")
+def _():
+    src = ('fn f() -> Int { return 1 }\n'
+           'try {\n    print(json.stringify(f))\n'
+           '} catch e {\n    print(e.code)\n}\n')
+    eq(run_src(src).strip(), "E300")
+
+
+@test("stdlib2: json round-trip")
+def _():
+    src = ('let v = {"n": 42, "f": 2.5, "s": "x", "l": [1, nil],\n'
+           '         "o": {"k": false}}\n'
+           'let s = json.stringify(v)\n'
+           'let w = json.parse(s)\n'
+           'print(w.n)\nprint(w.o.k)\nprint(json.stringify(w) == s)\n')
+    eq(run_src(src).strip().splitlines(), ["42", "false", "true"])
+
+
+# ---------------------------------------------------------------- v0.2 stdlib2: HTTP POST
+
+@test("stdlib2: http.post + post_json")
+def _():
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            ctype = self.headers.get("Content-Type", "")
+            resp = (b'{"got":' + json.dumps(body.decode()).encode()
+                    + b',"ct":' + json.dumps(ctype).encode() + b'}')
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        src = (f'print(http.post("http://127.0.0.1:{port}/", "hi"))\n'
+               f'print(http.post_json("http://127.0.0.1:{port}/", '
+               '{"a": 1}))\n')
+        lines = run_src(src).strip().splitlines()
+        eq(json.loads(lines[0]),
+           {"got": "hi", "ct": "text/plain"})
+        eq(json.loads(lines[1]),
+           {"got": '{"a":1}', "ct": "application/json"})
+    finally:
+        srv.shutdown()
+
+
+@test("stdlib2: http.post failure E304")
+def _():
+    src = ('try {\n    http.post("http://127.0.0.1:1/", "x")\n'
+           '} catch e {\n    print(e.code)\n}\n')
+    eq(run_src(src).strip(), "E304")
+
+
+# ---------------------------------------------------------------- v0.2 stdlib2: time
+
+@test("stdlib2: time.now / now_ms")
+def _():
+    src = 'print(time.now() > 1700000000)\nprint(time.now_ms() > 1700000000000)\n'
+    eq(run_src(src).strip().splitlines(), ["true", "true"])
+
+
+@test("stdlib2: time.format / parse round-trip")
+def _():
+    src = ('print(time.format(0, "%Y-%m-%d"))\n'
+           'print(time.parse("2026-10-06", "%Y-%m-%d"))\n'
+           'let e = time.parse("2026-10-06 12:30:45", "%Y-%m-%d %H:%M:%S")\n'
+           'print(time.format(e, "%H:%M"))\n')
+    eq(run_src(src).strip().splitlines(),
+       ["1970-01-01", "1791244800", "12:30"])
+
+
+@test("stdlib2: time.parse failure E300")
+def _():
+    src = ('try {\n    time.parse("not-a-date", "%Y-%m-%d")\n'
+           '} catch e {\n    print(e.code)\n}\n')
+    eq(run_src(src).strip(), "E300")
+
+
+# ---------------------------------------------------------------- v0.2 stdlib2: math
+
+@test("stdlib2: math basics")
+def _():
+    src = ('print(math.sqrt(2.0))\n'
+           'print(math.pow(2.0, 10.0))\n'
+           'print(math.abs(0 - 5))\n'
+           'print(math.abs(2.5))\n'
+           'print(math.floor(2.7))\n'
+           'print(math.ceil(2.2))\n'
+           'print(math.round(2.5))\n'
+           'print(math.round(0 - 2.5))\n'
+           'print(math.floor(0 - 2.2))\n')
+    eq(run_src(src).strip().splitlines(),
+       ["1.4142135623730951", "1024.0", "5", "2.5",
+        "2", "3", "3", "-3", "-3"])
+
+
+@test("stdlib2: math.sqrt negative E300")
+def _():
+    src = ('try {\n    math.sqrt(0 - 1.0)\n'
+           '} catch e {\n    print(e.code)\n}\n')
+    eq(run_src(src).strip(), "E300")
+
+
 # ---------------------------------------------------------------- v0.2: formatter
 
 @test("v0.2 fmt: new constructs canonical")

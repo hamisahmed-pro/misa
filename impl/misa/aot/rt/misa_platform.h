@@ -94,8 +94,9 @@ typedef struct {
 
 /* Blocking POST. Returns 1 on transport success (any HTTP status),
  * 0 on transport failure (err set). The response body is valid until
- * misa_platform_http_free(). */
-int misa_platform_http_post(const char *url,
+ * misa_platform_http_free(). content_type is sent as the Content-Type
+ * header (replacing any caller-supplied one). */
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out);

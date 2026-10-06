@@ -32,6 +32,8 @@ untrusted Misa programs — a program can read and write your files.
 | Function | Signature | Description |
 |---|---|---|
 | `http.get` | `http.get(url: Text) -> Text` | GET a URL, return the body as text; throws `Error{code: "E304"}` on network failure or non-2xx status (30s timeout). |
+| `http.post` | `http.post(url: Text, body: Text) -> Text` | POST `body` as `text/plain`; returns the response body as text; `E304` on failure (30s timeout). |
+| `http.post_json` | `http.post_json(url: Text, v: value) -> Text` | `json.stringify(v)` POSTed as `application/json`; returns the response body; `E304` on failure. |
 
 ## 3b. Strings (`str` namespace) — Phase 6 prerequisite
 
@@ -49,6 +51,33 @@ untrusted Misa programs — a program can read and write your files.
 | Function | Signature | Description |
 |---|---|---|
 | `process.run` | `process.run(cmd: [Text]) -> record` | Run a command; returns `{code: Int, stdout: Text, stderr: Text}`. Throws `Error{code: "E303"}` when the command cannot be started or times out (5 minutes). **Security note:** a Misa program with `process.run` can execute arbitrary commands — treat it with the same care as `fs.write`. |
+
+## 3e. JSON (`json` namespace) — Phase 5
+
+| Function | Signature | Description |
+|---|---|---|
+| `json.parse` | `json.parse(s: Text) -> value` | Parse JSON text. Objects become records, arrays become lists, strings become `Text`, `true`/`false` become `Bool`, `null` becomes `nil`. Numbers become `Int` when they have no fraction or exponent and fit in int64, otherwise `Float`. Throws `Error{code: "E300"}` on invalid JSON. |
+| `json.stringify` | `json.stringify(v) -> Text` | Canonical compact JSON (`{"a":1}`, `ensure_ascii=False` semantics). Throws `Error{code: "E300"}` for non-JSON values (functions/closures, `Ptr`, `Db` handles, `Media`, `Iter`, `Error`). |
+
+## 3f. Time (`time` namespace) — Phase 5
+
+| Function | Signature | Description |
+|---|---|---|
+| `time.now` | `time.now() -> Int` | Current Unix epoch time in seconds. |
+| `time.now_ms` | `time.now_ms() -> Int` | Current Unix epoch time in milliseconds. |
+| `time.format` | `time.format(epoch: Int, fmt: Text) -> Text` | Format an epoch timestamp with `strftime`-style directives, in UTC (e.g. `"%Y-%m-%d %H:%M:%S"`). |
+| `time.parse` | `time.parse(s: Text, fmt: Text) -> Int` | Parse `s` with `strptime`-style `fmt` (UTC); returns epoch seconds. Throws `Error{code: "E300"}` when `s` does not match `fmt`. |
+
+## 3g. Math (`math` namespace) — Phase 5
+
+| Function | Signature | Description |
+|---|---|---|
+| `math.sqrt` | `math.sqrt(x: Float) -> Float` | Square root; throws `Error{code: "E300"}` for negative `x`. |
+| `math.pow` | `math.pow(x: Float, y: Float) -> Float` | `x` raised to `y`. |
+| `math.abs` | `math.abs(x: Int\|Float) -> Int\|Float` | Absolute value (same numeric type as input). |
+| `math.floor` | `math.floor(x: Float) -> Int` | Round down. |
+| `math.ceil` | `math.ceil(x: Float) -> Int` | Round up. |
+| `math.round` | `math.round(x: Float) -> Int` | Round half away from zero (`2.5 -> 3`, `-2.5 -> -3`). |
 
 ## 3d. Database (`db` namespace) — Phase 5
 
@@ -130,6 +159,6 @@ expose: `TextInput.text -> Text`. Event lambdas: `onTap: || { ... }`,
 
 ## 7. Reserved for future versions
 
-`Embedding` type and vector ops, JSON value type, dates/times,
-on-device inference bindings. (First-class function values shipped in
-Phase 5a.)
+`Embedding` type and vector ops, on-device inference bindings.
+(First-class function values shipped in Phase 5a; JSON and
+dates/times shipped in Phase 5 stdlib2.)

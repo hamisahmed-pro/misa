@@ -1,0 +1,62 @@
+// a18_stdlib: Phase 5 stdlib2 — json, time, math builtins.
+// Byte-identical on interpreter vs `misa build` (host).
+// (http.post/post_json are interp-tested against a local server in
+//  tests/run_tests.py; the AOT harness does not run a local server.)
+
+// --- json.parse ---
+let v = json.parse("{{\"a\": 1, \"b\": true, \"c\": null, \"d\": \"x\"}}")
+print(v.a)
+print(v.b)
+print(v.c)
+print(v.d)
+
+// numbers: int vs float
+let n = json.parse("[42, 4.0, 1e3, -7, 0.5]")
+print(n[0])
+print(n[1])
+print(n[2])
+print(n[3])
+print(n[4])
+
+// nested
+let deep = json.parse("{{\"n\": {{\"x\": [1, {{\"y\": 2}}]}}}}")
+print(deep.n.x[1].y)
+
+// empty
+print(json.stringify(json.parse("{{}")))
+print(json.stringify(json.parse("[]")))
+
+// --- json.stringify ---
+print(json.stringify({"b": [1, "x"], "a": true}))
+print(json.stringify(nil))
+print(json.stringify("hi"))
+print(json.stringify(42))
+print(json.stringify(2.5))
+
+// escapes (str.chr not in AOT v1; escape coverage is in interp tests)
+print(json.stringify("a\"b\\c\nd"))
+
+// round-trip
+let orig = {"n": 42, "f": 2.5, "s": "x", "l": [1, nil], "o": {"k": false}}
+let s = json.stringify(orig)
+print(json.stringify(json.parse(s)) == s)
+
+// --- time ---
+print(time.format(0, "%Y-%m-%d"))
+print(time.parse("2026-10-06", "%Y-%m-%d"))
+let e = time.parse("2026-10-06 12:30:45", "%Y-%m-%d %H:%M:%S")
+print(time.format(e, "%H:%M"))
+print(time.now() > 1700000000)
+print(time.now_ms() > 1700000000000)
+
+// --- math ---
+print(math.sqrt(2.0))
+print(math.pow(2.0, 10.0))
+print(math.abs(0 - 5))
+print(math.abs(2.5))
+print(math.floor(2.7))
+print(math.ceil(2.2))
+print(math.round(2.5))
+print(math.round(0 - 2.5))
+print(math.floor(0 - 2.2))
+print(math.ceil(0 - 2.2))

@@ -390,11 +390,20 @@ fail:
     return 0;
 }
 
-int misa_platform_http_post(const char *url,
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out) {
-    return http_request("POST", url, headers, nheaders, body,
+    /* Phase 5 (stdlib2): prepend the caller's Content-Type. */
+    char ct[128];
+    snprintf(ct, sizeof ct, "Content-Type: %s",
+             content_type ? content_type : "application/json");
+    const char *hdrs[17];
+    int n = 0;
+    hdrs[n++] = ct;
+    for (int i = 0; i < nheaders && n < 17; i++)
+        hdrs[n++] = headers[i];
+    return http_request("POST", url, hdrs, n, body,
                         timeout_s, out);
 }
 

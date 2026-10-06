@@ -1,6 +1,7 @@
 """Misa v0.2 tree-walking interpreter."""
 from __future__ import annotations
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -651,6 +652,42 @@ class Interpreter:
                 raise IOError_(f"fs.write failed: {ex}")
         if name == "http.get":
             return self.http_get(args[0])
+        # -- Phase 5 (stdlib2): JSON, HTTP POST, time, math --------------
+        if name == "json.parse":
+            return self.json_parse(args[0], e)
+        if name == "json.stringify":
+            return self.json_stringify(args[0], e)
+        if name == "http.post":
+            return self.http_post(args[0], args[1], "text/plain", e)
+        if name == "http.post_json":
+            body = self.json_stringify(args[1], e)
+            return self.http_post(args[0], body, "application/json", e)
+        if name == "time.now":
+            return int(time.time())
+        if name == "time.now_ms":
+            return int(time.time() * 1000)
+        if name == "time.format":
+            return self.time_format(args[0], args[1], e)
+        if name == "time.parse":
+            return self.time_parse(args[0], args[1], e)
+        if name == "math.sqrt":
+            return self.math_unary("sqrt", args[0], e, math.sqrt)
+        if name == "math.pow":
+            return self.math_binary("pow", args[0], args[1], e)
+        if name == "math.abs":
+            v = args[0]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise RuntimeError_(
+                    "math.abs(Float) needs a numeric arg",
+                    line=e.line, col=e.col)
+            return abs(v)
+        if name == "math.floor":
+            return self.math_to_int("floor", args[0], e, math.floor)
+        if name == "math.ceil":
+            return self.math_to_int("ceil", args[0], e, math.ceil)
+        if name == "math.round":
+            return self.math_to_int("round", args[0], e,
+                                    self._round_half_away)
         # -- Phase 5 (DB): SQLite bindings ------------------------------
         if name == "db.open":
             return self.db_open(args[0], e)
@@ -778,6 +815,156 @@ class Interpreter:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPError_(f"http.get {url}: body is not UTF-8 text")
+
+    def http_post(self, url: str, body: str, content_type: str,
+                  node: ast.Node) -> str:
+        if not isinstance(url, str) or not url.startswith(
+                ("http://", "https://")):
+            raise HTTPError_(f"http.post needs an http(s) URL, got {url!r}")
+        req = urllib.request.Request(
+            url, data=body.encode("utf-8"),
+            headers={"User-Agent": "misa/0.2",
+                     "Content-Type": content_type})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status < 200 or resp.status >= 300:
+                    raise HTTPError_(
+                        f"http.post {url} -> HTTP {resp.status}")
+                raw = resp.read()
+        except urllib.error.HTTPError as ex:
+            raise HTTPError_(f"http.post {url} -> HTTP {ex.code}")
+        except urllib.error.URLError as ex:
+            raise HTTPError_(f"http.post failed: {ex.reason}")
+        except TimeoutError:
+            raise HTTPError_(f"http.post timed out: {url}")
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPError_(f"http.post {url}: body is not UTF-8 text")
+
+    # -- Phase 5 (stdlib2): JSON ---------------------------------------
+
+    def json_parse(self, s: str, node: ast.Node) -> Any:
+        try:
+            v = json.loads(s)
+        except json.JSONDecodeError as ex:
+            raise RuntimeError_(f"json.parse: invalid JSON: {ex}",
+                                line=node.line, col=node.col)
+        return self._json_to_misa(v, node)
+
+    def _json_to_misa(self, v: Any, node: ast.Node) -> Any:
+        if v is None or isinstance(v, (str, bool)):
+            return v
+        if isinstance(v, int):
+            if v > 2**63 - 1 or v < -(2**63):
+                raise RuntimeError_(
+                    f"json.parse: integer {v} out of Int range",
+                    line=node.line, col=node.col)
+            return v
+        if isinstance(v, float):
+            return v
+        if isinstance(v, list):
+            return [self._json_to_misa(i, node) for i in v]
+        if isinstance(v, dict):
+            return {k: self._json_to_misa(x, node)
+                    for k, x in v.items()}
+        raise RuntimeError_(f"json.parse: unsupported value {v!r}",
+                            line=node.line, col=node.col)
+
+    def json_stringify(self, v: Any, node: ast.Node) -> str:
+        try:
+            jv = self._misa_to_json(v, node)
+            return json.dumps(jv, separators=(",", ":"),
+                              ensure_ascii=False, allow_nan=False)
+        except (ValueError, TypeError) as ex:
+            raise RuntimeError_(f"json.stringify: {ex}",
+                                line=node.line, col=node.col)
+
+    def _misa_to_json(self, v: Any, node: ast.Node) -> Any:
+        if v is None or isinstance(v, (str, bool, int, float)):
+            return v
+        if isinstance(v, list):
+            return [self._misa_to_json(i, node) for i in v]
+        if isinstance(v, dict):
+            return {k: self._misa_to_json(x, node)
+                    for k, x in v.items()}
+        if isinstance(v, MapValue):
+            out = {}
+            for k, x in v.data.items():
+                if not isinstance(k, str):
+                    raise RuntimeError_(
+                        "json.stringify: map keys must be text",
+                        line=node.line, col=node.col)
+                out[k] = self._misa_to_json(x, node)
+            return out
+        raise RuntimeError_(
+            f"json.stringify: value of type "
+            f"{type(v).__name__} is not JSON-representable",
+            line=node.line, col=node.col)
+
+    # -- Phase 5 (stdlib2): time ---------------------------------------
+
+    def time_format(self, epoch: int, fmt: str, node: ast.Node) -> str:
+        try:
+            return time.strftime(fmt, time.gmtime(epoch))
+        except (ValueError, OverflowError, OSError) as ex:
+            raise RuntimeError_(f"time.format: {ex}",
+                                line=node.line, col=node.col)
+
+    def time_parse(self, s: str, fmt: str, node: ast.Node) -> int:
+        import calendar
+        try:
+            tt = time.strptime(s, fmt)
+            return calendar.timegm(tt)
+        except ValueError as ex:
+            raise RuntimeError_(f"time.parse: {ex}",
+                                line=node.line, col=node.col)
+
+    # -- Phase 5 (stdlib2): math ---------------------------------------
+
+    @staticmethod
+    def _round_half_away(x: float) -> int:
+        import math as _math
+        return _math.floor(x + 0.5) if x >= 0 else _math.ceil(x - 0.5)
+
+    def _math_num(self, op: str, v: Any, node: ast.Node) -> float:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise RuntimeError_(f"math.{op}(Float) needs a numeric arg",
+                                line=node.line, col=node.col)
+        return float(v)
+
+    def math_unary(self, op: str, v: Any, node: ast.Node,
+                   fn) -> float:
+        import math as _math
+        x = self._math_num(op, v, node)
+        try:
+            return fn(x)
+        except ValueError as ex:
+            raise RuntimeError_(f"math.{op}: {ex}",
+                                line=node.line, col=node.col)
+
+    def math_binary(self, op: str, a: Any, b: Any,
+                    node: ast.Node) -> float:
+        x = self._math_num(op, a, node)
+        y = self._math_num(op, b, node)
+        try:
+            return math.pow(x, y)
+        except ValueError as ex:
+            raise RuntimeError_(f"math.{op}: {ex}",
+                                line=node.line, col=node.col)
+
+    def math_to_int(self, op: str, v: Any, node: ast.Node, fn) -> int:
+        import math as _math
+        x = self._math_num(op, v, node)
+        try:
+            r = fn(x)
+        except (ValueError, OverflowError) as ex:
+            raise RuntimeError_(f"math.{op}: {ex}",
+                                line=node.line, col=node.col)
+        if r > 2**63 - 1 or r < -(2**63):
+            raise RuntimeError_(f"math.{op}: result out of Int range",
+                                line=node.line, col=node.col)
+        return int(r)
 
     # -- Phase 5 (DB): SQLite ------------------------------------------
 

@@ -264,7 +264,7 @@ int misa_platform_http_get(const char *url, double timeout_s,
     return 1;
 }
 
-int misa_platform_http_post(const char *url,
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out) {
@@ -278,9 +278,12 @@ int misa_platform_http_post(const char *url,
     memset(out, 0, sizeof *out);
     FetchState st;
     memset(&st, 0, sizeof st);
-    const char *kv[33]; /* <=16 headers -> 32 slots + NULL key */
-    char *keycopy[16];
+    const char *kv[35]; /* content-type + <=16 headers -> 34 + NULL */
+    char *keycopy[17];
     int nkeys = 0, nkv = 0;
+    /* Phase 5 (stdlib2): caller's Content-Type first. */
+    kv[nkv++] = "Content-Type";
+    kv[nkv++] = content_type ? content_type : "application/json";
     int nh = nheaders < 16 ? nheaders : 16;
     for (int i = 0; i < nh; i++) {
         const char *h = headers[i] ? headers[i] : "";
