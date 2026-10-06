@@ -27,15 +27,42 @@ static sqlite3 *db_lookup(int64_t h, int line, int col, const char *op) {
     return g_db_handles[h - 1];
 }
 
-/* Bind a Misa [Text] list as statement parameters. */
+/* Bind a Misa list of scalar args as statement parameters.
+ * H-3: the interpreter binds natively via sqlite3 (Int/Float/Text all
+ * work), so AOT must too — a program passing `misa check` and running on
+ * the interpreter must not fail on AOT. */
 static void db_bind_args(sqlite3_stmt *st, MVal *args, int line, int col,
                          const char *op) {
     int64_t n = misa_list_len(args);
     for (int64_t i = 0; i < n; i++) {
         MVal *a = misa_list_get(args, i);
-        const char *z = misa_text_z(a);
-        if (sqlite3_bind_text(st, (int)(i + 1), z, -1,
-                              SQLITE_TRANSIENT) != SQLITE_OK) {
+        int rc = SQLITE_OK;
+        int idx = (int)(i + 1);
+        switch (misa_tag(a)) {
+        case M_TAG_INT:
+            rc = sqlite3_bind_int64(st, idx, misa_as_int(a));
+            break;
+        case M_TAG_FLOAT:
+            rc = sqlite3_bind_double(st, idx, misa_as_float(a));
+            break;
+        case M_TAG_BOOL:
+            rc = sqlite3_bind_int(st, idx, misa_bool_val(a));
+            break;
+        case M_TAG_TEXT: {
+            const char *z = misa_text_z(a);
+            rc = sqlite3_bind_text(st, idx, z, -1, SQLITE_TRANSIENT);
+            break;
+        }
+        case M_TAG_NULL:
+            rc = sqlite3_bind_null(st, idx);
+            break;
+        default:
+            misa_raise_fmt("E200", line, col,
+                           "%s: bind arg %d must be Int, Float, Bool, "
+                           "Text, or nil", op, idx);
+            return;
+        }
+        if (rc != SQLITE_OK) {
             misa_raise_fmt("E303", line, col, "%s: bind failed", op);
             return;
         }

@@ -6,9 +6,8 @@
  *              allow_nan=False)
  *
  * Numbers: Int when there is no fraction/exponent and the value fits
- * int64, else Float. Floats print with shortest-roundtrip precision
- * (escalating %.15g -> %.17g) plus Python-repr ".0" for integral
- * values. Strings escape exactly like CPython's ensure_ascii=False:
+ * int64, else Float. Floats print byte-identically to Python str(float)
+ * via misa_fmt_float. Strings escape exactly like CPython's ensure_ascii=False:
  * '"', '\\', \b \f \n \r \t, other C0 controls as \u00xx; all other
  * bytes (including UTF-8) pass through raw.
  *
@@ -233,8 +232,12 @@ static MVal *jp_number(JP *j) {
     size_t n = (size_t)(j->p - start);
     if (!is_float) {
         if (n >= 32) {
-            j->err = "integer out of Int range";
-            return NULL;
+            /* M-6: STDLIB.md §3e — out-of-int64 integers become Float. */
+            char tmp[64];
+            size_t m = n < sizeof tmp - 1 ? n : sizeof tmp - 1;
+            memcpy(tmp, start, m);
+            tmp[m] = '\0';
+            return misa_float(strtod(tmp, NULL));
         }
         char tmp[32];
         memcpy(tmp, start, n);
@@ -243,8 +246,8 @@ static MVal *jp_number(JP *j) {
         char *e2;
         long long v = strtoll(tmp, &e2, 10);
         if (errno == ERANGE || *e2 != '\0') {
-            j->err = "integer out of Int range";
-            return NULL;
+            /* M-6: STDLIB.md §3e — out-of-int64 integers become Float. */
+            return misa_float(strtod(tmp, NULL));
         }
         return misa_int((int64_t)v);
     }
@@ -425,25 +428,11 @@ static void js_string(JBuf *b, const char *data, size_t len) {
     jb_putc(b, '"');
 }
 
-/* Shortest-roundtrip float formatting, Python-repr compatible:
- * escalate %.15g -> %.17g until strtod round-trips, then ensure a
- * ".0" (or exponent) so integral floats don't print as integers. */
+/* Float formatting: byte-identical to Python str(float) via the shared
+ * misa_fmt_float (H-1). Non-finite values are rejected by the caller. */
 static void js_float(JBuf *b, double d) {
-    char tmp[40];
-    int prec;
-    for (prec = 15; prec <= 17; prec++) {
-        snprintf(tmp, sizeof tmp, "%.*g", prec, d);
-        if (strtod(tmp, NULL) == d)
-            break;
-    }
-    if (!strchr(tmp, '.') && !strchr(tmp, 'e') && !strchr(tmp, 'E')) {
-        size_t n = strlen(tmp);
-        if (n + 2 < sizeof tmp) {
-            tmp[n] = '.';
-            tmp[n + 1] = '0';
-            tmp[n + 2] = '\0';
-        }
-    }
+    char tmp[64];
+    misa_fmt_float(tmp, sizeof tmp, d);
     jb_puts(b, tmp);
 }
 
@@ -486,9 +475,14 @@ static int js_value(JBuf *b, MVal *v) {
     }
     case M_TAG_RECORD: {
         int64_t n = misa_record_len(v);
-        /* closures / fn values are records with __closure_fn */
+        /* closures / fn values are records with __closure_fn; sum-type
+         * values are records with __sum_disp (H-4: leaking their internals
+         * as {"__tag":..,"__fields":..} is silent data corruption — the
+         * interpreter raises E300, so AOT must too). */
         for (int64_t i = 0; i < n; i++) {
-            if (strcmp(misa_record_field_name(v, i), "__closure_fn") == 0)
+            const char *fn = misa_record_field_name(v, i);
+            if (strcmp(fn, "__closure_fn") == 0
+                    || strcmp(fn, "__sum_disp") == 0)
                 return -1;
         }
         jb_putc(b, '{');

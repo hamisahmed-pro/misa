@@ -1,0 +1,77 @@
+// Phase 5b: sum types + `match` — construction, bindings, exhaustiveness,
+// zero-payload variants, wildcards, and generic sums (5c composition).
+
+type Shape {
+  Circle(radius: Float),
+  Rect(w: Float, h: Float),
+}
+
+fn area(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) => r * r * 3.14,
+    Shape.Rect(w, h) => w * h,
+  }
+}
+
+let c: Shape = Shape.Circle(1.0)
+let r: Shape = Shape.Rect(2.0, 3.0)
+print(area(c))   // 3.14
+print(area(r))   // 6.0
+
+// match is an expression
+let label = match c {
+  Shape.Circle(_) => "circle",
+  Shape.Rect(_, _) => "rect",
+}
+print(label)
+
+// zero-payload variants
+type Opt {
+  None,
+  Some(Int),
+}
+
+fn or_zero(o: Opt) -> Int {
+  return match o {
+    Opt.None => 0,
+    Opt.Some(n) => n,
+  }
+}
+
+print(or_zero(Opt.None))
+print(or_zero(Opt.Some(41)))
+
+// wildcard arm
+type Color {
+  Red,
+  Green,
+  Blue,
+}
+
+fn is_red(col: Color) -> Bool {
+  return match col {
+    Color.Red => true,
+    _ => false,
+  }
+}
+
+print(is_red(Color.Red))
+print(is_red(Color.Blue))
+
+// generic sum types compose with match (5b + 5c)
+type Result<T> {
+  Ok(T),
+  Err(Text),
+}
+
+fn unwrap_or(res: Result<Int>, fallback: Int) -> Int {
+  return match res {
+    Result.Ok(v) => v,
+    Result.Err(_) => fallback,
+  }
+}
+
+let good: Result<Int> = Result.Ok(7)
+let bad: Result<Int> = Result.Err("boom")
+print(unwrap_or(good, 0))
+print(unwrap_or(bad, 0))

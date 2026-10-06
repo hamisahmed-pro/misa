@@ -161,6 +161,24 @@ def _uses_db_source(path: str) -> bool:
                ("db.open", "db.exec", "db.query", "db.close"))
 
 
+def _extern_libs(misa_path: str) -> list:
+    """Phase 7: `-l<lib>` flags for extern (FFI) decls (M-11). Mirrors the
+    host link in misa.aot.build; \"c\" needs no flag. Without this, any
+    extern lib beyond libc/libm fails the NDK link."""
+    from misa.loader import load as load_with_imports
+    from misa import ast as mast
+    merged, _, _, _ = load_with_imports(misa_path)
+    if merged is None:
+        return []
+    libs = []
+    for item in merged.items:
+        if isinstance(item, mast.ExternDecl) and item.lib != "c":
+            flag = "-l" + item.lib
+            if flag not in libs:
+                libs.append(flag)
+    return libs
+
+
 def _build_native(workdir: str, abi_key: str):
     """Compile prog.o + runtime, link libmisa.so for one ABI."""
     triple, abi_dir = ABIS[abi_key]
@@ -177,6 +195,8 @@ def _build_native(workdir: str, abi_key: str):
     rt_objs = ensure_runtime(triple,
                              with_sqlite=_uses_db_source(args.misa))
     _defines, _cflags, libs = runtime_flags(triple)
+    # M-11: extern (FFI) libraries ride on the NDK link, like the host.
+    libs = libs + _extern_libs(args.misa)
     lib_dir = os.path.join(workdir, "lib", abi_dir)
     os.makedirs(lib_dir, exist_ok=True)
     lib_so = os.path.join(lib_dir, "libmisa.so")
@@ -184,7 +204,11 @@ def _build_native(workdir: str, abi_key: str):
            + rt_objs + libs)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"native link failed ({triple}):\n{r.stderr}")
+        # M-11: a clean E600, not a raw NDK traceback. (A missing
+        # non-NDK lib is a build failure, not a user-code error.)
+        raise RuntimeError(
+            f"E600: native link failed ({triple}). An extern library "
+            f"may not exist in the NDK sysroot:\n{r.stderr}")
     print(f"  [{abi_key}] libmisa.so ({os.path.getsize(lib_so)} bytes)")
     return lib_dir
 
@@ -310,6 +334,15 @@ def main() -> int:
 
     workdir = tempfile.mkdtemp(prefix="misa-apk-")
     print(f"workdir: {workdir}")
+    try:
+        return _main_inner(workdir, abis)
+    except RuntimeError as e:
+        # M-11: clean E-code on the stderr, never a traceback.
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+def _main_inner(workdir: str, abis: list) -> int:
     try:
         tflite_classes, tflite_sos = _tflite_setup(workdir)
         lib_dirs = [_build_native(workdir, a) for a in abis]

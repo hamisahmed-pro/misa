@@ -45,10 +45,12 @@ NS_BUILTINS = {
     "str.chr": (["Int"], "Text"),
     "process.run": (["[Text]"], "record"),
     # Phase 5 (DB): SQLite bindings. `db.exec`/`db.query` take an
-    # optional third `args` list (see NS_BUILTIN_ARITY).
+    # optional third `args` list (see NS_BUILTIN_ARITY). Bind args are
+    # heterogeneous scalars (H-3): Int/Float/Bool/Text/nil, bound natively
+    # on both backends — hence [any], not [Text].
     "db.open": (["Text"], "Db"),
-    "db.exec": (["Db", "Text", "[Text]"], "Int"),
-    "db.query": (["Db", "Text", "[Text]"], "[record]"),
+    "db.exec": (["Db", "Text", "[any]"], "Int"),
+    "db.query": (["Db", "Text", "[any]"], "[record]"),
     "db.close": (["Db"], "Void"),
     # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
     "json.parse": (["Text"], "unknown"),
@@ -230,11 +232,8 @@ class Checker:
     def _check_type_decl(self, decl: ast.TypeDecl):
         """Phase 5c: validate a type decl's field/variant types. For
         generic decls, the type parameters are in scope (unbound names
-        are E222). Non-generic decls keep prior behavior (no validation
-        was done before 5c, so only validate when there is something
-        to check — generic decls always validate)."""
-        if not decl.type_params and not decl.is_sum:
-            return
+        are E222); otherwise an unknown field type is E208 (M-2: plain
+        `type T { x: Wat }` must not pass silently)."""
         saved_tparams, self._tparams = self._tparams, list(decl.type_params)
         try:
             if decl.is_sum:
@@ -523,10 +522,14 @@ class Checker:
                            s.line, s.col)
                 t = "unknown"
             if s.ann:
+                # M-2: an unknown annotation type is E208 (not a
+                # downstream E200 from the failed assignability check).
+                ann_ok = self._check_te(s.ann, s.ann.line, s.ann.col)
                 want = self._tname(s.ann)
                 if self._check_annotated(s.ann, s.value, scope):
                     t = want
-                elif t != "unknown" and not self._assignable(want, t):
+                elif ann_ok and t != "unknown" \
+                        and not self._assignable(want, t):
                     self.error("E200",
                                f"cannot assign {t} to '{s.name}: {want}'",
                                s.line, s.col)
@@ -815,6 +818,14 @@ class Checker:
                                f"used as a value",
                                e.line, e.col)
                     return "unknown"
+                # M-7: extern (FFI) functions are not first-class
+                # values either — E214, not a misleading E101.
+                if e.name in self.externs:
+                    self.error("E214",
+                               f"'{e.name}' is an extern function and "
+                               f"cannot be used as a value",
+                               e.line, e.col)
+                    return "unknown"
                 # maybe a model/screen/type used as value?
                 if e.name in self.models or e.name in self.screens:
                     return "unknown"
@@ -1032,6 +1043,17 @@ class Checker:
 
     def _infer_call(self, e: ast.Call, scope: dict,
                     expected: Optional[str] = None) -> str:
+        # M-4: `<handle>.exec/query/close(...)` where the handle variable
+        # has type Db resolves to the `db.*` builtin regardless of the
+        # variable's name (the handle is still passed explicitly as the
+        # first arg). Rewriting e.name here propagates to the
+        # interpreter and the AOT emitter, which key off the same AST.
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if field in ("exec", "query", "close") and recv in scope \
+                    and scope[recv][0] == "Db":
+                e.name = f"db.{field}"
         # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
         if e.callee is not None:
             ct = self._infer(e.callee, scope)
@@ -2070,6 +2092,12 @@ class Checker:
         if (got == "[unknown]" and want.startswith("[")
                 and want.endswith("]")):
             return True
+        # H-3: list covariance — [Text] is assignable to [any], etc.
+        # (db.exec/db.query bind args accept heterogeneous scalars).
+        if (want.startswith("[") and want.endswith("]")
+                and got.startswith("[") and got.endswith("]")
+                and "," not in want[1:-1] and "," not in got[1:-1]):
+            return self._assignable(want[1:-1], got[1:-1])
         return False
 
 

@@ -402,20 +402,85 @@ static void str_putn(Str *s, const char *p, size_t n) {
 
 static void str_puts(Str *s, const char *p) { str_putn(s, p, strlen(p)); }
 
-/* Format a double exactly like Python str(float): shortest round-trip,
- * with ".0" for integral values. */
+/* Strip trailing zeros from a "%.*e" mantissa in place:
+ * "1.500e-05" -> "1.5e-05", "1.000e+16" -> "1e+16". */
+static void strip_e_mantissa_zeros(char *tmp) {
+    char *e = strchr(tmp, 'e');
+    if (!e) e = strchr(tmp, 'E');
+    if (!e) return;
+    char *dot = strchr(tmp, '.');
+    if (!dot || dot > e) return;
+    char *end = e - 1;
+    while (end > dot && *end == '0') end--;
+    if (end == dot)
+        memmove(dot, e, strlen(e) + 1);       /* "1.000e+16" -> "1e+16" */
+    else
+        memmove(end + 1, e, strlen(e) + 1);   /* "1.500e-05" -> "1.5e-05" */
+}
+
+/* Strip trailing zeros from a "%.*f" result in place: "0.500" -> "0.5".
+ * A bare "5." becomes "5" (the caller appends ".0" for integral values). */
+static void strip_f_trailing_zeros(char *tmp) {
+    char *dot = strchr(tmp, '.');
+    if (!dot) return;
+    char *end = tmp + strlen(tmp) - 1;
+    while (end > dot && *end == '0') end--;
+    if (end == dot) end--;                    /* "5." -> "5" */
+    end[1] = '\0';
+}
+
+/* Format a double exactly like Python str(float): the shortest string that
+ * round-trips through strtod; fixed notation when -4 <= decimal exponent
+ * < 16, scientific otherwise; ".0" appended for integral values so a Float
+ * never renders as an Int; "nan"/"inf"/"-inf" for non-finite.
+ *
+ * H-1: the interpreter renders via Python str(), so every AOT target must
+ * produce byte-identical output here (print, str(), interpolation,
+ * collection rendering, json.stringify). */
+void misa_fmt_float(char *out, size_t n, double f) {
+    char tmp[64];
+    if (isnan(f)) { snprintf(out, n, "nan"); return; }
+    if (isinf(f)) { snprintf(out, n, "%sinf", f < 0 ? "-" : ""); return; }
+    if (f == 0.0) {
+        snprintf(out, n, "%s0.0", signbit(f) ? "-" : "");
+        return;
+    }
+    /* Decimal exponent decides the style, mirroring CPython: scientific
+     * iff exp < -4 or exp >= 16. */
+    char ebuf[32];
+    snprintf(ebuf, sizeof ebuf, "%.17e", f);
+    char *ep = strchr(ebuf, 'e');
+    int exp = ep ? atoi(ep + 1) : 0;
+    if (exp < -4 || exp >= 16) {
+        for (int prec = 1; prec <= 17; prec++) {
+            snprintf(tmp, sizeof tmp, "%.*e", prec - 1, f);
+            strip_e_mantissa_zeros(tmp);
+            if (strtod(tmp, NULL) == f) break;
+        }
+    } else {
+        for (int prec = 1; prec <= 17; prec++) {
+            int after = prec - 1 - exp;
+            if (after < 0) after = 0;
+            snprintf(tmp, sizeof tmp, "%.*f", after, f);
+            strip_f_trailing_zeros(tmp);
+            if (strtod(tmp, NULL) == f) break;
+        }
+        if (!strchr(tmp, '.')) {
+            size_t len = strlen(tmp);
+            if (len + 2 < sizeof tmp) {
+                tmp[len] = '.';
+                tmp[len + 1] = '0';
+                tmp[len + 2] = '\0';
+            }
+        }
+    }
+    snprintf(out, n, "%s", tmp);
+}
+
 static void str_put_float(Str *s, double f) {
     char tmp[64];
-    snprintf(tmp, sizeof tmp, "%.17g", f);
+    misa_fmt_float(tmp, sizeof tmp, f);
     str_puts(s, tmp);
-    /* append ".0" when the text looks like a plain integer */
-    int i = 0, is_intlike = 1;
-    if (tmp[0] == '-' || tmp[0] == '+') i = 1;
-    if (!tmp[i]) is_intlike = 0;
-    for (; tmp[i] && is_intlike; i++) {
-        if (tmp[i] < '0' || tmp[i] > '9') is_intlike = 0;
-    }
-    if (is_intlike) str_puts(s, ".0");
 }
 
 static void render_into(Str *s, MVal *v);
@@ -1050,7 +1115,8 @@ MVal *misa_builtin_env(const char *name, int line, int col) {
      * an app-supplied config table instead. */
     const char *v = misa_platform_getenv(name);
     if (!v) {
-        misa_raise_fmt("E300", line, col, "env var '%s' is not set", name);
+        /* M-8: STDLIB.md promises E302 for an unset variable. */
+        misa_raise_fmt("E302", line, col, "env var '%s' is not set", name);
         return NULL;
     }
     return misa_text_cstr(v);

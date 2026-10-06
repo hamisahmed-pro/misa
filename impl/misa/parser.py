@@ -1151,7 +1151,15 @@ class Parser:
                         depth -= 1
                     j += 1
                 if depth:
-                    raise ParseError("unbalanced '{' in string", line, col)
+                    # M-5: the common cause is a '"' inside '{...}'
+                    # (e.g. "a{"b"}c"): the '"' ends the string at lex
+                    # time, so interpolation can never nest
+                    # double-quoted strings. Name the real problem.
+                    raise ParseError(
+                        "unbalanced '{' in string: '{' opens interpolation "
+                        "and needs a matching '}' (a '\"' inside '{...}' "
+                        "ends the string — interpolation cannot nest "
+                        "double-quoted strings)", line, col)
                 inner = raw[i + 1:j - 1]
                 if buf:
                     parts.append(buf)

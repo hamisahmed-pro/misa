@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from . import ast
 from .errors import (MisaError, RuntimeError_, UndefinedName,
-                     ImmutableAssign, AssertFailed, ModelError,
+                     ImmutableAssign, AssertFailed, EnvNotSet, ModelError,
                      SchemaValidationError, BudgetExceeded, ThrownError,
                      IOError_, HTTPError_, MapKeyError, ProviderConfigError,
                      FFIError, TypeMismatch)
@@ -332,6 +332,13 @@ class Interpreter:
                 self.exec_stmt(item, self.global_env)
             except _ReturnSignal:
                 break
+            except RecursionError:
+                # H-5: deep Misa recursion must surface as a clean E300,
+                # never a Python traceback.
+                raise RuntimeError_(
+                    "call stack overflow (recursion too deep)",
+                    line=getattr(item, "line", 0),
+                    col=getattr(item, "col", 0))
 
     # -- statements ---------------------------------------------------
 
@@ -370,6 +377,16 @@ class Interpreter:
                 self.exec_block(s.body, Env(env))
             except _ReturnSignal:
                 raise
+            except RecursionError:
+                # H-5: convert to a catchable E300 so `try/catch` sees a
+                # structured error, not a Python traceback. (Handled
+                # inline — raising here would skip the handler below.)
+                e = RuntimeError_("call stack overflow (recursion too deep)",
+                                  line=s.line, col=s.col)
+                inner = Env(env)
+                inner.define(s.catch_var,
+                             {"code": e.code, "message": e.message}, False)
+                self.exec_block(s.handler, inner)
             except MisaError as e:
                 inner = Env(env)
                 inner.define(s.catch_var,
@@ -656,6 +673,19 @@ class Interpreter:
             raise RuntimeError_(f"call result is not callable",
                                 line=e.line, col=e.col)
         name = e.name
+        # M-4: `<handle>.exec/query/close(...)` where the handle variable
+        # holds a DbHandle, regardless of its name. (The checker rewrites
+        # the checked AST; this covers ASTs that bypass checking.)
+        if name not in ("db.exec", "db.query", "db.close") \
+                and "." in name:
+            recv, _, field = name.partition(".")
+            if field in ("exec", "query", "close"):
+                try:
+                    rv = env.lookup(recv)[0]
+                except UndefinedName:
+                    rv = None
+                if isinstance(rv, DbHandle):
+                    name = "db." + field
         if name in self.models:
             return self.call_model(self.models[name], args, e)
         if name in self.screens:
@@ -929,9 +959,8 @@ class Interpreter:
             return v
         if isinstance(v, int):
             if v > 2**63 - 1 or v < -(2**63):
-                raise RuntimeError_(
-                    f"json.parse: integer {v} out of Int range",
-                    line=node.line, col=node.col)
+                # M-6: STDLIB.md §3e — out-of-int64 integers become Float.
+                return float(v)
             return v
         if isinstance(v, float):
             return v
@@ -1059,13 +1088,27 @@ class Interpreter:
                            line=node.line, col=node.col)
         return DbHandle(path=path, conn=conn)
 
+    @staticmethod
+    def _db_bind_arg(a, op: str, idx: int, node: ast.Node):
+        # H-3: bind args are Int/Float/Bool/Text/nil on both backends
+        # (bool is an int subclass; sqlite3 binds it as 0/1, like AOT).
+        # Anything else is E200 (matches the AOT runtime).
+        if a is None or isinstance(a, (int, float, str)):
+            return a
+        raise TypeMismatch(
+            f"{op}: bind arg {idx} must be Int, Float, Bool, Text, "
+            f"or nil, got {type(a).__name__}",
+            line=node.line, col=node.col)
+
     def db_exec(self, dbv, sql, args, node: ast.Node) -> int:
         h = self._db_handle(dbv, "db.exec", node)
         if not isinstance(sql, str):
             raise RuntimeError_("db.exec needs a text SQL statement",
                                 line=node.line, col=node.col)
+        bound = [self._db_bind_arg(a, "db.exec", i + 1, node)
+                 for i, a in enumerate(args)]
         try:
-            cur = h.conn.execute(sql, list(args))
+            cur = h.conn.execute(sql, bound)
             h.conn.commit()
             return cur.rowcount if cur.rowcount >= 0 else 0
         except sqlite3.Error as ex:
@@ -1077,8 +1120,10 @@ class Interpreter:
         if not isinstance(sql, str):
             raise RuntimeError_("db.query needs a text SQL statement",
                                 line=node.line, col=node.col)
+        bound = [self._db_bind_arg(a, "db.query", i + 1, node)
+                 for i, a in enumerate(args)]
         try:
-            cur = h.conn.execute(sql, list(args))
+            cur = h.conn.execute(sql, bound)
             names = [d[0] for d in cur.description or []]
             rows = []
             for tup in cur.fetchall():
@@ -1149,7 +1194,9 @@ class Interpreter:
         if name == "env":
             val = os.environ.get(args[0])
             if val is None:
-                raise RuntimeError_(f"env var '{args[0]}' is not set")
+                # M-8: STDLIB.md promises E302 for an unset variable.
+                raise EnvNotSet(f"env var '{args[0]}' is not set",
+                                line=node.line, col=node.col)
             return val
         raise UndefinedName(f"undefined function '{name}'")
 

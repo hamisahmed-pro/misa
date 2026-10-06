@@ -200,7 +200,8 @@ def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
         # C-2: surface the E-code (was a raw die() string).
         die(f"{e.code}: {e.message}")
     except RuntimeError as e:
-        die(str(e))
+        # H-6: toolchain failures are E600, never a bare message.
+        die(f"E600: {e}")
     if not ok:
         emit_errors(errors, as_json)
         return 1

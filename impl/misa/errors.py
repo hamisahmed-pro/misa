@@ -38,6 +38,11 @@ class AssertFailed(RuntimeError_):
     code = "E301"
 
 
+class EnvNotSet(MisaError):
+    """M-8: env() on an unset variable. Code E302, as STDLIB.md promises."""
+    code = "E302"
+
+
 class ModelError(MisaError):
     code = "E400"
 

@@ -8,15 +8,18 @@ see "Implementation strategy".
 
 ```misa
 let db = db.open("app.db")          // file; db.open(":memory:") for tests
-db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-db.exec("INSERT INTO users (name) VALUES (?)", ["Hamis"])
-let rows = db.query("SELECT id, name FROM users")
+db.exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+db.exec(db, "INSERT INTO users (name) VALUES (?)", ["Hamis"])
+let rows = db.query(db, "SELECT id, name FROM users")
 // rows: [{id: Int, name: Text}]
 for r in rows {
   print(r.name)
 }
-db.close()
+db.close(db)
 ```
+// M-9: `db.exec`/`db.query`/`db.close` take the handle as the first
+// argument (the `db.` prefix is the namespace, not the variable — any
+// variable holding a Db handle works, e.g. `mydb.exec(mydb, ...)`).
 
 | Function | Signature | Description |
 |---|---|---|
@@ -25,8 +28,8 @@ db.close()
 | `db.query` | `db.query(db: Db, sql: Text, args: [any]?) -> [record]` | Run a SELECT; returns list of records. |
 | `db.close` | `db.close(db: Db) -> Void` | Close the handle. |
 
-(`[any]` renders as `[Text]`/`[Int]`/etc. in practice — params are
-`[Text]`-encodable scalars; the checker enforces scalar args.)
+(Bind args are heterogeneous scalars — `Int`, `Float`, `Bool`, `Text`,
+or `nil` — bound natively via sqlite3 on both backends.)
 
 ## Typed queries (the Misa-shaped idea)
 
@@ -39,10 +42,11 @@ table users {
   email: Text?,
 }
 
-let rows = db.query("SELECT id, name FROM users")
+let db = db.open(":memory:")
+let rows = db.query(db, "SELECT id, name FROM users")
 // checker KNOWS rows: [{id: Int, name: Text}]
 
-let bad = db.query("SELECT id, nam FROM users")
+let bad = db.query(db, "SELECT id, nam FROM users")
 // E-code: column "nam" does not exist on table "users"
 ```
 

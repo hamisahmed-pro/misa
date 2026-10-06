@@ -1,0 +1,46 @@
+// Audit H/M fixes: differential interp-vs-AOT parity.
+// H-1: float rendering byte-identical (print/str/interp/collections/json).
+// H-3: heterogeneous db bind args. H-4/M-6/M-8 via caught error codes.
+
+print(0.1)
+print(1.0)
+print(1.0 / 3.0)
+print(1000000.0)
+print(10000000000000000.0)
+print(0.1 + 0.2)
+print(2.0 * 3.14)
+print(str(0.3333333333333333))
+print("pi={2.0 * 3.14}")
+print([0.1, 1.0])
+print(json.stringify({"pi": 3.14, "big": 10000000000000000.0}))
+
+// H-3: Int/Float/Text bind args work on both backends.
+let db = db.open(":memory:")
+db.exec(db, "CREATE TABLE t (name TEXT, n INTEGER, f REAL)")
+db.exec(db, "INSERT INTO t VALUES (?, ?, ?)", ["x", 11, 2.5])
+let rows = db.query(db, "SELECT * FROM t")
+print(rows[0].name)
+print(rows[0].n)
+print(rows[0].f)
+db.close(db)
+
+// H-4: sum values are not JSON-representable (E300 both backends).
+type Shape { Circle(radius: Float), Rect(w: Float, h: Float) }
+let s: Shape = Shape.Circle(1.0)
+try {
+  print(json.stringify({"shape": s}))
+} catch e {
+  print("caught " + e.code)
+}
+
+// M-6: out-of-int64 JSON integers become Float (spec §3e).
+let big = json.parse("99999999999999999999999")
+print(big)
+print(json.parse("42"))
+
+// M-8: env() on unset variable is E302 (both backends).
+try {
+  print(env("MISA_NO_SUCH_VAR_XYZ"))
+} catch e {
+  print("caught " + e.code)
+}

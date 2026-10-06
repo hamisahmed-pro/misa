@@ -112,6 +112,9 @@ MVal *misa_ge(MVal *a, MVal *b, int line, int col);
 /* -- text --------------------------------------------------------- */
 /* render_value() semantics; the returned MVal is Text. */
 MVal *misa_render(MVal *v);
+/* Format a double exactly like Python str(float) (shortest round-trip;
+ * see misa_rt.c). Shared by the display path and json.stringify. */
+void misa_fmt_float(char *out, size_t n, double f);
 MVal *misa_text_concat(MVal *a, MVal *b);
 /* code-point indexed char (new 1-char Text); E300 if out of range */
 MVal *misa_text_char_at(MVal *t, int64_t idx, int line, int col);

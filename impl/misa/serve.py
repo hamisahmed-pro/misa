@@ -242,7 +242,14 @@ def cmd_serve(args):
     while i < len(args):
         a = args[i]
         if a == "--port" and i + 1 < len(args):
-            port, i = int(args[i + 1]), i + 2
+            # H-6: a bad --port value must not escape as a traceback.
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                sys.stderr.write(
+                    f"misa serve: E600: invalid --port '{args[i + 1]}'\n")
+                return 2
+            i += 2
         elif a == "--key" and i + 1 < len(args):
             key, i = args[i + 1], i + 2
         elif a == "--key-env" and i + 1 < len(args):
@@ -286,7 +293,8 @@ def cmd_serve(args):
         sys.stderr.write(f"misa serve: {e.code}: {e.message}\n")
         return 1
     except RuntimeError as e:
-        sys.stderr.write(f"misa serve: build failed: {e}\n")
+        # H-6: toolchain failures are E600, never a bare message.
+        sys.stderr.write(f"misa serve: E600: {e}\n")
         return 1
     if not ok:
         for e in errors:
@@ -302,7 +310,14 @@ def cmd_serve(args):
     allowlist = _model_allowlist(src)
     state = _ProxyState(key, base_url, allowlist)
     handler = _make_handler(webdir, state)
-    with socketserver.ThreadingTCPServer(("127.0.0.1", port), handler) as srv:
+    # H-6: a bind failure (port in use, no permission) must not escape as
+    # a traceback.
+    try:
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", port), handler)
+    except OSError as e:
+        sys.stderr.write(f"misa serve: E600: cannot bind port {port}: {e}\n")
+        return 1
+    with srv:
         srv.daemon_threads = True
         sys.stderr.write(
             f"misa serve: {src} at http://127.0.0.1:{port}/\n"

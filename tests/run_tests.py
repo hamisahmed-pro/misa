@@ -2185,6 +2185,181 @@ def _():
     assert "process.run" in errors[0]["message"], errors
 
 
+# ---------------------------------------------------------------- audit H/M fixes
+
+@test("H-1: float rendering matches Python str() (interp side)")
+def _():
+    # The AOT side is covered by a21 (byte-identical via misa_fmt_float,
+    # verified against 4015 values incl. denormals). Here: shortest
+    # round-trip + ".0" for integral floats.
+    out = run_src('print(0.1)\nprint(1.0)\nprint(1.0/3.0)\n'
+                  'print(1000000.0)\nprint(10000000000000000.0)\n'
+                  'print(0.1+0.2)\n')
+    eq(out, "0.1\n1.0\n0.3333333333333333\n1000000.0\n1e+16\n"
+            "0.30000000000000004\n")
+
+
+@test("H-3: db bind args accept heterogeneous scalars (interp)")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE t (name TEXT, n INTEGER, f REAL)")\n'
+           'db.exec(db, "INSERT INTO t VALUES (?, ?, ?)", ["x", 11, 2.5])\n'
+           'let rows = db.query(db, "SELECT * FROM t")\n'
+           'print(rows[0].name)\nprint(rows[0].n)\nprint(rows[0].f)\n'
+           'db.close(db)\n')
+    out = run_src(src)
+    eq(out, "x\n11\n2.5\n")
+
+
+@test("H-3: db.exec rejects non-scalar bind arg with E200")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE t (x TEXT)")\n'
+           'db.exec(db, "INSERT INTO t VALUES (?)", [[1]])\n')
+    raises_code(lambda: run_src(src), "E200")
+
+
+@test("H-4: json.stringify rejects sum values with E300 (interp)")
+def _():
+    src = ('type Shape { Circle(radius: Float), Rect(w: Float, h: Float) }\n'
+           'let s: Shape = Shape.Circle(1.0)\n'
+           'print(json.stringify({"shape": s}))\n')
+    raises_code(lambda: run_src(src), "E300")
+
+
+@test("H-5: deep recursion is a clean E300, not a traceback")
+def _():
+    src = ('fn boom(n: Int) -> Int {\n'
+           '  if (n <= 0) { return 0 }\n'
+           '  return boom(n - 1) + 1\n'
+           '}\n'
+           'print(boom(100000))\n')
+    e = raises_code(lambda: run_src(src), "E300")
+    assert "recursion" in e.message.lower(), e.message
+    assert "Traceback" not in e.message
+
+
+@test("H-5: deep recursion E300 is catchable")
+def _():
+    src = ('fn boom(n: Int) -> Int {\n'
+           '  if (n <= 0) { return 0 }\n'
+           '  return boom(n - 1) + 1\n'
+           '}\n'
+           'try {\n  boom(100000)\n} catch e {\n'
+           '  print("caught " + e.code)\n'
+           '}\n')
+    eq(run_src(src), "caught E300\n")
+
+
+@test("H-6: misa build surfaces E600 (not bare text) on toolchain failure")
+def _():
+    # Exercise via the CLI: build a program for a bogus target triple.
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "t.misa")
+        with open(src, "w") as f:
+            f.write('print("hi")\n')
+        p = subprocess.run([sys.executable,
+                            os.path.join(ROOT, "impl", "bin", "misa"),
+                            "build", src, "--target", "bogus-unknown-xyz"],
+                           capture_output=True, text=True)
+    assert p.returncode != 0
+    assert "E600" in p.stderr, p.stderr
+    assert "Traceback" not in p.stderr
+
+
+@test("H-6: misa serve rejects a bad --port with E600, not a traceback")
+def _():
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "t.misa")
+        with open(src, "w") as f:
+            f.write('print("hi")\n')
+        p = subprocess.run([sys.executable,
+                            os.path.join(ROOT, "impl", "bin", "misa"),
+                            "serve", src, "--port", "abc"],
+                           capture_output=True, text=True, timeout=30)
+    assert p.returncode == 2, p.returncode
+    assert "E600" in p.stderr, p.stderr
+    assert "Traceback" not in p.stderr
+
+
+@test("M-2: unknown type in let annotation is E208 (not E200)")
+def _():
+    errs = check_source("let x: Wat = 1\n")
+    eq(len(errs), 1)
+    eq(errs[0]["code"], "E208")
+
+
+@test("M-2: unknown type in plain type-decl field is E208")
+def _():
+    errs = check_source("type T { x: Wat }\n")
+    eq(len(errs), 1)
+    eq(errs[0]["code"], "E208")
+
+
+@test("M-2: unbound type variable in generic decl stays E222")
+def _():
+    errs = check_source("type Box<T> { value: Wat }\n")
+    eq(len(errs), 1)
+    eq(errs[0]["code"], "E222")
+
+
+@test("M-4: db handle may use any variable name")
+def _():
+    src = ('let mydb = db.open(":memory:")\n'
+           'mydb.exec(mydb, "CREATE TABLE t (x INT)")\n'
+           'mydb.exec(mydb, "INSERT INTO t VALUES (?)", [7])\n'
+           'let rows = mydb.query(mydb, "SELECT x FROM t")\n'
+           'print(rows[0].x)\n'
+           'mydb.close(mydb)\n')
+    eq(run_src(src), "7\n")
+
+
+@test("M-5: nested quote in interpolation names the real problem")
+def _():
+    errs = check_source('let x = "a{"b"}c"\n')
+    eq(len(errs), 1)
+    eq(errs[0]["code"], "E001")
+    assert "interpolation" in errs[0]["message"], errs[0]["message"]
+
+
+@test("M-6: json.parse maps out-of-int64 integers to Float")
+def _():
+    out = run_src('let v = json.parse("99999999999999999999999")\n'
+                  'print(v)\n'
+                  'let w = json.parse("42")\n'
+                  'print(w)\n')
+    eq(out, "1e+23\n42\n")
+
+
+@test("M-7: extern function used as a value is E214 (not E101)")
+def _():
+    src = ('extern "c" {\n'
+           '  fn strlen(s: Text) -> Int\n'
+           '}\n'
+           'let f = strlen\n')
+    errs = check_source(src)
+    eq(len(errs), 1)
+    eq(errs[0]["code"], "E214")
+    assert "extern" in errs[0]["message"], errs[0]["message"]
+
+
+@test("M-8: env() on unset variable is E302")
+def _():
+    e = raises_code(lambda: run_src('print(env("MISA_NO_SUCH_VAR_XYZ"))\n'),
+                    "E302")
+    assert "not set" in e.message
+
+
+@test("M-8: env() E302 is catchable")
+def _():
+    out = run_src('try {\n'
+                  '  env("MISA_NO_SUCH_VAR_XYZ")\n'
+                  '} catch e {\n'
+                  '  print("caught " + e.code)\n'
+                  '}\n')
+    eq(out, "caught E302\n")
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

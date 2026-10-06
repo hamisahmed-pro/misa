@@ -23,6 +23,10 @@ FLOAT    := [0-9]+.[0-9]+
 STRING   := '"' (ESC | INTERP | [^"\\])* '"'
 TRISTRING:= '"""' (ESC | INTERP | .)*? '"""'
 INTERP   := '{' expr '}'            // inside strings only; '{{' = literal brace
+                                     // (M-1: there is NO '}}' escape — '}}'
+                                     // is two literal chars, because only
+                                     // '{' opens interpolation. To emit a
+                                     // literal "{{...}}", write "{{" + "}" + "}".
 DURATION := (INT|FLOAT) ('ms' | 's')
 MONEY    := '$' (INT|FLOAT)
 ```

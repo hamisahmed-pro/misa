@@ -47,7 +47,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E211 | Argument/return type mismatch (`argument 'x' wants Int, got Text`). |
 | E212 | `throw` of a non-`Error` value. |
 | E213 | **(Phase 5a)** Cannot infer a lambda parameter's type — annotate it (`\|x: Int\|`) or use the lambda where a function type is expected. |
-| E214 | **(Phase 5a)** A builtin (`print`, `str`, `fs.read`, …) used as a value. Builtins are not first-class. |
+| E214 | **(Phase 5a)** A builtin (`print`, `str`, `fs.read`, …) used as a value. Builtins are not first-class. **(M-7)** Also fires for an `extern` (FFI) function used as a value — extern functions are not first-class either. |
 | E215 | **(Phase 5a)** Calling a value that is not a function (`'x' has type 'Int' and is not callable`). |
 | E216 | **(Phase 5b)** Non-exhaustive `match` — lists the missing variants (`non-exhaustive match on 'Shape'; missing: Rect`). Add the missing arms or a `_` wildcard. |
 | E217 | **(Phase 5b)** `match` arms yield different types (`match arms yield different types ('Int' vs 'Text')`). |
@@ -67,6 +67,7 @@ Every Misa diagnostic carries a code. Ranges:
 |---|---|
 | E300 | Generic runtime error (div by zero, bad operation, out of memory). |
 | E301 | `assert` failure. |
+| E302 | **(M-8)** Environment variable not set (`env(name)` when `name` is unset). |
 | E303 | I/O error (`fs.read`/`fs.write`/`process.run` failure). Also the code carried by a caught `throw` value's `code` field when user-defined. |
 | E304 | HTTP error (`http.get` failure / non-2xx). |
 | E305 | Missing map key. |
@@ -99,4 +100,8 @@ Every Misa diagnostic carries a code. Ranges:
 
 `try/catch` catches any `E3xx`–`E5xx` (and user `throw` values) as
 `{code, message}` records. Static errors (`E0xx`–`E2xx`) and `E6xx` are
-compile-time and cannot be caught.
+compile-time and cannot be caught — with one exception: **E226** (FFI
+failure) is numbered in the E2xx range for historical reasons but fires
+at *runtime* (library/symbol/call failure) and **is** catchable, like an
+E3xx. In AOT-compiled binaries the same fault surfaces as E600 at link
+time instead (E226 never fires from a binary).
