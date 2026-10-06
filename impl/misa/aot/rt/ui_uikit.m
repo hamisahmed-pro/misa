@@ -287,7 +287,6 @@ MisaWidget misa_ui_begin_screen(MisaUI *ui, const char *name) {
 MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
                               const char *kind) {
     __block MisaWidget w = 0;
-    NSLog(@"misa: begin_comp entry kind=%s", kind ? kind : "(null)");
     ui_main_sync(^{
         ui_grow_meta(ui);
         UIView *v = nil;
@@ -296,6 +295,11 @@ MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
             s.axis = strcmp(kind, "Column") == 0
                 ? UILayoutConstraintAxisVertical
                 : UILayoutConstraintAxisHorizontal;
+            /* Containers hug their content vertically: a stretched
+             * Column would smear its last child across the spare
+             * space. Only Spacer (low hugging) absorbs extra room. */
+            [s setContentHuggingPriority:UILayoutPriorityRequired
+                                 forAxis:UILayoutConstraintAxisVertical];
             v = s;
         } else if (strcmp(kind, "Text") == 0 ||
                    strcmp(kind, "Heading") == 0 ||
@@ -316,7 +320,15 @@ MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
             v = l;
         } else if (strcmp(kind, "Button") == 0 ||
                    strcmp(kind, "CameraButton") == 0) {
-            v = [UIButton buttonWithType:UIButtonTypeSystem];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+            if (strcmp(kind, "CameraButton") == 0) {
+                /* A labelless CameraButton would be a zero-size,
+                 * invisible button. Default title; a label: arg
+                 * still overrides it via misa_ui_set_arg. */
+                [b setTitle:@"\U0001F4F7 Snap a leaf"
+                   forState:UIControlStateNormal];
+            }
+            v = b;
         } else if (strcmp(kind, "TextInput") == 0) {
             UITextField *t = [UITextField new];
             t.borderStyle = UITextBorderStyleRoundedRect;
@@ -372,7 +384,6 @@ MisaWidget misa_ui_begin_comp(MisaUI *ui, MisaWidget parent,
                 [p addSubview:v];
         }
     });
-    NSLog(@"misa: begin_comp exit kind=%s", kind ? kind : "(null)");
     return w;
 }
 
