@@ -52,6 +52,23 @@ void misa_ui_set_root_view(MisaUI *ui, void *rootView);
     misa_main();      /* builds the first screen through the driver */
     /* NSLog (unbuffered): proves misa_main returned even if os_log drops it. */
     NSLog(@"misa: misa_main returned, app alive");
+    /* View census: proves the Misa screen attached real views rather
+     * than leaving the blank launch window. PlantDoc Home = 7. */
+    {
+        NSUInteger census = 0;
+        NSMutableArray *stack =
+            [NSMutableArray arrayWithObject:root.view];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            for (UIView *s in v.subviews) {
+                census++;
+                [stack addObject:s];
+            }
+        }
+        NSLog(@"misa: view census: %lu views under root",
+              (unsigned long)census);
+    }
     /* Heartbeat: if the app survives startup, this fires every 5s. */
     [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES
         block:^(NSTimer *t) {

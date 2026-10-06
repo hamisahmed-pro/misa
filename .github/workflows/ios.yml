@@ -42,7 +42,7 @@ jobs:
             -destination 'platform=iOS Simulator,name=iPhone 16' \
             build CODE_SIGNING_ALLOWED=NO
 
-      - name: Simulator smoke test (launch, no crash)
+      - name: Simulator smoke test (launch, no crash, UI rendered)
         run: |
           set +e  # full manual control; every failure must print diagnostics
           APP=$(find ios/MisaApp/build ~/Library/Developer/Xcode/DerivedData \
@@ -67,22 +67,51 @@ jobs:
           # Screenshot first (visual proof of what the simulator shows).
           xcrun simctl io "$UDID" screenshot /tmp/misa_shot.png 2>&1
           ls -la /tmp/misa_shot.png 2>/dev/null
+          # Startup logs: captured on success AND failure (a live process
+          # with a blank window is a failure too — see 2026-10-06).
+          echo "--- misa startup logs ---"
+          LOGS=$(xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
+            | grep -i "misa:" | tail -30)
+          echo "$LOGS"
+          echo "--- end misa logs ---"
+          FAIL=0
           # Definitive aliveness: simulator apps are host processes.
           echo "--- host-side process check (pid $PID) ---"
           ps -p "$PID" -o pid,etime,comm 2>&1 || echo "(pid $PID not in ps)"
           if ps -p "$PID" >/dev/null 2>&1; then
             echo "smoke test OK: app process alive after 10s (pid $PID)"
-            exit 0
+          else
+            echo "SMOKE TEST FAILED: app process gone 10s after launch"
+            FAIL=1
           fi
-          echo "SMOKE TEST FAILED: app process gone 10s after launch"
-          echo "--- our startup logs (did the app get through misa_main?) ---"
-          xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
-            | grep -i "misa:" | tail -15
-          echo "--- who killed it? system logs mentioning our bundle ---"
-          xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
-            | grep -i "misa\|0x8badf00d\|jetsam\|termination\|SIGKILL\|exited" \
-            | grep -vi "misaapp:" | grep -vi "misa:" | tail -25
-          exit 1
+          # misa_main must have run to completion...
+          echo "$LOGS" | grep -q "misa: misa_main returned, app alive" \
+            || { echo "SMOKE TEST FAILED: no 'misa_main returned' trace"; FAIL=1; }
+          # ...and attached the first screen to the root view...
+          echo "$LOGS" | grep -q "misa: show_screen" \
+            || { echo "SMOKE TEST FAILED: no 'show_screen' trace"; FAIL=1; }
+          # ...and the runloop must be ticking (timer is scheduled only
+          # after misa_main returns).
+          echo "$LOGS" | grep -q "misa: heartbeat" \
+            || { echo "SMOKE TEST FAILED: no heartbeat trace"; FAIL=1; }
+          # ...and the Home screen must own real views, not a blank window
+          # (PlantDoc Home = 7: screen root + Column + 5 components).
+          CENSUS=$(echo "$LOGS" | grep -o "misa: view census: [0-9]*" | tail -1 \
+            | grep -o "[0-9]*")
+          echo "view census: ${CENSUS:-<none>}"
+          if [ -z "$CENSUS" ] || [ "$CENSUS" -lt 5 ]; then
+            echo "SMOKE TEST FAILED: expected >=5 views, got '${CENSUS:-<none>}'"
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "--- who killed it? system logs mentioning our bundle ---"
+            xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
+              | grep -i "misa\|0x8badf00d\|jetsam\|termination\|SIGKILL\|exited" \
+              | grep -vi "misaapp:" | grep -vi "misa:" | tail -25
+            exit 1
+          fi
+          echo "SMOKE TEST PASSED: alive + misa_main returned + screen shown + $CENSUS views"
+          exit 0
 
       - name: Upload simulator screenshot
         if: always()
