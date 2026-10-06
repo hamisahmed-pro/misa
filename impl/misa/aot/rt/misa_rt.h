@@ -40,6 +40,7 @@ enum {
     M_TAG_TASK   = 13,  /* Phase 7: Task<T> handle (wraps MisaTask*) */
     M_TAG_CHAN   = 14,  /* Phase 7: Chan<T> handle (wraps MisaChan*) */
     M_TAG_BUILDER = 15, /* Text.Builder handle (wraps Str*) */
+    M_TAG_STRUCT = 16, /* Wave 2 FFI: C-layout struct (wraps raw bytes) */
 };
 
 /* Media kinds. */
@@ -98,6 +99,10 @@ const char *misa_media_path(MVal *v);
  * owning C library manages its lifetime. */
 MVal *misa_ptr(void *p);
 void *misa_as_ptr(MVal *v);       /* E200 if not Ptr */
+/* Overtake Wave 2 (FFI): C-layout struct values. `bytes` must be
+ * misa_alloc'd; ownership transfers to the value. */
+MVal *misa_struct_new(void *bytes);
+void *misa_struct_bytes(MVal *v);  /* E200 if not a struct value */
 
 /* -- inspection -------------------------------------------------- */
 int      misa_tag(MVal *v);

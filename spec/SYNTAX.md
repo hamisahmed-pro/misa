@@ -40,6 +40,9 @@ Keywords: `app` `model` `type` `screen` `let` `var` `if` `else` `for` `in`
 `navigate` `env` `nil` `v` (version prefix, only after `prompt`)
 `fn` `import` `try` `catch` `throw`
 
+Contextual keywords (ordinary IDENTs, special only in item position):
+`interface` `impl`, plus `test`.
+
 Operators: `+ - * / %` `== != < <= > >=` `=` `|` `.` `,` `:` `(` `)` `[` `]`
 `{` `}` `?`
 
@@ -57,7 +60,10 @@ An explicit `;` is also legal but the formatter never emits one.
 program     := item*
 item        := appDecl | providerDecl | modelsDecl | typeDecl
              | modelDecl | screenDecl | evalDecl | testDecl | fnDecl
-             | importDecl | tableDecl | externDecl | statement
+             | importDecl | tableDecl | externDecl
+             | interfaceDecl | implDecl | statement
+             // Phase 8 (overtake): interfaces — `interface`/`impl` are
+             // contextual keywords (ordinary IDENTs elsewhere).
 
 appDecl     := "app" IDENT "{" appField* "}"
 appField    := IDENT ":" literal ","?
@@ -70,7 +76,11 @@ modelsDecl  := "models" "{" modelsField* "}"
 modelsField := IDENT ":" IDENT "(" STRING ")" ","?
 
 typeDecl    := "type" IDENT typeParams? "{" (typeField | sumVariant)* "}"
-typeParams  := "<" IDENT ("," IDENT)* ">"
+typeParams  := "<" typeParam ("," typeParam)* ">"
+typeParam   := IDENT (":" IDENT)?
+              // Phase 8 (overtake): interface bounds, e.g. <T: Drawable>.
+              // Bounds are only legal on fnDecl; a bound on a type or
+              // extern declaration is a parse error.
 typeField   := IDENT ":" typeExpr ","?
 sumVariant  := IDENT "(" (IDENT ":" typeExpr ("," IDENT ":" typeExpr)*)? ")" ","?
               // Phase 5b: sum types, e.g. type Shape { Circle(radius: Float), None, }
@@ -79,9 +89,33 @@ tableDecl   := "table" IDENT "{" tableField* "}"
 tableField  := IDENT ":" typeExpr ("@" IDENT)? ","?
               // Phase 5 (DB): e.g. table users { id: Int @primary, name: Text, }
 
-externDecl  := "extern" STRING "{" externFn* "}"
-externFn    := "fn" IDENT "(" params? ")" ("->" typeExpr)? ","?
+externDecl  := "extern" STRING "{" (externFn | externStruct)* "}"
+externFn    := "fn" IDENT "(" (params ","? "..."?)? ")" ("->" typeExpr)? ","?
               // Phase 7 (FFI): e.g. extern "c" { fn strlen(s: Text) -> Int }
+              // Overtake Wave 2: trailing "..." = C varargs
+externStruct:= "struct" IDENT "{" structField* "}" ","?
+structField := IDENT ":" typeExpr ","?
+              // Overtake Wave 2: e.g. struct Point { x: Float, y: Float }
+              // (v1 fields: Int, Float, Bool, Ptr)
+structLit   := IDENT "{" (IDENT ":" expr ","?)* "}"
+              // Overtake Wave 2: e.g. Point { x: 1.0, y: 2.0 }
+
+interfaceDecl := "interface" IDENT "{" ifaceSig* "}"
+ifaceSig    := "fn" IDENT "(" ifaceParam ("," ifaceParam)* ")"
+               ("->" typeExpr)? ("throws" IDENT ("," IDENT)*)?
+ifaceParam  := "self" | IDENT ":" typeExpr
+              // Phase 8 (overtake): `self` may be bare or typed
+              // (`self: Circle`); other params need types.
+
+implDecl    := "impl" IDENT "for" IDENT "{" implMethod* "}"
+implMethod  := "fn" IDENT "(" ifaceParam ("," ifaceParam)* ")"
+               ("->" typeExpr)? ("throws" IDENT ("," IDENT)*)?
+               "{" statement* "}"
+              // Phase 8 (overtake): e.g.
+              //   interface Drawable { fn draw(self) -> Text }
+              //   impl Drawable for Circle { fn draw(self) -> Text { … } }
+              // v1: no default bodies, no blanket impls; the impl
+              // target must be a plain record `type`.
 
 typeExpr    := IDENT "?"? | "[" typeExpr "]" "?"?
              | "Map" "<" typeExpr "," typeExpr ">" "?"?

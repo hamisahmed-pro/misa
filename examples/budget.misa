@@ -86,7 +86,8 @@ fn sum_by<T>(xs: [T], f: (T) -> Int) -> Int {
 
 // --- Money ---------------------------------------------------------------------
 // Amounts are integer cents: 4250 means $42.50. Integers never round.
-// (`/` is float division in Misa, so dollars come from int(cents / 100).)
+// (`/` on Ints is truncating integer division in Misa, so dollars
+// come straight from cents / 100; int() is a no-op here.)
 fn fmt_money(cents: Int) -> Text throws E300 {
   let dollars = int(cents / 100)
   let rest = cents % 100

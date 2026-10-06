@@ -33,7 +33,7 @@ Every Misa diagnostic carries a code. Ranges:
 
 | Code | Meaning |
 |---|---|
-| E200 | Type mismatch on assignment (`cannot assign Text to 'x: Int'`). |
+| E200 | Type mismatch on assignment (`cannot assign Text to 'x: Int'`). **(Phase 8 overtake)** Also: interface errors — unknown method on an interface value, impl missing a method / signature mismatch / throws superset, ambiguous static dispatch, `match` or field access on an interface value, bound violation on a generic call, unsupported nested interface conversion. |
 | E201 | Assignment to an immutable binding, invalid target, or component id used as a value. |
 | E202 | Structural mismatch (record field type, map key type, list element). |
 | E203 | `eval given` keys do not match the model's parameters. |
@@ -43,7 +43,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E207 | Duplicate component id. |
 | E208 | Unknown type name in an annotation. |
 | E209 | Unknown provider / model alias / on-device model problem at check time. |
-| E210 | Duplicate definition in one file (`duplicate function 'f'`, `redefinition of 'x'`). |
+| E210 | Duplicate definition in one file (`duplicate function 'f'`, `redefinition of 'x'`). **(Phase 8 overtake)** Also: duplicate `interface` declaration or duplicate `impl` of one interface for one type. |
 | E211 | Argument/return type mismatch (`argument 'x' wants Int, got Text`). Also: screen `state()` misuse — `state()` outside a screen body, unbound `state()` (not under `let`/`var`), `state()` declared in an event handler or `for` body, wrong arity, or assigning a mistyped value to a state binding (`cannot assign Text to state 'count: Int'`). |
 | E212 | `throw` of a non-`Error` value. Accepts a `{ code: Text, message: Text }` record *literal* or a caught error — a plain record cannot be assigned to the nominal `Error` type (E200). |
 | E213 | **(Phase 5a)** Cannot infer a lambda parameter's type — annotate it (`\|x: Int\|`) or use the lambda where a function type is expected. |
@@ -58,7 +58,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E222 | **(Phase 5c)** Unbound type variable — a name used as a type inside a generic declaration that is not one of its type parameters (`unbound type variable 'K'`). |
 | E223 | **(Phase 5c)** Monomorphization depth exceeded — recursive generic instantiation in AOT (`f<T>` calling `f<[T]>`); restructure to avoid infinite specialization. |
 | E224 | **(Phase 5 DB)** Unknown table or column in a `db.query` SQL string validated against `table` declarations (`unknown column 'nam' (table 'users' has no such column)`). Queries over undeclared tables are dynamic, not errors. |
-| E225 | **(Phase 7)** Invalid `extern` signature — empty library name, type parameters on an extern function, or a parameter/return type that cannot cross the FFI boundary (only `Int`, `Float`, `Text`, `Bool`, `Ptr`, `Void` in v1). Passing a `Task<T>`/`Chan<T>` value to an `extern` function at a call site is also E225. |
+| E225 | **(Phase 7; extended Wave 2)** Invalid `extern` signature — empty library name, type parameters on an extern function, or a parameter/return type that cannot cross the FFI boundary (crossable: `Int`, `Float`, `Text`, `Bool`, `Ptr`, `Void`, declared C structs, and `(A, B) -> R` callback params with scalar parts). Struct fields are `Int`/`Float`/`Bool`/`Ptr` only in v1; callbacks as return types, nested callbacks, and structs in callbacks are E225; >16-byte structs as varargs are E225. Passing a `Task<T>`/`Chan<T>` value to an `extern` function at a call site is also E225. |
 | E226 | **(Phase 7)** FFI failure at load or call time — library cannot be loaded (`cannot load library 'foo': ...`), symbol not found (`library 'm' has no symbol 'bar'`), or the foreign call itself failed. Foreign crashes are NOT caught (same as C). |
 | E227 | **(Phase 8 overtake)** Checked `throws` violation — an unhandled error code at a call/`throw`/`await` site (`unhandled E304 from call to 'fetch' — 'load' must declare 'throws E304' or catch it'), or a malformed code in a `throws` clause. See `spec/PHASE8-THROWS.md`. |
 

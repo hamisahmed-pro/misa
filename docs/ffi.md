@@ -57,6 +57,91 @@ free(p)
 - `Ptr` cannot be dereferenced from Misa. There is no pointer
   arithmetic.
 
+## Structs by value
+
+`extern` blocks can declare C-layout structs, usable by value and by
+pointer in signatures:
+
+```misa
+extern "c" {
+    struct Point { x: Float, y: Float },
+    fn hypot(x: Float, y: Float) -> Float,
+}
+
+let p = Point { x: 3.0, y: 4.0 }   // construct
+print(p.x)                          // 3.0 — field read
+print(hypot(p.x, p.y))              // 5.0
+```
+
+- Field types in v1: `Int`, `Float`, `Bool`, `Ptr` only (anything
+  else is E225). In particular `Int` fields are C `long` (64-bit) —
+  a C struct with 32-bit `int` fields does **not** match; write a
+  shim with `int64_t` fields or pass the struct by pointer.
+- Construction requires every field (`Point { x: 1.0 }` is E211);
+  unknown fields are E101; mistyped fields are E211.
+- Structs cross by value with the platform C ABI (≤16-byte structs
+  in registers, larger via `sret`/`byval` — handled for you on
+  x86-64 and AArch64).
+- The library string may be a direct shared-object path
+  (`extern "/tmp/mylib.so" { ... }`), which the interpreter loads
+  with `dlopen` and AOT links directly — handy for test shims.
+
+## Callbacks: Misa closures as C function pointers
+
+A `(A, B) -> R` parameter type means "C function pointer" — pass a
+Misa lambda or named function:
+
+```misa
+extern "c" {
+    fn qsort(base: Ptr, n: Int, sz: Int, cmp: (Ptr, Ptr) -> Int) -> Void,
+    fn malloc(n: Int) -> Ptr,
+}
+
+let cmp = |a: Ptr, b: Ptr| {
+    // ... compare the two elements, return -1/0/1
+    return 0
+}
+qsort(base, n, 8, cmp)
+```
+
+- The closure's signature must match the declared callback type
+  (E211 otherwise). Named functions work too — but a function that
+  calls `extern` functions needs its `throws E226` clause, like
+  anywhere else.
+- The callback's parameter/return types are the scalar FFI types
+  (`Int`, `Float`, `Text`, `Bool`, `Ptr`, `Void` return). Structs
+  and nested callbacks in a signature are E225 in v1.
+- **Lifetime (v1):** the callback is valid only for the duration of
+  the `extern` call. The trampoline stays alive (no GC
+  use-after-free), but if C retains the pointer and calls it later,
+  behavior is undefined. Callbacks are re-entrant-safe (nested
+  extern calls with callbacks work).
+- A Misa error raised *inside* a callback cannot unwind through C:
+  it is printed and the process aborts (v1) — never silently
+  ignored.
+
+## Varargs
+
+C varargs functions declare a `...` tail:
+
+```misa
+extern "c" {
+    fn snprintf(buf: Ptr, size: Int, fmt: Text, ...) -> Int,
+}
+
+let buf = malloc(64)
+let n = snprintf(buf, 64, "%d %f %s", 42, 2.5, "hi")
+// n == 16, buf holds "42 2.500000 hi"
+```
+
+- The fixed prefix checks arity/types as usual; the `...` tail
+  needs at least the fixed args (fewer is E102).
+- Each vararg's C type derives from its Misa type: `Int`→`long`,
+  `Float`→`double`, `Text`→`char*`, `Bool`→`int`, `Ptr`→`void*`
+  (C default argument promotion applies). Anything else is E225.
+  Structs up to 16 bytes may cross as varargs; larger ones are E225
+  (pass by pointer instead).
+
 ## Errors
 
 - **E225** — invalid `extern` signature (empty library name, or a type
@@ -64,8 +149,8 @@ free(p)
 
   ```
   2:27: E225: extern function 'strlen': return has type '[Int]', which
-  cannot cross the FFI boundary (v1 supports only Int, Float, Text,
-  Bool, Ptr, Void)
+  cannot cross the FFI boundary (supports Int, Float, Text, Bool, Ptr,
+  Void, declared structs, and (A, B) -> R callbacks)
   ```
 
 - **E226** — the library can't be loaded, the symbol is missing, or the
@@ -106,10 +191,14 @@ backends, but it *will* bite you if you test `< 0` or compare with
 - For "negative on error" C APIs, normalize through a shim returning
   `Bool` before branching.
 
-## Limitations (v1)
+## Limitations
 
-- No structs by value, no callbacks (Misa fn → C function pointer),
-  no varargs, no C++ name mangling, no automatic header binding.
+- No C++ name mangling, no automatic header binding.
+- Struct fields: `Int`/`Float`/`Bool`/`Ptr` only in v1 (no `Text`
+  fields, no nested structs — E225).
+- Callbacks: scalar signatures only in v1; valid only during the
+  extern call; errors inside callbacks abort.
+- Varargs: structs over 16 bytes are E225.
 - Android: `extern "c"` / `"m"` link via the NDK; other libraries fail
   the link with a clean `E600`. iOS: same via the Xcode template
   (device run not yet verified).

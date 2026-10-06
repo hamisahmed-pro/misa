@@ -188,6 +188,69 @@ print(unwrap(bad, 0))               // 0
 Type parameters are unconstrained in v1 (no `where` clauses). The AOT
 compiler monomorphizes — one specialization per concrete type tuple.
 
+## Interfaces
+
+An `interface` declares a set of methods; `impl I for T` provides
+them for a concrete record type. This is how Misa does polymorphism:
+heterogeneous collections, test doubles, and plugin-style APIs.
+
+```misa
+interface Drawable {
+    fn draw(self) -> Text
+}
+
+type Circle { x: Int, y: Int, r: Int }
+type Rect { w: Int, h: Int }
+
+impl Drawable for Circle {
+    fn draw(self) -> Text { return "circle({self.r})" }
+}
+
+impl Drawable for Rect {
+    fn draw(self) -> Text { return "rect({self.w}x{self.h})" }
+}
+
+// A Circle flows into a Drawable position automatically.
+fn render_all(items: [Drawable]) -> [Text] {
+    var out: [Text] = []
+    for d in items { out = out + [d.draw()] }
+    return out
+}
+
+let c: Circle = { x: 0, y: 0, r: 5 }
+let r: Rect = { w: 3, h: 4 }
+print(c.draw())            // circle(5) — static dispatch (zero-cost)
+var d: Drawable = c
+print(d.draw())            // circle(5) — dynamic dispatch
+print(render_all([c, r]))  // [circle(5), rect(3x4)] — mixed collection
+```
+
+Method calls on an interface value dispatch on the value's concrete
+type at runtime. Calls on a concrete receiver are resolved statically
+when exactly one impl provides the method. Calling a method that is
+not in the interface is a compile error (E200), as is `match` or
+field access on an interface value.
+
+Type parameters can be bounded: `fn f<T: Drawable>(x: T)` only
+accepts types implementing `Drawable` (anything else is E200), and
+`x.draw()` inside dispatches dynamically:
+
+```misa
+fn describe<T: Drawable>(x: T) -> Text {
+    return "got: " + x.draw()
+}
+
+print(describe(c))  // got: circle(5)
+print(describe(r))  // got: rect(3x4)
+```
+
+Interface methods can declare `throws` sets; an impl may only throw a
+subset (more is E200), and dynamic calls are checked against the
+interface's set.
+
+v1 limits: no default method bodies, no blanket impls, impl targets
+must be plain record types, and there is no FFI crossing.
+
 ## Errors: `try` / `catch` / `throw` / `throws`
 
 Runtime, I/O, HTTP, model, and budget failures surface as catchable

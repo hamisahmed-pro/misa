@@ -108,6 +108,13 @@ unary `-`), integer literals (so `18446744073709551615` is `-1`), and
 `int()` parsing of strings. Out-of-range `Float` → `Int` conversions
 (`int()`, `math.floor`/`ceil`/`round`) raise `E300` instead. The
 interpreter and AOT backends are byte-identical on all of these.
+
+**Integer division semantics (2026-10-06):** `Int / Int` is *truncating*
+integer division (C99/LLVM `sdiv`: quotient rounds toward zero;
+`INT64_MIN / -1` wraps to `INT64_MIN`); `Int % Int` is truncated modulo
+(LLVM `srem`: the remainder takes the sign of the dividend). Division or
+modulo by zero raises catchable `E300`. Mixed `Int`/`Float` operands use
+float division. The checker types `Int / Int` as `Int`.
 | `Float` | Double |
 | `Bool` | Boolean |
 | `Void` | No value; only as a `fn` return type |
@@ -283,6 +290,59 @@ report as JSON for agent consumers.
 Error families: `E1xx` resolution, `E2xx` types, `E3xx` runtime,
 `E4xx` model/provider, `E5xx` budget. See §4 for the catchable
 `Error` type.
+
+## 12. Interfaces
+
+An `interface` declares a method set; `impl I for T` provides it for a
+concrete record type `T`. Interfaces are nominal: a type implements an
+interface only via an explicit `impl` block.
+
+```misa
+interface Drawable {
+  fn draw(self) -> Text
+}
+type Circle { x: Int, y: Int, r: Int }
+impl Drawable for Circle {
+  fn draw(self) -> Text { return "circle({self.r})" }
+}
+```
+
+**Conversions.** A `Circle` flows into a `Drawable` position (fn arg,
+return, `let`/`var` annotation, assignment, record field) by
+wrapping it in an interface value: the pair (interface, concrete
+type, payload). Heterogeneous collections work: `[c, r]` where
+`c: Circle`, `r: Rect` and both implement `Drawable` converts to
+`[Drawable]`.
+
+**Dispatch.** The checker resolves `recv.m(args)` at compile time:
+
+- `d.m(…)`, `d: Drawable` → dynamic: dispatch on the value's concrete
+  type at runtime (a switch over the impls known at compile time).
+- `x.m(…)`, `x: T`, `T: Drawable` (bounded type param) →
+  monomorphized for `T`, then dispatched dynamically (the argument is
+  wrapped at the generic call site).
+- `c.m(…)`, `c: Circle`, and exactly one impl in scope provides `m` →
+  static: a direct call to the impl method (zero-cost). If several
+  applicable impls provide `m`, it is E200 (ambiguous).
+
+Calling a method not in the interface's set on an interface value is
+E200. `match` on an interface value and field access through one are
+E200 (v1).
+
+**Generics.** `fn f<T: Drawable>(x: T)` bounds the type parameter;
+calling `f` with a type that does not implement the bound is E200.
+Inside `f`, `x` is known to satisfy the bound, so `x.draw()`
+type-checks and dispatches dynamically.
+
+**Throws.** An impl method may declare a subset of the interface
+method's `throws` set (declaring more is E200). A dynamic call
+through the interface is checked against the interface's declared
+set (E227 at the call site if uncaught).
+
+**v1 limits.** No default method bodies (parse error), no blanket
+impls, impl target must be a plain record `type`, no FFI crossing,
+nested interface conversions only for list literals (a non-literal
+`[[T]]` → `[[I]]` is E200).
 
 ## Appendix A — cost pricing table (estimates, USD per 1K tokens)
 

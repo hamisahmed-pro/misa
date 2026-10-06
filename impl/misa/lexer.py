@@ -166,6 +166,15 @@ class Lexer:
             t = self._tok(two, two)
             self.advance(2)
             return t
+        # Overtake Wave 2 (FFI): `...` marks C varargs in extern
+        # declarations, e.g. `fn printf(fmt: Text, ...) -> Int`.
+        # Must come before the single-`.` branch below; `a...b` (not
+        # valid Misa) lexes as `.`, `..`, `.` — only the exact triple
+        # forms the token.
+        if ch == "." and self.peek(1) == "." and self.peek(2) == ".":
+            t = self._tok("...", "...")
+            self.advance(3)
+            return t
         if ch in "+-*/%()[]{}.,:|=?<>!@":
             # Phase 5 (DB): `@` for `@primary` in table declarations.
             if ch == "!" :

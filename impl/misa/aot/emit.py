@@ -97,6 +97,12 @@ class FnCtx:
         # compiled event handlers (resolved via the runtime frame).
         self.state_vars: dict = {}
         self.screen_state_vars: dict = {}
+        # Overtake Wave 2 (FFI): var name -> FFI type name, for names
+        # provably holding an FFI-scalar or C-struct value (mirrors
+        # int_vars). Drives struct field reads (`p.x` via GEP) and
+        # `...` vararg marshalling. Annotations and struct literals
+        # populate it; assignments clear it (sound).
+        self.ffi_types: dict = {}
 
 
 # ---------------------------------------------------------------------
@@ -114,11 +120,18 @@ _RT_SIGS = {
     "misa_list_new": (PTR, []),
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
     "misa_list_get": (PTR, [PTR, I64]),
+    # Phase 8 (overtake): wrap each element of a list as an interface
+    # value with the given impl tag.
+    "misa_iface_wrap_list": (PTR, [I64, PTR]),
     "misa_as_int": (I64, [PTR]),
     "misa_as_float": (DBL, [PTR]),
     # Phase 7: opaque C pointer (FFI `Ptr`).
     "misa_ptr": (PTR, [PTR]),
     "misa_as_ptr": (PTR, [PTR]),
+    # Overtake Wave 2 (FFI): C-layout struct values.
+    "misa_struct_new": (PTR, [PTR]),
+    "misa_struct_bytes": (PTR, [PTR]),
+    "misa_alloc": (PTR, [I64]),
     "misa_map_new": (PTR, []),
     "misa_record_new": (PTR, []),
     "misa_record_set_cstr": (ir.VoidType(), [PTR, PTR, PTR]),
@@ -301,9 +314,20 @@ class Emitter:
         self.model_decls = {}
         self.screen_decls = {}
         self.type_decls = {}
+        # Phase 8 (overtake): interfaces.
+        self.iface_decls = {}
+        self.impl_decls = []
+        self.impl_index = {}
+        self.impl_fns = {}
         # Phase 7: extern (FFI) blocks: fn name -> FnDecl signature.
         self.extern_decls = {}
         self.extern_libs = {}  # fn name -> library string
+        # Overtake Wave 2 (FFI): struct name -> StructDecl, plus
+        # cached LLVM struct types and callback trampolines.
+        self.extern_structs = {}
+        self._llvm_struct_types = {}
+        self._cb_trampolines = {}  # sig key -> (trampoline fn, slot global)
+        self._abort_fn = None  # lazily declared libc abort
         self.providers = {}   # provider name -> ProviderDecl
         self.aliases = {}     # alias -> (provider_name, model_id)
         for item in prog.items:
@@ -313,12 +337,28 @@ class Emitter:
                 for fn in item.fns:
                     self.extern_decls[fn.name] = fn
                     self.extern_libs[fn.name] = item.lib
+                # Overtake Wave 2 (FFI): C-layout struct declarations.
+                for st in item.structs:
+                    self.extern_structs[st.name] = st
             elif isinstance(item, A.ModelDecl):
                 self.model_decls[item.name] = item
             elif isinstance(item, A.ScreenDecl):
                 self.screen_decls[item.name] = item
             elif isinstance(item, A.TypeDecl):
                 self.type_decls[item.name] = item
+            # Phase 8 (overtake): interfaces. impl_decls in source
+            # order; impl_index[(iface, target)] = tag used in the
+            # interface value record.
+            elif isinstance(item, A.InterfaceDecl):
+                self.iface_decls[item.name] = item
+            elif isinstance(item, A.ImplDecl):
+                self.impl_decls.append(item)
+                key = (item.iface, item.target)
+                # Tag = the impl's index within its interface (source
+                # order); stable across wrap and dispatch sites.
+                tag = sum(1 for (i, _t) in self.impl_index
+                          if i == item.iface)
+                self.impl_index[key] = tag
             elif isinstance(item, A.ProviderDecl):
                 self.providers[item.name] = item
             elif isinstance(item, A.ModelsDecl):
@@ -353,42 +393,432 @@ class Emitter:
         raise AOTError("E225",
                        f"cannot map type '{tname}' across FFI")
 
+    # Overtake Wave 2 (FFI): full type-expression mapping — struct
+    # names become LLVM struct types, `(A, B) -> R` becomes a C
+    # function pointer type.
+    def _ffi_llvm_type_te(self, te):
+        if te.is_func:
+            fty = ir.FunctionType(
+                self._ffi_llvm_type_te(te.func_ret),
+                [self._ffi_llvm_type_te(p) for p in te.func_params])
+            return fty.as_pointer()
+        tname = te.name
+        if tname in self.extern_structs:
+            return self._ffi_struct_llvm_type(tname)
+        return self._ffi_llvm_type(tname)
+
+    def _ffi_struct_llvm_type(self, name: str):
+        """LLVM struct type for a declared C-layout struct (cached)."""
+        if name not in self._llvm_struct_types:
+            st = self.extern_structs[name]
+            self._llvm_struct_types[name] = ir.LiteralStructType(
+                [self._ffi_llvm_type(fte.name) for _, fte in st.fields],
+                packed=False)
+        return self._llvm_struct_types[name]
+
+    @staticmethod
+    def _ffi_struct_layout(fields) -> tuple:
+        """(size, [(fname, kind)]) with C alignment rules for flat
+        scalar fields. kinds: 'Int'/'Float'/'Bool'/'Ptr'. Exact: every
+        allowed field type has align == size, all powers of two."""
+        size_align = {"Int": (8, 8), "Float": (8, 8),
+                      "Bool": (4, 4), "Ptr": (8, 8)}
+        offset, max_align, kinds = 0, 1, []
+        for fname, ftype in fields:
+            sz, al = size_align[ftype]
+            offset = (offset + al - 1) // al * al
+            kinds.append((fname, ftype))
+            offset += sz
+            max_align = max(max_align, al)
+        size = (offset + max_align - 1) // max_align * max_align
+        return size, kinds
+
+    @staticmethod
+    def _te_ffi_name(te) -> Optional[str]:
+        """The FFI type name for an exact scalar/struct annotation
+        (`Int`, `Float`, `Text`, `Bool`, `Ptr`, or a declared struct),
+        else None."""
+        if te is None or te.is_func or te.is_list or te.is_map \
+                or te.optional or te.type_args:
+            return None
+        return te.name
+
+    def _ffi_var_type(self, te) -> Optional[str]:
+        """Like _te_ffi_name but only for names that can cross FFI."""
+        t = self._te_ffi_name(te)
+        if t is None:
+            return None
+        if t in ("Int", "Float", "Text", "Bool", "Ptr"):
+            return t
+        if t in self.extern_structs:
+            return t
+        return None
+
+    def _track_ffi_var(self, ctx, name: str, te):
+        t = self._ffi_var_type(te)
+        if t is not None:
+            ctx.ffi_types[name] = t
+
+    # -- Wave 2: C callbacks ------------------------------------------
+    # A `(P, ...) -> R` extern parameter takes a Misa closure. The C
+    # side needs a stable function pointer with the exact C signature,
+    # so each distinct callback signature gets one trampoline: it loads
+    # the current closure from a per-signature global slot, wraps the
+    # raw C args as MVal*s, invokes the closure, and unwraps the
+    # result. The call site saves/sets/restores the slot, which keeps
+    # nested callbacks sound.
+
+    def _libc_abort(self):
+        if self._abort_fn is None:
+            fty = ir.FunctionType(ir.VoidType(), [])
+            self._abort_fn = ir.Function(self.mod, fty, name="abort")
+        return self._abort_fn
+
+    def _ffi_struct_needs_sret(self, name: str) -> bool:
+        """x86_64 SysV / AAPCS64: a struct larger than 16 bytes is
+        returned via a hidden sret pointer (first argument), not in
+        registers. Raw LLVM IR does not infer this — the declaration
+        must use the explicit sret form."""
+        return self._ffi_struct_size(name) > 16
+
+    def _ffi_struct_indirect(self, name: str) -> bool:
+        """Same 16-byte rule for parameters: a larger struct crosses
+        by invisible reference (pointer to a caller-made copy)."""
+        return self._ffi_struct_size(name) > 16
+
+    def _ffi_struct_size(self, name: str) -> int:
+        size, _ = self._ffi_struct_layout(
+            [(fn_, fte.name)
+             for fn_, fte in self.extern_structs[name].fields])
+        return size
+
+    def _cb_trampoline(self, te):
+        """(trampoline_fn, slot_global) for callback type te."""
+        pnames = [p.name for p in te.func_params]
+        rname = te.func_ret.name
+        key = (tuple(pnames), rname)
+        if key in self._cb_trampolines:
+            return self._cb_trampolines[key]
+        idx = len(self._cb_trampolines)
+        slot = ir.GlobalVariable(self.mod, PTR,
+                                 name=f"misa_cb_slot_{idx}")
+        slot.linkage = "internal"
+        slot.initializer = NULL_PTR
+        fty = ir.FunctionType(self._ffi_llvm_type(rname),
+                             [self._ffi_llvm_type(p) for p in pnames])
+        fn = ir.Function(self.mod, fty, name=f"misa_cb_tramp_{idx}")
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        z = self.const_i32(0)
+        clos = b.load(slot, name="cb_clos")
+        fn_mval = b.call(self.rt["misa_record_get"],
+                         [clos, self.cstr("__closure_fn"), z, z],
+                         name="cb_fn_mval")
+        fn_i64 = b.call(self.rt["misa_as_int"], [fn_mval],
+                        name="cb_fn_i64")
+        lam_ty = ir.FunctionType(PTR, [PTR, PTR]).as_pointer()
+        lam_fn = b.inttoptr(fn_i64, lam_ty, name="cb_lam")
+        env = b.call(self.rt["misa_record_get"],
+                     [clos, self.cstr("__closure_env"), z, z],
+                     name="cb_env")
+        args_list = b.call(self.rt["misa_list_new"], [], name="cb_args")
+        for c_arg, p in zip(fn.args, pnames):
+            b.call(self.rt["misa_list_push"],
+                   [args_list, self._cb_wrap(b, c_arg, p)])
+        res = b.call(lam_fn, [env, args_list], name="cb_res")
+        # v1: a Misa error raised inside a callback cannot unwind
+        # through C frames — report it and abort (never silently
+        # continue with a garbage value).
+        pend = b.call(self.rt["misa_pending"], [], name="cb_pend")
+        is_err = b.icmp_unsigned("!=", pend, NULL_PTR, name="cb_iserr")
+        err_bb = fn.append_basic_block("cb_error")
+        ok_bb = fn.append_basic_block("cb_ok")
+        b.cbranch(is_err, err_bb, ok_bb)
+        b.position_at_end(err_bb)
+        taken = b.call(self.rt["misa_take_pending"], [],
+                       name="cb_taken")
+        b.call(self.rt["misa_report_uncaught"], [taken])
+        b.call(self._libc_abort(), [])
+        b.unreachable()
+        b.position_at_end(ok_bb)
+        if rname == "Void":
+            b.ret_void()
+        else:
+            b.ret(self._cb_unwrap(b, res, rname))
+        self._cb_trampolines[key] = (fn, slot)
+        return fn, slot
+
+    def _cb_wrap(self, b, c_arg, p):
+        """Wrap one raw C callback argument as an MVal*."""
+        if p == "Int":
+            return b.call(self.rt["misa_int"], [c_arg], name="_cbw")
+        if p == "Float":
+            return b.call(self.rt["misa_float"], [c_arg], name="_cbw")
+        if p == "Bool":
+            return b.call(self.rt["misa_bool"], [c_arg], name="_cbw")
+        if p == "Text":
+            # v1: callback Text params must be non-null.
+            return b.call(self.rt["misa_text_cstr"], [c_arg],
+                          name="_cbw")
+        if p == "Ptr":
+            return b.call(self.rt["misa_ptr"], [c_arg], name="_cbw")
+        raise AOTError("E225",
+                       f"cannot wrap callback argument of type '{p}'")
+
+    def _cb_unwrap(self, b, res, rname):
+        """Unwrap a callback's MVal* result to its C return type."""
+        if rname == "Int":
+            return b.call(self.rt["misa_as_int"], [res], name="_cbu")
+        if rname == "Float":
+            return b.call(self.rt["misa_as_float"], [res], name="_cbu")
+        if rname == "Bool":
+            return b.call(self.rt["misa_truthy"], [res], name="_cbu")
+        if rname == "Text":
+            return b.call(self.rt["misa_text_z"], [res], name="_cbu")
+        if rname == "Ptr":
+            return b.call(self.rt["misa_as_ptr"], [res], name="_cbu")
+        raise AOTError("E225",
+                       f"cannot unwrap callback result of type '{rname}'")
+
+    def _marshal_scalar(self, v, tname: str, node, ctx):
+        """Marshal a boxed MVal* (or raw i64 for Int) to its raw C
+        value for an extern argument."""
+        b = ctx.builder
+        # P-2: a raw i64 is already the C `long`.
+        if tname == "Int" and v.type == I64:
+            return v
+        v = self._ensure_mval(v, node, ctx)
+        if tname == "Int":
+            return self.call(ctx, "misa_as_int", [v], node,
+                             check=False)
+        if tname == "Float":
+            return self.call(ctx, "misa_as_float", [v], node,
+                             check=False)
+        if tname == "Text":
+            return self.call(ctx, "misa_text_z", [v], node,
+                             check=False)
+        if tname == "Bool":
+            return self.call(ctx, "misa_truthy", [v], node,
+                             check=False)
+        if tname == "Ptr":
+            return self.call(ctx, "misa_as_ptr", [v], node,
+                             check=False)
+        raise AOTError("E225",
+                       f"cannot map type '{tname}' across FFI",
+                       node.line, node.col)
+
+    def _marshal_struct_arg(self, v, st_name: str, node, ctx):
+        """Marshal a struct MVal* for a by-value C parameter.
+
+        <=16 bytes: the LLVM struct value (the C ABI passes it in
+        registers). Larger: a pointer to the struct bytes — the
+        declaration uses byval, so the backend copies it onto the
+        stack per the C ABI.
+        """
+        b = ctx.builder
+        v = self._ensure_mval(v, node, ctx)
+        raw_ptr = self.call(ctx, "misa_struct_bytes", [v], node,
+                            check=False)
+        sty = self._ffi_struct_llvm_type(st_name)
+        sptr = b.bitcast(raw_ptr, sty.as_pointer(),
+                         name="_sarg_ptr")
+        if self._ffi_struct_indirect(st_name):
+            return sptr
+        return b.load(sptr, name="_sarg")
+
+    def _wrap_struct_ret(self, raw, st_name: str, node, ctx):
+        """Box a by-value LLVM struct return into a struct MVal*."""
+        b = ctx.builder
+        st = self.extern_structs[st_name]
+        size, _ = self._ffi_struct_layout(
+            [(fn_, fte.name) for fn_, fte in st.fields])
+        mem = self.call(ctx, "misa_alloc", [self.const_i64(size)],
+                        node, check=False)
+        sty = self._ffi_struct_llvm_type(st_name)
+        sptr = b.bitcast(mem, sty.as_pointer(), name="_sret_ptr")
+        b.store(raw, sptr)
+        return self.call(ctx, "misa_struct_new", [mem], node,
+                         check=False)
+
+    def _struct_type_of(self, e, ctx) -> Optional[str]:
+        """The declared struct type of an expression, if statically
+        known (variables via ffi_types, struct literals, extern calls
+        with struct returns)."""
+        if isinstance(e, A.Ident):
+            t = ctx.ffi_types.get(e.name)
+            return t if t in self.extern_structs else None
+        if isinstance(e, A.StructLit):
+            return e.name if e.name in self.extern_structs else None
+        if isinstance(e, A.Call) and e.name in self.extern_decls:
+            decl = self.extern_decls[e.name]
+            if decl.ret is not None \
+                    and decl.ret.name in self.extern_structs:
+                return decl.ret.name
+        return None
+
+    def _vararg_kind(self, arg_e, ctx, e) -> str:
+        """The FFI kind of a `...` argument for marshalling."""
+        if isinstance(arg_e, A.IntLit):
+            return "Int"
+        if isinstance(arg_e, A.FloatLit):
+            return "Float"
+        if isinstance(arg_e, A.StrLit):
+            return "Text"
+        if isinstance(arg_e, A.BoolLit):
+            return "Bool"
+        if isinstance(arg_e, A.Ident):
+            t = ctx.ffi_types.get(arg_e.name)
+            if t in ("Int", "Float", "Text", "Bool", "Ptr") \
+                    or t in self.extern_structs:
+                return t
+        st = self._struct_type_of(arg_e, ctx)
+        if st is not None:
+            return st
+        if isinstance(arg_e, A.Call) and arg_e.name in self.extern_decls:
+            decl = self.extern_decls[arg_e.name]
+            if decl.ret is not None:
+                rt = decl.ret.name
+                if rt in ("Int", "Float", "Text", "Bool", "Ptr") \
+                        or rt in self.extern_structs:
+                    return rt
+        raise AOTError("E225",
+                       "cannot determine the C type of a vararg "
+                       "argument: bind it to a variable with a scalar "
+                       "or struct type annotation first",
+                       arg_e.line, arg_e.col)
+
+    def _emit_struct_lit(self, e: A.StructLit, ctx):
+        """`Point { x: 1.0, y: 2.0 }` — build the raw bytes on the
+        heap and box them as a struct MVal*."""
+        st = self.extern_structs.get(e.name)
+        if st is None:
+            raise AOTError("E101", f"unknown struct '{e.name}'",
+                           e.line, e.col)
+        b = ctx.builder
+        size, _ = self._ffi_struct_layout(
+            [(fn_, fte.name) for fn_, fte in st.fields])
+        mem = self.call(ctx, "misa_alloc", [self.const_i64(size)], e,
+                        check=False)
+        sty = self._ffi_struct_llvm_type(e.name)
+        sptr = b.bitcast(mem, sty.as_pointer(), name="_slit_ptr")
+        have = {fn_: fv for fn_, fv in e.fields}
+        for i, (fn_, fte) in enumerate(st.fields):
+            # The checker guarantees every field is present.
+            v = self.emit_expr(have[fn_], ctx)
+            self.check(ctx, e)
+            raw = self._marshal_scalar(v, fte.name, have[fn_], ctx)
+            fp = b.gep(sptr, [self.const_i32(0), self.const_i32(i)],
+                       name="_slit_gep")
+            b.store(raw, fp)
+        return self.call(ctx, "misa_struct_new", [mem], e,
+                         check=False)
+
+    def _emit_struct_field(self, e: A.Field, st_name: str, ctx):
+        """`p.x` on a statically-known struct value: GEP + load,
+        boxed back to an MVal*."""
+        b = ctx.builder
+        obj = self.emit_expr(e.obj, ctx)
+        self.check(ctx, e)
+        obj = self._ensure_mval(obj, e.obj, ctx)
+        st = self.extern_structs[st_name]
+        idx = next(i for i, (fn_, _) in enumerate(st.fields)
+                   if fn_ == e.field)
+        _, fte = st.fields[idx]
+        raw_ptr = self.call(ctx, "misa_struct_bytes", [obj], e,
+                            check=False)
+        sty = self._ffi_struct_llvm_type(st_name)
+        sptr = b.bitcast(raw_ptr, sty.as_pointer(),
+                         name="_sfield_ptr")
+        fp = b.gep(sptr, [self.const_i32(0), self.const_i32(idx)],
+                   name="_sfield_gep")
+        raw = b.load(fp, name="_sfield")
+        ft = fte.name
+        if ft == "Int":
+            return self.call(ctx, "misa_int", [raw], e, check=False)
+        if ft == "Float":
+            return self.call(ctx, "misa_float", [raw], e, check=False)
+        if ft == "Bool":
+            return self.call(ctx, "misa_bool", [raw], e, check=False)
+        if ft == "Ptr":
+            return self.call(ctx, "misa_ptr", [raw], e, check=False)
+        raise AOTError("E225",
+                       f"cannot read struct field of type '{ft}'",
+                       e.line, e.col)
+
     def emit_extern_call(self, e: A.Call, ctx, name: str):
         """Phase 7: call an extern (FFI) function. Marshals MVal*
         args to raw C values, calls the declared symbol, and wraps
-        the raw return back into an MVal*."""
+        the raw return back into an MVal*.
+
+        Overtake Wave 2: struct args/returns cross by value;
+        `(A, B) -> R` params take Misa closures via per-signature C
+        trampolines (the closure slot is saved/set/restored around
+        the call, keeping nested callbacks sound); `...` tails
+        marshal per the mapping table.
+        """
         decl = self.extern_decls[name]
         line, col = self.loc(e)
         b = ctx.builder
         c_args = []
-        for (_, pte), arg_e in zip(decl.params, e.args):
+        cb_restores = []  # (slot_global, saved MVal*)
+        fixed = decl.params
+        for (pn, pte), arg_e in zip(fixed, e.args):
             v = self.emit_expr(arg_e, ctx)
             self.check(ctx, e)
-            t = pte.name
-            if t == "Int":
-                c_args.append(self.call(ctx, "misa_as_int", [v], e,
-                                        check=False))
-            elif t == "Float":
-                c_args.append(self.call(ctx, "misa_as_float", [v], e,
-                                        check=False))
-            elif t == "Text":
-                c_args.append(self.call(ctx, "misa_text_z", [v], e,
-                                        check=False))
-            elif t == "Bool":
-                c_args.append(self.call(ctx, "misa_truthy", [v], e,
-                                        check=False))
-            elif t == "Ptr":
-                c_args.append(self.call(ctx, "misa_as_ptr", [v], e,
-                                        check=False))
+            if pte.is_func:
+                # Callback: stash the closure in the signature's
+                # slot and pass the trampoline pointer.
+                tramp, slot = self._cb_trampoline(pte)
+                saved = b.load(slot, name="_cb_saved")
+                b.store(v, slot)
+                cb_restores.append((slot, saved))
+                c_args.append(tramp.bitcast(
+                    self._ffi_llvm_type_te(pte)))
+            elif pte.name in self.extern_structs:
+                c_args.append(self._marshal_struct_arg(
+                    v, pte.name, arg_e, ctx))
             else:
-                raise AOTError("E225",
-                               f"cannot map type '{t}' across FFI",
-                               e.line, e.col)
+                c_args.append(self._marshal_scalar(
+                    v, pte.name, arg_e, ctx))
+        # `...` tail: kind derived per argument (literals, tracked
+        # variables, struct literals, extern calls).
+        for arg_e in e.args[len(fixed):]:
+            v = self.emit_expr(arg_e, ctx)
+            self.check(ctx, e)
+            kind = self._vararg_kind(arg_e, ctx, e)
+            if kind in self.extern_structs:
+                c_args.append(self._marshal_struct_arg(
+                    v, kind, arg_e, ctx))
+            else:
+                c_args.append(self._marshal_scalar(
+                    v, kind, arg_e, ctx))
         target = self.mod.get_global(name)
-        raw = b.call(target, c_args, name="_extern_ret")
-        ret_t = decl.ret.name if decl.ret else "Void"
+        ret_te = decl.ret
+        ret_t = ret_te.name if ret_te else "Void"
+        # Large struct returns: pass the hidden sret slot first; the
+        # declared function returns void.
+        sret_mem = None
+        if ret_t in self.extern_structs \
+                and self._ffi_struct_needs_sret(ret_t):
+            st = self.extern_structs[ret_t]
+            size, _ = self._ffi_struct_layout(
+                [(fn_, fte.name) for fn_, fte in st.fields])
+            sret_mem = self.call(ctx, "misa_alloc",
+                                 [self.const_i64(size)], e, check=False)
+            sty = self._ffi_struct_llvm_type(ret_t)
+            c_args.insert(0, b.bitcast(sret_mem, sty.as_pointer(),
+                                       name="_sret_slot"))
+            raw = b.call(target, c_args, name="_extern_ret")
+        else:
+            raw = b.call(target, c_args, name="_extern_ret")
+        for slot, saved in reversed(cb_restores):
+            b.store(saved, slot)
         if ret_t == "Void":
             return self.call(ctx, "misa_null", [], e, check=False)
+        if ret_t in self.extern_structs:
+            if sret_mem is not None:
+                return self.call(ctx, "misa_struct_new", [sret_mem], e,
+                                 check=False)
+            return self._wrap_struct_ret(raw, ret_t, e, ctx)
         if ret_t == "Int":
             return self.call(ctx, "misa_int", [raw], e, check=False)
         if ret_t == "Float":
@@ -480,6 +910,8 @@ class Emitter:
                 rty = ir.FunctionType(I64, [I64] * len(decl.params))
                 self.int_fns[name] = ir.Function(
                     self.mod, rty, name=f"misa_fn_{name}__int")
+        # Phase 8 (overtake): declare impl method functions.
+        self.declare_impl_fns()
         for name, decl in self.model_decls.items():
             self.emit_model_decl(name, decl)
         for name, decl in self.screen_decls.items():
@@ -496,17 +928,49 @@ class Emitter:
                 name=f"misa_rerender_{name}")
         # Phase 7: declare extern (FFI) functions with raw C types.
         # The linker resolves them against the shared libraries
-        # (build.py adds -l<lib>).
+        # (build.py adds -l<lib>). Overtake Wave 2: struct-typed and
+        # callback-typed params, plus var_arg for `...` declarations.
+        # Large struct returns (>16 bytes) use the explicit sret form
+        # (hidden first pointer arg); the C ABI requires it.
         for name, decl in self.extern_decls.items():
-            fty = ir.FunctionType(self._ffi_llvm_type(
-                decl.ret.name if decl.ret else "Void"),
-                [self._ffi_llvm_type(pte.name)
-                 for _, pte in decl.params])
-            ir.Function(self.mod, fty, name=name)
+            ret_te = decl.ret if decl.ret \
+                else A.TypeExpr(name="Void")
+            sret_struct = None
+            if ret_te.name in self.extern_structs \
+                    and self._ffi_struct_needs_sret(ret_te.name):
+                sret_struct = ret_te.name
+            param_tys = []
+            byval_idxs = []
+            for i, (_, pte) in enumerate(decl.params):
+                if not pte.is_func and pte.name in self.extern_structs \
+                        and self._ffi_struct_indirect(pte.name):
+                    # >16-byte struct param: the C ABI passes it on
+                    # the stack; declare the slot as a byval pointer
+                    # (raw LLVM struct args mislower — see sret).
+                    sty = self._ffi_struct_llvm_type(pte.name)
+                    param_tys.append(sty.as_pointer())
+                    # +1 when the hidden sret slot leads.
+                    byval_idxs.append(i + (1 if sret_struct else 0))
+                else:
+                    param_tys.append(self._ffi_llvm_type_te(pte))
+            if sret_struct is not None:
+                sty = self._ffi_struct_llvm_type(sret_struct)
+                fty = ir.FunctionType(ir.VoidType(),
+                                      [sty.as_pointer()] + param_tys,
+                                      var_arg=decl.varargs)
+            else:
+                fty = ir.FunctionType(
+                    self._ffi_llvm_type_te(ret_te), param_tys,
+                    var_arg=decl.varargs)
+            efn = ir.Function(self.mod, fty, name=name)
+            for bi in byval_idxs:
+                efn.args[bi].attributes.add("byval")
         for name, decl in self.fn_decls.items():
             if decl.type_params:
                 continue
             self.emit_fn_body(name, decl)
+        # Phase 8 (overtake): emit impl method bodies.
+        self.emit_impl_bodies()
         for name, decl in self.screen_decls.items():
             self.emit_screen_body(name, decl)
         # Phase 4 (M4): the handler dispatch table the drivers call.
@@ -789,6 +1253,9 @@ class Emitter:
             # P-2: track provably-Int variables for unboxing.
             if self._te_is_int(pte):
                 ctx.int_vars.add(pn)
+            # Wave 2 (FFI): track FFI-scalar/struct params for
+            # struct field reads and vararg marshalling.
+            self._track_ffi_var(ctx, pn, pte)
         # make nil available
         self.get_nil(ctx)
         b.position_at_end(fn.basic_blocks[0])
@@ -924,6 +1391,7 @@ class Emitter:
                                              A.EvalDecl, A.TestDecl,
                                              A.FnDecl,
                                              A.ExternDecl,
+                                             A.InterfaceDecl, A.ImplDecl,
                                              A.ImportDecl))]
         ctx.cell_vars = self._cell_vars_for(top_stmts)
         self.get_nil(ctx)
@@ -934,6 +1402,7 @@ class Emitter:
                                  A.ScreenDecl,
                                  A.EvalDecl, A.TestDecl, A.FnDecl,
                                  A.ExternDecl,
+                                 A.InterfaceDecl, A.ImplDecl,
                                  A.ImportDecl)):
                 continue
             self.emit_stmt(item, ctx)
@@ -1074,6 +1543,20 @@ class Emitter:
                 ctx.int_vars.add(s.name)
             elif not s.mutable and self._is_int_expr(val_node, ctx):
                 ctx.int_vars.add(s.name)
+            # Wave 2 (FFI): annotated FFI-scalar/struct locals, and
+            # struct literals, get static FFI types (struct field
+            # reads via GEP, vararg marshalling).
+            self._track_ffi_var(ctx, s.name, s.ann)
+            if isinstance(val_node, A.StructLit) \
+                    and val_node.name in self.extern_structs:
+                ctx.ffi_types[s.name] = val_node.name
+            elif isinstance(val_node, A.Call) \
+                    and val_node.name in self.extern_decls:
+                # `let q = get_point()` — struct-typed extern call.
+                rdecl = self.extern_decls[val_node.name]
+                if rdecl.ret is not None \
+                        and rdecl.ret.name in self.extern_structs:
+                    ctx.ffi_types[s.name] = rdecl.ret.name
         elif isinstance(s, A.AssignStmt):
             v = self.emit_expr(s.value, ctx)
             self.check(ctx, s)
@@ -1118,6 +1601,12 @@ class Emitter:
                         ctx.int_vars.add(tgt.name)
                     else:
                         ctx.int_vars.discard(tgt.name)
+                    # Wave 2 (FFI): assignments clear static FFI types
+                    # (a struct literal RHS re-establishes it).
+                    ctx.ffi_types.pop(tgt.name, None)
+                    if isinstance(s.value, A.StructLit) \
+                            and s.value.name in self.extern_structs:
+                        ctx.ffi_types[tgt.name] = s.value.name
             elif isinstance(tgt, A.Field):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
@@ -1382,6 +1871,12 @@ class Emitter:
                 decl = self.type_decls.get(e.obj.name)
                 if decl is not None and decl.is_sum:
                     return self.emit_bare_variant(decl, e, ctx)
+            # Overtake Wave 2 (FFI): `p.x` on a statically-known
+            # C-layout struct compiles to GEP + load (not a record
+            # lookup). Anything else falls through to records.
+            st_name = self._struct_type_of(e.obj, ctx)
+            if st_name is not None:
+                return self._emit_struct_field(e, st_name, ctx)
             # Phase 4 (M4): `<id>.text` readback inside handlers goes
             # to the active UI driver. (The checker guarantees `.text`
             # on a TextInput here.)
@@ -1416,6 +1911,11 @@ class Emitter:
                 v = self._ensure_mval(v, it, ctx)
                 self.call(ctx, "misa_list_push", [l, v], e, check=False)
             return l
+        # Phase 8 (overtake): interface conversions (checker-inserted).
+        if isinstance(e, A.IfaceWrap):
+            return self.emit_iface_wrap(e, ctx)
+        if isinstance(e, A.IfaceWrapList):
+            return self.emit_iface_wrap_list(e, ctx)
         if isinstance(e, A.RecordLit):
             r = self.call(ctx, "misa_record_new", [], e, check=False)
             for fname, fv in e.fields:
@@ -1425,6 +1925,9 @@ class Emitter:
                 self.call(ctx, "misa_record_set_cstr",
                           [r, self.cstr(fname), v], e, check=False)
             return r
+        if isinstance(e, A.StructLit):
+            # Overtake Wave 2 (FFI): `Point { x: 1.0, y: 2.0 }`.
+            return self._emit_struct_lit(e, ctx)
         if isinstance(e, A.MapLit):
             m = self.call(ctx, "misa_map_new", [], e, check=False)
             line, col = self.loc(e)
@@ -1777,6 +2280,13 @@ class Emitter:
         if name in self.fn_decls and self.fn_decls[name].type_params:
             return self.emit_mono_call(name, self.fn_decls[name], e,
                                        ctx)
+        # Phase 8 (overtake): interface method calls.
+        if name.startswith("iface.") and name.count(".") == 2:
+            _p, iname, mname = name.split(".")
+            return self.emit_iface_call(iname, mname, e, ctx)
+        if name.startswith("impl.") and name.count(".") == 3:
+            _p, iname, tgt, mname = name.split(".")
+            return self.emit_impl_call(iname, tgt, mname, e, ctx)
         if name in self.fns:
             decl = self.fn_decls[name]
             if len(e.args) != len(decl.params):
@@ -1799,13 +2309,19 @@ class Emitter:
                 args.append(v)
             return self.call(ctx, f"misa_fn_{name}", args, e,
                              check=True, direct=True)
-        # Phase 7: extern (FFI) function calls.
+        # Phase 7: extern (FFI) function calls. Overtake Wave 2:
+        # varargs functions take at least the fixed prefix.
         if name in self.extern_decls:
             decl = self.extern_decls[name]
-            if len(e.args) != len(decl.params):
+            n_fixed = len(decl.params)
+            ok = (len(e.args) >= n_fixed) if decl.varargs \
+                else (len(e.args) == n_fixed)
+            if not ok:
+                want = (f"at least {n_fixed}" if decl.varargs
+                        else str(n_fixed))
                 raise AOTError("E600",
                                f"extern fn '{name}' takes "
-                               f"{len(decl.params)} args, got "
+                               f"{want} args, got "
                                f"{len(e.args)}", e.line, e.col)
             return self.emit_extern_call(e, ctx, name)
         if name in self.models:
@@ -2339,6 +2855,151 @@ class Emitter:
                   [clos, self.cstr(self.CLOSURE_DISP), disp],
                   node, check=False)
         return clos
+
+    # -- Phase 8 (overtake): interfaces -------------------------------
+    #
+    # An interface value is an MVal* record:
+    #   {__tag: Int(impl index), __fields: [payload], __iface_disp: Text}.
+    # Method calls compile to an LLVM switch on __tag (closed world:
+    # every impl is known at compile time).
+
+    @staticmethod
+    def _impl_sym(iface: str, target: str, method: str) -> str:
+        return f"misa_impl_{iface}_{target}_{method}"
+
+    def _iface_impls(self, iface: str):
+        """[(tag, target)] for an interface, in tag order."""
+        items = [(tag, tgt) for (i, tgt), tag in self.impl_index.items()
+                 if i == iface]
+        items.sort()
+        return items
+
+    def declare_impl_fns(self):
+        """Declare LLVM functions for every impl method."""
+        for impl in self.impl_decls:
+            for m in impl.methods:
+                sym = self._impl_sym(impl.iface, impl.target, m.name)
+                fty = ir.FunctionType(PTR, [PTR] * len(m.params))
+                self.impl_fns[(impl.iface, impl.target,
+                               m.name)] = ir.Function(self.mod, fty,
+                                                      name=sym)
+
+    def emit_impl_bodies(self):
+        """Emit bodies for every impl method."""
+        for impl in self.impl_decls:
+            for m in impl.methods:
+                fn = self.impl_fns[(impl.iface, impl.target, m.name)]
+                self.emit_fn_body_direct(fn, m)
+
+    def emit_iface_wrap(self, e, ctx):
+        """Build the {__tag, __fields, __iface_disp} record for an
+        interface value."""
+        b = ctx.builder
+        tag = self.impl_index.get((e.iface, e.concrete))
+        if tag is None:
+            raise AOTError("E600",
+                           f"no impl of '{e.iface}' for '{e.concrete}'",
+                           e.line, e.col)
+        payload = self.emit_expr(e.expr, ctx)
+        self.check(ctx, e)
+        r = self.call(ctx, "misa_record_new", [], e, check=False)
+        tagv = self.call(ctx, "misa_int", [self.const_i64(tag)], e,
+                         check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr(self.SUM_TAG), tagv], e, check=False)
+        l = self.call(ctx, "misa_list_new", [], e, check=False)
+        self.call(ctx, "misa_list_push", [l, payload], e, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr(self.SUM_FIELDS), l], e, check=False)
+        # Display hint so print/str renders the payload (mirrors
+        # __sum_disp handling in the C renderer).
+        disp = self.call(ctx, "misa_text_cstr",
+                         [self.cstr("__iface_payload")], e, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [r, self.cstr("__iface_disp"), disp], e, check=False)
+        return r
+
+    def emit_iface_wrap_list(self, e, ctx):
+        """Element-wise [T] -> [I] conversion via a runtime helper."""
+        tag = self.impl_index.get((e.iface, e.concrete))
+        if tag is None:
+            raise AOTError("E600",
+                           f"no impl of '{e.iface}' for '{e.concrete}'",
+                           e.line, e.col)
+        lv = self.emit_expr(e.expr, ctx)
+        self.check(ctx, e)
+        return self.call(ctx, "misa_iface_wrap_list",
+                         [self.const_i64(tag), lv], e, check=False)
+
+    def emit_iface_call(self, iface: str, method: str, e, ctx):
+        """Dynamic dispatch: switch on the interface value's __tag."""
+        b = ctx.builder
+        line, col = self.loc(e)
+        recv = self.emit_expr(e.args[0], ctx)
+        self.check(ctx, e)
+        tag_val = self.call(ctx, "misa_record_get",
+                            [recv, self.cstr(self.SUM_TAG), line, col],
+                            e)
+        tag = self.call(ctx, "misa_as_int", [tag_val], e, check=False)
+        fields = self.call(ctx, "misa_record_get",
+                           [recv, self.cstr(self.SUM_FIELDS), line, col],
+                           e)
+        payload = self.call(ctx, "misa_list_get",
+                            [fields, self.const_i64(0)], e, check=False)
+        rest = []
+        for a in e.args[1:]:
+            v = self.emit_expr(a, ctx)
+            self.check(ctx, e)
+            rest.append(v)
+        impls = self._iface_impls(iface)
+        if not impls:
+            raise AOTError("E600",
+                           f"interface '{iface}' has no implementations",
+                           e.line, e.col)
+        # The call returns a value; use a phi over the case blocks.
+        end_b = ctx.fn.append_basic_block("iface.end")
+        case_bs = [ctx.fn.append_basic_block(f"iface.case{i}")
+                   for i, _ in enumerate(impls)]
+        default_b = ctx.fn.append_basic_block("iface.unreachable")
+        sw = b.switch(tag, default_b)
+        for (tg, tgt), cb in zip(impls, case_bs):
+            sw.add_case(self.const_i64(tg), cb)
+        b.position_at_end(default_b)
+        b.unreachable()
+        incomings = []
+        for (tg, tgt), cb in zip(impls, case_bs):
+            b.position_at_end(cb)
+            fn = self.impl_fns.get((iface, tgt, method))
+            if fn is None:
+                raise AOTError("E600",
+                               f"no impl of '{iface}' for '{tgt}' "
+                               f"providing '{method}'", e.line, e.col)
+            cv = b.call(fn, [payload] + rest, name="_iface_call")
+            self.check(ctx, e)
+            cur = b.block
+            b.branch(end_b)
+            incomings.append((cv, cur))
+        b.position_at_end(end_b)
+        phi = b.phi(PTR, name="_iface_res")
+        for cv, blk in incomings:
+            phi.add_incoming(cv, blk)
+        return phi
+
+    def emit_impl_call(self, iface: str, target: str, method: str,
+                       e, ctx):
+        """Static dispatch: direct call to the impl method."""
+        fn = self.impl_fns.get((iface, target, method))
+        if fn is None:
+            raise AOTError("E600",
+                           f"no impl of '{iface}' for '{target}' "
+                           f"providing '{method}'", e.line, e.col)
+        args = []
+        for a in e.args:
+            v = self.emit_expr(a, ctx)
+            self.check(ctx, e)
+            args.append(v)
+        return self.call(ctx, self._impl_sym(iface, target, method),
+                         args, e, check=True, direct=True)
 
     # -- Phase 5b: sum types -------------------------------------------
     #

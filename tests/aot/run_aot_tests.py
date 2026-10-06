@@ -43,8 +43,25 @@ def run(cmd, env=None):
     return p.returncode, p.stdout, p.stderr
 
 
+def _ensure_ffi_helpers():
+    """Compile tests/ffi_helpers.c -> /tmp/misa_ffi_helpers.so (once)
+    for the a27_ffi2 parity test."""
+    so = "/tmp/misa_ffi_helpers.so"
+    src = os.path.join(HERE, "..", "ffi_helpers.c")
+    if os.path.exists(so) and os.path.getmtime(src) <= os.path.getmtime(so):
+        return
+    r = subprocess.run(["cc", "-shared", "-fPIC", "-O2", "-o", so, src],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"WARNING: could not build ffi helpers: {r.stderr.strip()}")
+        print("a27_ffi2 will fail; install a C compiler to run it.")
+
+
 def main():
     keep = "--keep" in sys.argv
+    # Overtake Wave 2 (FFI): a27_ffi2 needs the C test helpers as a
+    # shared object at a fixed path (the .misa references it).
+    _ensure_ffi_helpers()
     progs = sorted(f for f in os.listdir(PROG) if f.endswith(".misa")
                    and not f.startswith("a11_util"))
     passed, failed = 0, []

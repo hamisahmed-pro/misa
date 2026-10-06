@@ -1,0 +1,69 @@
+// a27_ffi2: Overtake Wave 2 FFI depth — structs by value, C callbacks,
+// varargs. Byte-identical on interpreter vs `misa build` (host).
+// Requires /tmp/misa_ffi_helpers.so (compiled by run_aot_tests.py
+// from tests/ffi_helpers.c).
+extern "/tmp/misa_ffi_helpers.so" {
+  struct Point { x: Int, y: Int },
+  struct Mixed { id: Int, score: Float, flags: Int, tag: Ptr },
+  fn ffi_scale_point(p: Point, s: Float) -> Point,
+  fn ffi_make_mixed(id: Int, score: Float, flags: Int, tag: Ptr) -> Mixed,
+  fn ffi_mixed_id(m: Mixed) -> Int,
+  fn ffi_i64_set(base: Ptr, i: Int, v: Int) -> Void,
+  fn ffi_i64_get(base: Ptr, i: Int) -> Int,
+  fn ffi_cstr_at(p: Ptr) -> Text,
+}
+
+extern "c" {
+  fn qsort(base: Ptr, n: Int, size: Int, cmp: (Ptr, Ptr) -> Int) -> Void,
+  fn malloc(size: Int) -> Ptr,
+  fn free(p: Ptr) -> Void,
+  fn snprintf(buf: Ptr, size: Int, fmt: Text, ...) -> Int,
+}
+
+// Struct literal + field reads.
+let p0 = Point { x: 3, y: 4 }
+print(p0.x)
+print(p0.y)
+
+// Struct by value, both directions.
+let q = ffi_scale_point(p0, 2.5)
+print("{q.x} {q.y}")
+
+// Mixed field types incl. a Bool-width field and a Ptr field.
+let m = ffi_make_mixed(7, 2.5, 3, malloc(8))
+print(m.id)
+print(m.score)
+print(m.flags)
+print(ffi_mixed_id(m))
+
+// qsort with a Misa comparator (C calls back into compiled Misa).
+let cmp = |a: Ptr, b: Ptr| {
+  let x = ffi_i64_get(a, 0)
+  let y = ffi_i64_get(b, 0)
+  if x < y { return -1 }
+  if x > y { return 1 }
+  return 0
+}
+let base = malloc(5 * 8)
+ffi_i64_set(base, 0, 30)
+ffi_i64_set(base, 1, 10)
+ffi_i64_set(base, 2, 50)
+ffi_i64_set(base, 3, 20)
+ffi_i64_set(base, 4, 40)
+qsort(base, 5, 8, cmp)
+var out = ""
+var i = 0
+while i < 5 {
+  out = out + "{ffi_i64_get(base, i)} "
+  i = i + 1
+}
+print(out)
+free(base)
+
+// Varargs: Int, Float, Text tails via snprintf (deterministic: no
+// C-stdout/Misa-stdout interleave).
+let sbuf = malloc(64)
+let n = snprintf(sbuf, 64, "v: %d %f %s", 42, 2.5, "hi")
+print(ffi_cstr_at(sbuf))
+print("ret={n}")
+free(sbuf)

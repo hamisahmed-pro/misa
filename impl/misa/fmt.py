@@ -40,7 +40,23 @@ class Formatter:
     _DECLS = (ast.AppDecl, ast.ProviderDecl, ast.ModelsDecl, ast.TypeDecl,
               ast.TableDecl,
               ast.ModelDecl, ast.ScreenDecl, ast.EvalDecl, ast.FnDecl,
-              ast.ExternDecl, ast.ImportDecl, ast.TestDecl)
+              ast.ExternDecl, ast.ImportDecl, ast.TestDecl,
+              ast.InterfaceDecl, ast.ImplDecl)
+
+    def fmt_iface_sig(self, m: ast.FnDecl) -> str:
+        """Format an interface/impl method signature."""
+        ps = []
+        for n, te in m.params:
+            if te is None:
+                ps.append(n)  # bare `self`
+            else:
+                ps.append(f"{n}: {self.fmt_type(te)}")
+        head = f"fn {m.name}({', '.join(ps)})"
+        if m.ret is not None:
+            head += f" -> {self.fmt_type(m.ret)}"
+        if m.throws:
+            head += f" throws {', '.join(m.throws)}"
+        return head
 
     def format_item(self, item: ast.Node):
         # statements emit their own leading comments via format_stmt
@@ -151,12 +167,37 @@ class Formatter:
                 self.format_stmt(stmt)
             self.ind -= 1
             self.w("}")
+        elif isinstance(item, ast.InterfaceDecl):
+            self.w(f"interface {item.name} {{")
+            self.ind += 1
+            for m in item.methods:
+                self.w(self.fmt_iface_sig(m))
+            self.ind -= 1
+            self.w("}")
+        elif isinstance(item, ast.ImplDecl):
+            self.w(f"impl {item.iface} for {item.target} {{")
+            self.ind += 1
+            for m in item.methods:
+                self.w(self.fmt_iface_sig(m) + " {")
+                self.ind += 1
+                for st in m.body:
+                    self.format_stmt(st)
+                self.ind -= 1
+                self.w("}")
+            self.ind -= 1
+            self.w("}")
         elif isinstance(item, ast.FnDecl):
             params = ", ".join(f"{n}: {self.fmt_type(t)}"
                                for n, t in item.params)
-            # Phase 5c: type parameters.
-            tp = f"<{', '.join(item.type_params)}>" \
-                if item.type_params else ""
+            # Phase 5c: type parameters. Phase 8: interface bounds.
+            if item.type_params:
+                tps = []
+                for tp in item.type_params:
+                    b = item.type_param_bounds.get(tp)
+                    tps.append(f"{tp}: {b}" if b else tp)
+                tp = f"<{', '.join(tps)}>"
+            else:
+                tp = ""
             head = f"fn {item.name}{tp}({params})"
             if item.ret is not None:
                 head += f" -> {self.fmt_type(item.ret)}"
@@ -173,11 +214,19 @@ class Formatter:
             self.w(f'import "{item.path}"')
         elif isinstance(item, ast.ExternDecl):
             # Phase 7: `extern "<lib>" { fn f(...) -> T, ... }`.
+            # Overtake Wave 2: struct declarations and `...` varargs.
             self.w(f'extern "{item.lib}" {{')
             self.ind += 1
+            for st in item.structs:
+                fields = ", ".join(
+                    f"{fn_}: {self.fmt_type(fte)}"
+                    for fn_, fte in st.fields)
+                self.w(f"struct {st.name} {{ {fields} }},")
             for fn in item.fns:
                 params = ", ".join(
                     f"{pn}: {self.fmt_type(te)}" for pn, te in fn.params)
+                if fn.varargs:
+                    params = (params + ", ...") if params else "..."
                 ret = f" -> {self.fmt_type(fn.ret)}" if fn.ret else ""
                 self.w(f"fn {fn.name}({params}){ret},")
             self.ind -= 1
@@ -437,6 +486,11 @@ class Formatter:
             inner = ", ".join(f"{k}: {self.fmt_expr(v)}"
                               for k, v in e.fields)
             return "{ " + inner + " }"
+        if isinstance(e, ast.StructLit):
+            # Overtake Wave 2 (FFI): `Point { x: 1.0, y: 2.0 }`.
+            inner = ", ".join(f"{k}: {self.fmt_expr(v)}"
+                              for k, v in e.fields)
+            return f"{e.name} {{ {inner} }}"
         if isinstance(e, ast.MapLit):
             inner = ", ".join(f'{self.quote(k)}: {self.fmt_expr(v)}'
                               for k, v in e.entries)

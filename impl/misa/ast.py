@@ -169,12 +169,19 @@ class FnDecl(Node):
     body: List[Node] = field(default_factory=list)
     # Phase 5c: type parameters, e.g. `fn first<T>(xs: [T]) -> T`.
     type_params: List[str] = field(default_factory=list)
+    # Phase 8 (overtake): interface bounds, e.g. `fn f<T: Drawable>(x: T)`.
+    # Maps type parameter name -> interface name.
+    type_param_bounds: dict = field(default_factory=dict)
     # Phase 8 (overtake): checked `throws` signatures, e.g.
     # `fn fetch(u: Text) -> Text throws E304`. The declared E-codes
     # (as written); empty = no clause (strict: uncaught codes error).
     throws: List[str] = field(default_factory=list)
     throws_line: int = 0
     throws_col: int = 0
+    # Overtake Wave 2 (FFI): C varargs, e.g.
+    # `extern "c" { fn printf(fmt: Text, ...) -> Int }`.
+    # Only legal on extern declarations.
+    varargs: bool = False
 
 
 @dataclass
@@ -190,9 +197,83 @@ class ExternDecl(Node):
     Each entry is an FnDecl carrying only the signature (name, params,
     ret); body is always empty. `lib` is the library name as written,
     e.g. "c" (C standard library) or "m" (libm).
+
+    Overtake Wave 2: blocks may also declare C-layout structs
+    (`struct Point { x: Float, y: Float }`) usable by value and by
+    pointer in the block's signatures; `lib` may be a direct shared
+    object path (contains "/" or ends in .so/.dylib) instead of a
+    `-l` name.
     """
     lib: str = ""
     fns: List["FnDecl"] = field(default_factory=list)
+    structs: List["StructDecl"] = field(default_factory=list)
+
+
+@dataclass
+class StructDecl(Node):
+    """Overtake Wave 2 (FFI): `struct Point { x: Float, y: Float }`
+    inside an `extern` block. Declares a C-layout struct type usable
+    in extern signatures by value and by pointer, and constructible
+    from Misa as `Point { x: 1.0, y: 2.0 }`.
+
+    v1 fields: Int, Float, Bool, Ptr only (checked with E225).
+    """
+    name: str = ""
+    fields: List[Tuple[str, "TypeExpr"]] = field(default_factory=list)
+
+
+@dataclass
+class StructLit(Node):
+    """Overtake Wave 2 (FFI): `Point { x: 1.0, y: 2.0 }` — construct
+    a C-layout struct value. All declared fields required (E211
+    otherwise); unknown fields are E101."""
+    name: str = ""
+    fields: List[Tuple[str, Node]] = field(default_factory=list)
+
+
+@dataclass
+class InterfaceDecl(Node):
+    """Phase 8 (overtake): `interface Drawable { fn draw(self) -> Text }`.
+
+    `methods` are FnDecls carrying signatures only (no bodies — a body
+    in an interface method is a parse error). The first param must be
+    named `self`.
+    """
+    name: str = ""
+    methods: List["FnDecl"] = field(default_factory=list)
+
+
+@dataclass
+class ImplDecl(Node):
+    """Phase 8 (overtake): `impl Drawable for Circle { ... }`.
+
+    `methods` are FnDecls with bodies; the first param must be named
+    `self` (bare `self` defaults to the target type, `self: Circle`
+    must match it). Signatures must match the interface's.
+    """
+    iface: str = ""
+    target: str = ""
+    methods: List["FnDecl"] = field(default_factory=list)
+
+
+@dataclass
+class IfaceWrap(Node):
+    """Phase 8 (overtake): checker-inserted conversion of a concrete
+    value to an interface value. The interpreter builds an IfaceValue;
+    AOT builds a {__tag, __fields} record."""
+    iface: str = ""
+    concrete: str = ""
+    expr: Optional[Node] = None
+
+
+@dataclass
+class IfaceWrapList(Node):
+    """Phase 8 (overtake): checker-inserted element-wise conversion of
+    a [T] value to [I] (single level; nested non-literal coercion is
+    E200 in v1)."""
+    iface: str = ""
+    concrete: str = ""
+    expr: Optional[Node] = None
 
 
 # ---------------------------------------------------------------- statements

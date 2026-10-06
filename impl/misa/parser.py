@@ -91,6 +91,15 @@ class Parser:
         if (k == "IDENT" and self.peek().value == "test"
                 and self.peek(1).kind == "IDENT" and self.at("{", 2)):
             return self.parse_test_decl()
+        # Phase 8 (overtake): `interface` / `impl` are contextual
+        # keywords (IDENTs, not lexer keywords) so existing code using
+        # those words as identifiers keeps working.
+        if (k == "IDENT" and self.peek().value == "interface"
+                and self.peek(1).kind == "IDENT"):
+            return self.parse_interface_decl()
+        if (k == "IDENT" and self.peek().value == "impl"
+                and self.peek(1).kind == "IDENT"):
+            return self.parse_impl_decl()
         if k == "fn":
             return self.parse_fn_decl()
         if k == "extern":
@@ -218,7 +227,13 @@ class Parser:
         # Phase 5c: type parameters, e.g. `type Box<T> { value: T }`.
         type_params = []
         if self.at("<"):
-            type_params = self._parse_type_params_decl()
+            for pn, bound in self._parse_type_params_decl():
+                if bound is not None:
+                    raise ParseError(
+                        f"interface bounds are only allowed on "
+                        f"functions, not on type '{name}'",
+                        self.peek().line, self.peek().col)
+                type_params.append(pn)
         self.expect("{", "'{'")
         fields = []
         variants = []
@@ -370,11 +385,27 @@ class Parser:
             opt = True
         return ast.TypeExpr(name=name, optional=opt, line=t.line, col=t.col)
 
-    def parse_params(self) -> list:
+    def parse_params(self, allow_varargs=False) -> tuple:
+        """Parse `(a: Int, b: Text)`. Returns (params, varargs).
+
+        Overtake Wave 2 (FFI): with allow_varargs, a trailing `...`
+        marks C varargs (`fn printf(fmt: Text, ...) -> Int`). `...`
+        anywhere else is a parse error.
+        """
         self.expect("(", "'('")
         params = []
+        varargs = False
         if not self.at(")"):
             while True:
+                if self.at("..."):
+                    if not allow_varargs:
+                        raise ParseError(
+                            "varargs '...' are only allowed on extern "
+                            "function declarations", self.peek().line,
+                            self.peek().col)
+                    self.advance()
+                    varargs = True
+                    break
                 pn = self.expect_ident("parameter name").value
                 self.expect(":", "':'")
                 te = self.parse_type_expr()
@@ -384,12 +415,12 @@ class Parser:
                     continue
                 break
         self.expect(")", "')'")
-        return params
+        return params, varargs
 
     def parse_model_decl(self) -> ast.ModelDecl:
         t = self.expect("model", "'model'")
         name = self.expect_ident("model name").value
-        params = self.parse_params()
+        params, _ = self.parse_params()
         self.expect("->", "'->'")
         ret = self.parse_type_expr()
         self.skip_semis()
@@ -443,7 +474,8 @@ class Parser:
     def parse_screen(self) -> ast.ScreenDecl:
         t = self.expect("screen", "'screen'")
         name = self.expect_ident("screen name").value
-        params = self.parse_params() if self.at("(") else []
+        _pp = self.parse_params() if self.at("(") else ([], False)
+        params, _ = _pp
         self.expect("{", "'{'")
         body = self.parse_screen_block()
         self.expect("}", "'}'")
@@ -579,6 +611,97 @@ class Parser:
         return ast.TestDecl(name=name, body=body,
                             line=t.line, col=t.col)
 
+    # -- Phase 8 (overtake): interfaces ---------------------------------
+
+    def _parse_iface_sig(self) -> ast.FnDecl:
+        """Parse `fn name(self, p: T, ...) -> Ret throws ...` — the
+        signature shared by interface methods (no body) and impl
+        methods (with body). Bare `self` (no `: Type`) is allowed and
+        defaults to the impl target (filled in by the checker)."""
+        ft = self.expect("fn", "'fn'")
+        name = self.expect_ident("method name").value
+        self.expect("(", "'('")
+        params = []
+        if not self.at(")"):
+            while True:
+                pn_tok = self.expect_ident("parameter name")
+                pn = pn_tok.value
+                if pn == "self" and not self.at(":"):
+                    # Bare `self`: type defaults to the impl target.
+                    params.append((pn, None))
+                else:
+                    self.expect(":", "':'")
+                    params.append((pn, self.parse_type_expr()))
+                if self.at(","):
+                    self.advance()
+                    continue
+                break
+        self.expect(")", "')'")
+        ret = None
+        if self.at("->"):
+            self.advance()
+            ret = self.parse_type_expr()
+        # `throws` is contextual (an IDENT here, not a keyword).
+        throws: List[str] = []
+        throws_line, throws_col = 0, 0
+        if self.at("IDENT") and self.peek().value == "throws":
+            t_throws = self.advance()
+            throws_line, throws_col = t_throws.line, t_throws.col
+            while True:
+                ctok = self.expect_ident("error code (e.g. E304)")
+                throws.append(ctok.value)
+                if self.at(","):
+                    self.advance()
+                    continue
+                break
+        return ast.FnDecl(name=name, params=params, ret=ret, body=[],
+                          throws=throws, throws_line=throws_line,
+                          throws_col=throws_col,
+                          line=ft.line, col=ft.col)
+
+    def parse_interface_decl(self) -> ast.InterfaceDecl:
+        t = self.advance()  # the contextual `interface` identifier
+        name = self.expect("IDENT", "interface name").value
+        self.expect("{", "'{'")
+        methods = []
+        self.skip_semis()
+        while not self.at("}"):
+            sig = self._parse_iface_sig()
+            if self.at("{"):
+                raise ParseError(
+                    f"interface method '{sig.name}' must not have a "
+                    f"body (give the implementation in an "
+                    f"`impl {name} for ...` block)",
+                    self.peek().line, self.peek().col)
+            methods.append(sig)
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.InterfaceDecl(name=name, methods=methods,
+                                 line=t.line, col=t.col)
+
+    def parse_impl_decl(self) -> ast.ImplDecl:
+        t = self.advance()  # the contextual `impl` identifier
+        iface = self.expect("IDENT", "interface name").value
+        self.expect("for", "'for'")
+        target = self.expect("IDENT", "type name").value
+        self.expect("{", "'{'")
+        methods = []
+        self.skip_semis()
+        while not self.at("}"):
+            sig = self._parse_iface_sig()
+            sig.body = self.parse_block()
+            # Bare `self` defaults to the impl target type.
+            if sig.params and sig.params[0][0] == "self" \
+                    and sig.params[0][1] is None:
+                te = ast.TypeExpr(name=target,
+                                  line=sig.line, col=sig.col)
+                sig.params[0] = ("self", te)
+            methods.append(sig)
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.ImplDecl(iface=iface, target=target, methods=methods,
+                            line=t.line, col=t.col)
+
     def parse_record_fields(self) -> list:
         self.expect("{", "'{'")
         fields = []
@@ -709,10 +832,18 @@ class Parser:
         t = self.expect("fn", "'fn'")
         name = self.expect_ident("function name").value
         # Phase 5c: type parameters, e.g. `fn first<T>(xs: [T]) -> T`.
+        # Phase 8 (overtake): bounds, e.g. `fn f<T: Drawable>(x: T)`.
         type_params = []
+        type_param_bounds = {}
         if self.at("<"):
-            type_params = self._parse_type_params_decl()
-        params = self.parse_params()
+            for pn, bound in self._parse_type_params_decl():
+                type_params.append(pn)
+                if bound is not None:
+                    type_param_bounds[pn] = bound
+        params, _pv = self.parse_params()
+        if _pv:
+            raise ParseError("varargs '...' are only allowed on extern "
+                             "function declarations", t.line, t.col)
         ret = None
         if self.at("->"):
             self.advance()
@@ -735,48 +866,126 @@ class Parser:
                 break
         body = self.parse_block()
         return ast.FnDecl(name=name, params=params, ret=ret, body=body,
-                          type_params=type_params, throws=throws,
+                          type_params=type_params,
+                          type_param_bounds=type_param_bounds,
+                          throws=throws,
                           throws_line=throws_line, throws_col=throws_col,
                           line=t.line, col=t.col)
 
     def parse_extern_block(self) -> ast.ExternDecl:
-        """Phase 7: `extern "<lib>" { fn f(...) -> T, ... }`."""
+        """Phase 7: `extern "<lib>" { fn f(...) -> T, ... }`.
+
+        Overtake Wave 2: blocks may also declare C-layout structs
+        (`struct Point { x: Float, y: Float }`, contextual keyword —
+        `struct` stays a plain identifier everywhere else), and
+        function signatures may end params with `...` for C varargs.
+        """
         t = self.expect("extern", "'extern'")
         lib_tok = self.expect("STRING", "library name string")
         lib = lib_tok.value
         self.expect("{", "'{'")
         fns = []
+        structs = []
         self.skip_semis()
         while not self.at("}"):
-            ft = self.expect("fn", "'fn'")
-            name = self.expect_ident("function name").value
-            # Phase 7: accept type params syntactically so the checker
-            # can reject them with E225 (v1: no generics across FFI).
-            type_params = []
-            if self.at("<"):
-                type_params = self._parse_type_params_decl()
-            params = self.parse_params()
-            ret = None
-            if self.at("->"):
-                self.advance()
-                ret = self.parse_type_expr()
-            # No body: extern fns are signatures only. A `{` here is a
-            # mistake (user wrote a body); reject it plainly.
-            if self.at("{"):
-                raise ParseError(
-                    "extern function '%s' must not have a body" % name,
-                    self.peek().line, self.peek().col)
-            fns.append(ast.FnDecl(name=name, params=params, ret=ret,
-                                  body=[], type_params=type_params,
-                                  line=ft.line, col=ft.col))
+            pk = self.peek()
+            if pk.kind == "IDENT" and pk.value == "struct" \
+                    and self.peek(1).kind == "IDENT":
+                structs.append(self.parse_extern_struct())
+            else:
+                fns.append(self.parse_extern_fn())
             if self.at(","):
                 self.advance()
             self.skip_semis()
         self.expect("}", "'}'")
-        return ast.ExternDecl(lib=lib, fns=fns, line=t.line, col=t.col)
+        return ast.ExternDecl(lib=lib, fns=fns, structs=structs,
+                              line=t.line, col=t.col)
 
-    def _parse_type_params_decl(self) -> List[str]:
-        """Phase 5c: parse `<T, K>` after a fn/type name. Returns names."""
+    def _looks_like_struct_lit(self) -> bool:
+        """Lookahead guard for struct literals: the current token must be
+        `{` followed (past newlines) by `}` or `ident :`. Distinguishes
+        `Point { x: 1.0 }` from `match s {`, `for p in items {`, etc."""
+        toks = self.toks
+        i = self.i + 1
+        while i < len(toks) and toks[i].kind == "SEMI":
+            i += 1
+        if i >= len(toks):
+            return False
+        if toks[i].kind == "}":
+            return True
+        return (i + 1 < len(toks) and toks[i].kind == "IDENT"
+                and toks[i + 1].kind == ":")
+
+    def parse_struct_lit(self, name: str, t) -> ast.StructLit:
+        """`Point { x: 1.0, y: 2.0 }` — C-layout struct construction."""
+        self.expect("{", "'{'")
+        fields = []
+        self.skip_semis()
+        while not self.at("}"):
+            fk = self.expect_ident("field name").value
+            self.expect(":", "':'")
+            fv = self.parse_expr()
+            fields.append((fk, fv))
+            if self.at(","):
+                self.advance()
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.StructLit(name=name, fields=fields,
+                             line=t.line, col=t.col)
+
+    def parse_extern_struct(self) -> ast.StructDecl:
+        """`struct Point { x: Float, y: Float }` inside an extern block."""
+        t = self.expect_ident("'struct'")
+        name = self.expect_ident("struct name").value
+        self.expect("{", "'{'")
+        fields = []
+        self.skip_semis()
+        while not self.at("}"):
+            fn_tok = self.expect_ident("field name")
+            self.expect(":", "':'")
+            te = self.parse_type_expr()
+            fields.append((fn_tok.value, te))
+            if self.at(","):
+                self.advance()
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.StructDecl(name=name, fields=fields,
+                              line=t.line, col=t.col)
+
+    def parse_extern_fn(self) -> ast.FnDecl:
+        ft = self.expect("fn", "'fn'")
+        name = self.expect_ident("function name").value
+        # Phase 7: accept type params syntactically so the checker
+        # can reject them with E225 (v1: no generics across FFI).
+        type_params = []
+        if self.at("<"):
+            for pn, bound in self._parse_type_params_decl():
+                if bound is not None:
+                    raise ParseError(
+                        "interface bounds are not allowed on extern "
+                        "functions", self.peek().line, self.peek().col)
+                type_params.append(pn)
+        # Overtake Wave 2: extern signatures allow trailing `...`
+        # for C varargs.
+        params, varargs = self.parse_params(allow_varargs=True)
+        ret = None
+        if self.at("->"):
+            self.advance()
+            ret = self.parse_type_expr()
+        # No body: extern fns are signatures only. A `{` here is a
+        # mistake (user wrote a body); reject it plainly.
+        if self.at("{"):
+            raise ParseError(
+                "extern function '%s' must not have a body" % name,
+                self.peek().line, self.peek().col)
+        return ast.FnDecl(name=name, params=params, ret=ret,
+                          body=[], type_params=type_params,
+                          varargs=varargs, line=ft.line, col=ft.col)
+
+    def _parse_type_params_decl(self) -> List[Tuple[str, Optional[str]]]:
+        """Phase 5c: parse `<T, K>` after a fn/type name. Phase 8
+        (overtake): bounds `<T: Drawable>` on functions. Returns
+        (name, bound-or-None) pairs."""
         self.expect("<", "'<'")
         params = []
         seen = set()
@@ -787,7 +996,12 @@ class Parser:
                     raise ParseError(f"duplicate type parameter '{pn}'",
                                      self.peek().line, self.peek().col)
                 seen.add(pn)
-                params.append(pn)
+                bound = None
+                if self.at(":"):
+                    self.advance()
+                    bound = self.expect_ident(
+                        "interface bound").value
+                params.append((pn, bound))
                 if self.at(","):
                     self.advance()
                     continue
@@ -1106,6 +1320,14 @@ class Parser:
                 node = ast.Ident(name=t.value, line=t.line, col=t.col)
                 node.type_args = type_args
                 return node
+            # Overtake Wave 2 (FFI): `Point { x: 1.0, y: 2.0 }`
+            # constructs a C-layout struct value. Guarded by lookahead:
+            # `IDENT {` also opens `match`/`if`/`while`/`for` bodies
+            # (`match s {`, `for p in items {`), so the struct-literal
+            # path is only taken when the brace opens a field list
+            # (`{ ident :` or `{ }`).
+            if self.at("{") and self._looks_like_struct_lit():
+                return self.parse_struct_lit(t.value, t)
             return ast.Ident(name=t.value, line=t.line, col=t.col)
         if t.kind in ("navigate", "env"):
             self.advance()

@@ -2244,6 +2244,27 @@ def _():
     eq(run_src(src), "6765\n")
 
 
+@test("semantics: Int/Int is truncating division, Int%Int is srem")
+def _():
+    # 2026-10-06: the interpreter did float `/` and floored `%` while the
+    # checker typed Int/Int->Int and AOT emitted sdiv/srem -- a three-way
+    # divergence the debugger caught. All backends now agree: truncation
+    # toward zero (C99), remainder takes the sign of the dividend.
+    src = ('print(7 / 2)\n'        # 3, not 3.5
+           'print(-7 / 2)\n'       # -3 (trunc, not floor)
+           'print(7 / -2)\n'       # -3
+           'print(-7 / -2)\n'      # 3
+           'print(7 % 3)\n'        # 1
+           'print(-7 % 3)\n'       # -1 (sign of dividend, not divisor)
+           'print(7 % -3)\n'       # 1
+           'print(7.0 / 2)\n'      # 3.5 (float stays float)
+           'print(7 / 2.0)\n')     # 3.5
+    eq(run_src(src),
+       "3\n-3\n-3\n3\n1\n-1\n1\n3.5\n3.5\n")
+    raises_code(lambda: run_src("print(1 / 0)\n"), "E300")
+    raises_code(lambda: run_src("print(1 % 0)\n"), "E300")
+
+
 @test("db: checker query on undeclared table is dynamic (no error)")
 def _():
     src = ('let db = db.open(":memory:")\n'
@@ -2386,10 +2407,19 @@ def _():
     assert any(e["code"] == "E225" for e in errs), errs
 
 
-@test("ffi: function-type param is E225")
+@test("ffi: callback param type is now accepted")
 def _():
+    # Overtake Wave 2: `(Int) -> Int` params are C callbacks now.
     errs = check_source('extern "c" {\n'
                         '  fn f(cb: (Int) -> Int) -> Int,\n'
+                        '}\n')
+    assert errs == [], errs
+
+
+@test("ffi: callback as return type is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn f(x: Int) -> (Int) -> Int,\n'
                         '}\n')
     assert any(e["code"] == "E225" for e in errs), errs
 
@@ -2411,6 +2441,286 @@ def _():
                         '  fn strlen(s: Text) -> Int,\n'
                         '}\n')
     assert any(e["code"] == "E210" for e in errs), errs
+
+
+# ----------------------------------------------------------------------
+# Overtake Wave 2: FFI depth — structs by value, callbacks, varargs
+# ----------------------------------------------------------------------
+
+def _ffi_helpers_so():
+    """Compile tests/ffi_helpers.c to /tmp/misa_ffi_helpers.so (once)."""
+    import subprocess
+    so = "/tmp/misa_ffi_helpers.so"
+    src = os.path.join(ROOT, "tests", "ffi_helpers.c")
+    if not os.path.exists(so) or \
+            os.path.getmtime(src) > os.path.getmtime(so):
+        r = subprocess.run(["cc", "-shared", "-fPIC", "-O2",
+                            "-o", so, src],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    return so
+
+
+@test("ffi2: struct decl + literal + field read (interp)")
+def _():
+    src = ('extern "c" {\n'
+           '  struct Point { x: Float, y: Float },\n'
+           '  fn sqrt(x: Float) -> Float,\n'
+           '}\n'
+           'let p = Point { x: 3.0, y: 4.0 }\n'
+           'print(p.x)\n'
+           'print(p.y)\n'
+           'print(sqrt(p.x * p.x + p.y * p.y))\n')
+    out = run_src(src)
+    assert out.strip().splitlines() == ["3.0", "4.0", "5.0"], out
+
+
+@test("ffi2: struct by value round-trip through C helper")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  struct Point { x: Int, y: Int },\n'
+           '  fn ffi_scale_point(p: Point, s: Float) -> Point,\n'
+           '}\n'
+           'let p = Point { x: 3, y: 4 }\n'
+           'let q = ffi_scale_point(p, 2.5)\n'
+           'print("{q.x} {q.y}")\n')
+    out = run_src(src)
+    assert out.strip() == "7 10", out
+
+
+@test("ffi2: struct with mixed field types")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  struct Mixed { id: Int, score: Float, flags: Int, tag: Ptr },\n'
+           '  fn ffi_make_mixed(id: Int, score: Float, flags: Int, tag: Ptr) -> Mixed,\n'
+           '  fn ffi_mixed_id(m: Mixed) -> Int,\n'
+           '}\n'
+           'let m = ffi_make_mixed(7, 2.5, 1, malloc(8))\n'
+           'print(m.id)\n'
+           'print(m.score)\n'
+           'print(m.flags)\n'
+           'print(ffi_mixed_id(m))\n')
+    # malloc is not declared here; use a null-ish Ptr via helper-free path:
+    src = (f'extern "{so}" {{\n'
+           '  struct Mixed { id: Int, score: Float, flags: Int, tag: Ptr },\n'
+           '  fn ffi_make_mixed(id: Int, score: Float, flags: Int, tag: Ptr) -> Mixed,\n'
+           '  fn ffi_mixed_id(m: Mixed) -> Int,\n'
+           '}\n'
+           'extern "c" {\n'
+           '  fn malloc(size: Int) -> Ptr,\n'
+           '}\n'
+           'let m = ffi_make_mixed(7, 2.5, 3, malloc(8))\n'
+           'print(m.id)\n'
+           'print(m.score)\n'
+           'print(m.flags)\n'
+           'print(ffi_mixed_id(m))\n')
+    out = run_src(src)
+    assert out.strip().splitlines() == ["7", "2.5", "3", "7"], out
+
+
+@test("ffi2: qsort with a Misa comparator (interp)")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  fn ffi_i64_set(base: Ptr, i: Int, v: Int) -> Void,\n'
+           '  fn ffi_i64_get(base: Ptr, i: Int) -> Int,\n'
+           '}\n'
+           'extern "c" {\n'
+           '  fn qsort(base: Ptr, n: Int, size: Int, cmp: (Ptr, Ptr) -> Int) -> Void,\n'
+           '  fn malloc(size: Int) -> Ptr,\n'
+           '  fn free(p: Ptr) -> Void,\n'
+           '}\n'
+           'let cmp = |a: Ptr, b: Ptr| {\n'
+           '  let x = ffi_i64_get(a, 0)\n'
+           '  let y = ffi_i64_get(b, 0)\n'
+           '  if x < y { return -1 }\n'
+           '  if x > y { return 1 }\n'
+           '  return 0\n'
+           '}\n'
+           'let base = malloc(5 * 8)\n'
+           'ffi_i64_set(base, 0, 30)\n'
+           'ffi_i64_set(base, 1, 10)\n'
+           'ffi_i64_set(base, 2, 50)\n'
+           'ffi_i64_set(base, 3, 20)\n'
+           'ffi_i64_set(base, 4, 40)\n'
+           'qsort(base, 5, 8, cmp)\n'
+           'var out = ""\n'
+           'var i = 0\n'
+           'while i < 5 {\n'
+           '  out = out + "{ffi_i64_get(base, i)} "\n'
+           '  i = i + 1\n'
+           '}\n'
+           'print(out)\n'
+           'free(base)\n')
+    out = run_src(src)
+    assert out.strip() == "10 20 30 40 50", out
+
+
+@test("ffi2: varargs printf (interp)")
+def _():
+    # Note: C printf writes to fd 1 directly, bypassing run_src's
+    # capture — assert the return value (chars written) instead.
+    # "42 2.500000 hi\n" is 15 chars: proves the format string and
+    # the Int/Float/Text varargs all crossed correctly.
+    src = ('extern "c" {\n'
+           '  fn printf(fmt: Text, ...) -> Int,\n'
+           '}\n'
+           'let n = printf("%d %f %s\\n", 42, 2.5, "hi")\n'
+           'print("ret={n}")\n')
+    out = run_src(src)
+    assert out.strip() == "ret=15", out
+
+
+@test("ffi2: struct field type Text is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct Bad { s: Text },\n'
+                        '  fn f(b: Bad) -> Int,\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi2: nested struct field is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct Inner { x: Int },\n'
+                        '  struct Outer { inner: Inner },\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi2: duplicate struct name is E210")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int },\n'
+                        '  struct P { y: Int },\n'
+                        '}\n')
+    assert any(e["code"] == "E210" for e in errs), errs
+
+
+@test("ffi2: struct literal missing field is E211")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int, y: Int },\n'
+                        '}\n'
+                        'let p = P { x: 1 }\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("ffi2: struct literal unknown field is E101")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int },\n'
+                        '}\n'
+                        'let p = P { x: 1, z: 2 }\n')
+    assert any(e["code"] == "E101" for e in errs), errs
+
+
+@test("ffi2: struct literal wrong field type is E211")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int },\n'
+                        '}\n'
+                        'let p = P { x: "nope" }\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("ffi2: unknown struct literal is E101")
+def _():
+    errs = check_source('let p = Nope { x: 1 }\n')
+    assert any(e["code"] == "E101" for e in errs), errs
+
+
+@test("ffi2: unknown struct field read is E101")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int },\n'
+                        '}\n'
+                        'let p = P { x: 1 }\n'
+                        'print(p.z)\n')
+    assert any(e["code"] == "E101" for e in errs), errs
+
+
+@test("ffi2: varargs too few args is E102")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn printf(fmt: Text, ...) -> Int,\n'
+                        '}\n'
+                        'printf()\n')
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("ffi2: varargs bad tail type is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn printf(fmt: Text, ...) -> Int,\n'
+                        '}\n'
+                        'printf("%d\\n", [1, 2])\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi2: callback arg with wrong signature is E211")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  fn qsort(base: Ptr, n: Int, size: Int, cmp: (Ptr, Ptr) -> Int) -> Void,\n'
+                        '}\n'
+                        'let bad = |a: Ptr| { return 0 }\n'
+                        'qsort(bad, 1, 8, bad)\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("ffi2: struct arg of wrong struct is E211")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct A { x: Int },\n'
+                        '  struct B { x: Int },\n'
+                        '  fn f(a: A) -> Int,\n'
+                        '}\n'
+                        'let b = B { x: 1 }\n'
+                        'f(b)\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("ffi2: callback with struct param is E225")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  struct P { x: Int },\n'
+                        '  fn f(cb: (P) -> Int) -> Int,\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi2: ... on a Misa fn is a parse error")
+def _():
+    from misa.parser import ParseError
+    try:
+        parse_source('fn f(fmt: Text, ...) -> Int {\n'
+                     '  return 0\n'
+                     '}\n')
+    except ParseError as ex:
+        assert "varargs" in str(ex), ex
+        return
+    raise AssertionError("expected ParseError for ... on Misa fn")
+
+
+@test("ffi2: formatter round-trips structs/varargs/callbacks")
+def _():
+    from misa.fmt import format_source
+    src = ('extern "c" {\n'
+           '  struct Point { x: Float, y: Float },\n'
+           '  fn qsort(base: Ptr, n: Int, size: Int, cmp: (Ptr, Ptr) -> Int) -> Void,\n'
+           '  fn printf(fmt: Text, ...) -> Int,\n'
+           '}\n'
+           'let p = Point { x: 1.0, y: 2.0 }\n')
+    out = format_source(src)
+    assert "struct Point { x: Float, y: Float }" in out, out
+    assert "cmp: (Ptr, Ptr) -> Int" in out, out
+    assert "fn printf(fmt: Text, ...)" in out, out
+    assert "Point { x: 1.0, y: 2.0 }" in out, out
+    # idempotent
+    assert format_source(out) == out
 
 
 @test("str: slice/starts_with/split/trim edge cases incl. unicode")
@@ -3423,6 +3733,443 @@ def _():
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _dbg_run(prog_src, commands):
+    """Drive `misa debug --agent` through a pipe. commands is a list of
+    dicts (break file paths may use $F for the temp program path).
+    Returns (returncode, events, stderr, prog_path)."""
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-dbg-")
+    try:
+        prog = os.path.join(d, "prog.misa")
+        with open(prog, "w") as f:
+            f.write(prog_src)
+        lines = []
+        for c in commands:
+            if isinstance(c, dict) and c.get("cmd") == "break":
+                c = dict(c)
+                c["file"] = c["file"].replace("$F", prog)
+            lines.append(c if isinstance(c, str) else json.dumps(c))
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "debug", "--agent", prog],
+            input="\n".join(lines) + "\n",
+            capture_output=True, text=True, timeout=60)
+        events = [json.loads(ln) for ln in p.stdout.splitlines()
+                  if ln.strip()]
+        return p.returncode, events, p.stderr, prog
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("debug: agent protocol break/run/locals/eval/continue/exit")
+def _():
+    src = ("fn total(prices: [Int]) -> Int {\n"
+           "  var sum = 0\n"
+           "  for p in prices {\n"
+           "    sum = sum + p\n"
+           "  }\n"
+           "  return sum\n"
+           "}\n"
+           "let t = total([10, 20])\n"
+           'print(t)\n')
+    rc, ev, err, prog = _dbg_run(src, [
+        {"cmd": "break", "file": "$F", "line": 4},
+        {"cmd": "run"},
+        {"cmd": "locals"},
+        {"cmd": "eval", "expr": "sum + 100"},
+        {"cmd": "continue"},
+    ])
+    assert rc == 0, err
+    kinds = [e.get("event") for e in ev]
+    eq(kinds[0], "started")
+    assert ev[1] == {"ok": True, "breakpoint": 1}, ev[1]
+    brk = ev[2]
+    eq(brk["event"], "break")
+    eq(brk["breakpoint"], 1)
+    eq(brk["line"], 4)
+    eq(brk["function"], "total")
+    loc = ev[3]
+    assert loc["ok"], loc
+    by_name = {v["name"]: v for v in loc["locals"]}
+    eq(by_name["sum"]["type"], "Int")
+    eq(by_name["sum"]["value"], 0)
+    eq(by_name["prices"]["type"], "List")
+    eq(by_name["prices"]["value"][0], {"type": "Int", "value": 10})
+    eq(ev[4], {"ok": True, "type": "Int", "value": 100})
+    # loop has two iterations, hitting the breakpoint each time
+    breaks = [e for e in ev if e.get("event") == "break"]
+    eq(len(breaks), 2)
+    assert ev[-1] == {"event": "exit", "code": 0}, ev[-1]
+
+
+@test("debug: step/next/out and stack")
+def _():
+    src = ("fn inner(x: Int) -> Int {\n"
+           "  let y = x * 2\n"
+           "  return y\n"
+           "}\n"
+           "fn outer() -> Int {\n"
+           "  let a = inner(21)\n"
+           "  return a\n"
+           "}\n"
+           "let r = outer()\n"
+           "let s = r + 1\n"
+           "print(s)\n")
+    rc, ev, err, prog = _dbg_run(src, [
+        {"cmd": "break", "file": "$F", "line": 3},
+        {"cmd": "run"},
+        {"cmd": "out"},
+        {"cmd": "stack"},
+        {"cmd": "clear", "id": 1},
+        {"cmd": "continue"},
+    ])
+    assert rc == 0, err
+    assert ev[2]["event"] == "break" and ev[2]["line"] == 3, ev[2]
+    # `out` from inner's last line: next pause is outer's line 7
+    assert ev[3]["event"] == "break" and ev[3]["line"] == 7, ev[3]
+    eq(ev[3]["function"], "outer")
+    st = ev[4]
+    assert st["ok"], st
+    names = [(f["depth"], f["name"]) for f in st["frames"]]
+    eq(names, [(1, "outer"), (0, "<main>")])
+    eq(ev[5], {"ok": True})
+    outs = [e for e in ev if e.get("event") == "output"]
+    eq([o["text"] for o in outs], ["43"])
+    assert ev[-1] == {"event": "exit", "code": 0}, ev[-1]
+
+
+@test("debug: runtime error produces a structured error event")
+def _():
+    rc, ev, err, prog = _dbg_run(
+        "fn f() -> Int {\n  return 1 / 0\n}\nprint(f())\n",
+        [{"cmd": "run"}])
+    eq(rc, 1)  # debugger exits nonzero when the program fails
+    assert ev[0]["event"] == "started", ev
+    last = ev[-1]
+    eq(last["event"], "error")
+    eq(last["code"], "E300")
+    assert "division by zero" in last["message"], last
+    eq(last["line"], 2)
+
+
+@test("debug: breakpoints listing and bad commands")
+def _():
+    rc, ev, err, prog = _dbg_run(
+        'print("hi")\n',
+        [{"cmd": "break", "file": "$F", "line": 1},
+         {"cmd": "breakpoints"},
+         {"cmd": "clear", "id": 99},
+         {"cmd": "bogus"},
+         {"cmd": "clear", "id": 1},
+         {"cmd": "run"}])
+    assert rc == 0, err
+    eq(ev[1], {"ok": True, "breakpoint": 1})
+    bps = ev[2]
+    assert bps["ok"] and len(bps["breakpoints"]) == 1, bps
+    eq(bps["breakpoints"][0]["line"], 1)
+    assert not ev[3]["ok"], ev[3]
+    assert not ev[4]["ok"], ev[4]
+    assert ev[-1] == {"event": "exit", "code": 0}, ev[-1]
+
+
+@test("debug: human text mode session")
+def _():
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-dbg-")
+    try:
+        prog = os.path.join(d, "prog.misa")
+        with open(prog, "w") as f:
+            f.write("var x = 41\nx = x + 1\nprint(x)\n")
+        p = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "impl", "bin", "misa"),
+             "debug", prog],
+            input=f"b {prog}:2\nr\np x\nc\n",
+            capture_output=True, text=True, timeout=60)
+        assert p.returncode == 0, p.stderr
+        assert "breakpoint 1" in p.stdout, p.stdout
+        # breakpoint pauses BEFORE `x = x + 1` runs, so x is still 41
+        assert "Int: 41" in p.stdout, p.stdout
+        assert "program exited (code 0)" in p.stdout, p.stdout
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------
+# Phase 8 (overtake): interfaces
+
+IFACE_PREAMBLE = '''
+interface Drawable {
+  fn draw(self) -> Text
+}
+type Circle { x: Int, y: Int, r: Int }
+type Rect { w: Int, h: Int }
+impl Drawable for Circle {
+  fn draw(self) -> Text { return "circle({self.r})" }
+}
+impl Drawable for Rect {
+  fn draw(self) -> Text { return "rect({self.w}x{self.h})" }
+}
+'''
+
+
+@test("iface: declare + impl check clean")
+def _():
+    errs = check_source(IFACE_PREAMBLE)
+    eq(errs, [])
+
+
+@test("iface: static dispatch on concrete receiver")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  print(c.draw())
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "circle(5)")
+
+
+@test("iface: dynamic dispatch on interface value")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  var d: Drawable = c
+  print(d.draw())
+  let r: Rect = { w: 3, h: 4 }
+  d = r
+  print(d.draw())
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "circle(5)\nrect(3x4)")
+
+
+@test("iface: heterogeneous list + UFCS map")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn map<T, K>(xs: [T], f: (T) -> K) -> [K] {
+  var out: [K] = []
+  for x in xs { out = out + [f(x)] }
+  return out
+}
+fn render_all(items: [Drawable]) -> [Text] {
+  return map(items, |d| d.draw())
+}
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let r: Rect = { w: 3, h: 4 }
+  print(render_all([c, r]))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "[circle(5), rect(3x4)]")
+
+
+@test("iface: bounded generic dispatches dynamically")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn describe<T: Drawable>(x: T) -> Text {
+  return "got: " + x.draw()
+}
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let r: Rect = { w: 3, h: 4 }
+  print(describe(c))
+  print(describe(r))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "got: circle(5)\ngot: rect(3x4)")
+
+
+@test("iface: complex receiver via index")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn first<T: Drawable>(xs: [T]) -> Text { return xs[0].draw() }
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  print(first([c, c]))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "circle(5)")
+
+
+@test("iface: interface value renders as payload")
+def _():
+    _, buf = run_src_checked(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let d: Drawable = c
+  print(d)
+  return 0
+}
+main()
+''')
+    assert "r: 5" in buf.getvalue(), buf.getvalue()
+
+
+@test("iface: E200 unknown method on interface value")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let d: Drawable = c
+  print(d.bogus())
+  return 0
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: E200 impl missing method")
+def _():
+    errs = check_source('''
+interface I { fn a(self) -> Int
+              fn b(self) -> Int }
+type T { x: Int }
+impl I for T {
+  fn a(self) -> Int { return 1 }
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: E200 impl signature mismatch")
+def _():
+    errs = check_source('''
+interface I { fn a(self) -> Int }
+type T { x: Int }
+impl I for T {
+  fn a(self) -> Text { return "x" }
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: E210 duplicate impl")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+impl Drawable for Circle {
+  fn draw(self) -> Text { return "dup" }
+}
+''')
+    assert any(e["code"] == "E210" for e in errs), errs
+
+
+@test("iface: E200 bound violation on generic call")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+fn describe<T: Drawable>(x: T) -> Text { return x.draw() }
+fn main() -> Int {
+  print(describe(42))
+  return 0
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: E200 match on interface value")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let d: Drawable = c
+  match d { _ => print("x") }
+  return 0
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: E200 field access on interface value")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let d: Drawable = c
+  print(d.r)
+  return 0
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: throws — impl subset ok, superset E200")
+def _():
+    errs = check_source('''
+interface Repo {
+  fn get(self, id: Int) -> Text throws E404, E408
+}
+type Db { url: Text }
+impl Repo for Db {
+  fn get(self, id: Int) -> Text throws E404 { return "row" }
+}
+fn main() -> Int {
+  let db: Db = { url: "x" }
+  let r: Repo = db
+  try { print(r.get(1)) } catch e { print("caught") }
+  return 0
+}
+''')
+    eq(errs, [])
+    errs = check_source('''
+interface Repo {
+  fn get(self, id: Int) -> Text throws E404
+}
+type Db { url: Text }
+impl Repo for Db {
+  fn get(self, id: Int) -> Text throws E404, E408 { return "row" }
+}
+''')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("iface: throws — dynamic call enforces interface set (E227)")
+def _():
+    errs = check_source(IFACE_PREAMBLE + '''
+interface Loud {
+  fn boom(self) -> Int throws E500
+}
+type T { x: Int }
+impl Loud for T {
+  fn boom(self) -> Int throws E500 { return 1 }
+}
+fn main() -> Int {
+  let t: T = { x: 1 }
+  let l: Loud = t
+  print(l.boom())
+  return 0
+}
+''')
+    assert any(e["code"] == "E227" for e in errs), errs
+
+
+@test("iface: formatter round-trips interface + impl")
+def _():
+    src = IFACE_PREAMBLE.strip() + "\n"
+    out = format_source(src)
+    assert "interface Drawable" in out, out
+    assert "impl Drawable for Circle" in out, out
+    # formatted output re-parses and re-checks clean
+    errs = check_source(out)
+    eq(errs, [])
+
+
+@test("iface: fmt bounded type param")
+def _():
+    src = "fn f<T: Drawable>(x: T) -> T { return x }\n"
+    out = format_source(src)
+    assert "<T: Drawable>" in out, out
 
 
 if __name__ == "__main__":

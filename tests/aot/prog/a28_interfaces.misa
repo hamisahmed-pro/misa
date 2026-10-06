@@ -1,0 +1,62 @@
+// a28_interfaces: Overtake Wave 2 — interfaces with impl blocks.
+// Static dispatch on concrete receivers, dynamic dispatch on
+// interface values, heterogeneous [Drawable] collections, bounded
+// generics. Byte-identical on interpreter vs `misa build` (host).
+interface Drawable {
+  fn draw(self) -> Text
+}
+
+type Circle { x: Int, y: Int, r: Int }
+type Rect { w: Int, h: Int }
+
+impl Drawable for Circle {
+  fn draw(self) -> Text { return "circle({self.r})" }
+}
+
+impl Drawable for Rect {
+  fn draw(self) -> Text { return "rect({self.w}x{self.h})" }
+}
+
+// Limited UFCS used by the polymorphic example below.
+fn map<T, K>(xs: [T], f: (T) -> K) -> [K] {
+  var out: [K] = []
+  for x in xs { out = out + [f(x)] }
+  return out
+}
+
+fn render_all(items: [Drawable]) -> [Text] {
+  return map(items, |d| d.draw())
+}
+
+// Bounded type parameter: monomorphized, dispatched dynamically.
+fn describe<T: Drawable>(x: T) -> Text {
+  return "got: " + x.draw()
+}
+
+fn first_draw<T: Drawable>(xs: [T]) -> Text {
+  return xs[0].draw()
+}
+
+fn main() -> Int {
+  let c: Circle = { x: 0, y: 0, r: 5 }
+  let r: Rect = { w: 3, h: 4 }
+  // Static dispatch (concrete receiver).
+  print(c.draw())
+  // Dynamic dispatch (interface value).
+  var d: Drawable = c
+  print(d.draw())
+  d = r
+  print(d.draw())
+  // Heterogeneous collection + polymorphic render.
+  print(render_all([c, r]))
+  // Bounded generics.
+  print(describe(c))
+  print(describe(r))
+  print(first_draw([c, c]))
+  // Interface values render as their payload.
+  let e: Drawable = r
+  print(e)
+  return 0
+}
+
+main()

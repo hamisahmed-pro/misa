@@ -858,10 +858,16 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
     _defines, _cflags, libs = runtime_flags(eff_target, need_ort)
     # Phase 7: extern (FFI) libraries. "c" needs no flag; anything
     # else becomes -l<lib>. (Always safe: the linker only pulls what
-    # the declared extern symbols need.)
+    # the declared extern symbols need.) Overtake Wave 2: a lib that
+    # is a direct shared-object path (contains "/" or ends in
+    # .so/.dylib/.dll) is passed to the linker as-is.
     for item in merged.items:
         if isinstance(item, mast.ExternDecl) and item.lib != "c":
-            flag = "-l" + item.lib
+            lib = item.lib
+            if "/" in lib or lib.endswith((".so", ".dylib", ".dll")):
+                flag = lib
+            else:
+                flag = "-l" + lib
             if flag not in libs:
                 libs.append(flag)
     rt_objs = ensure_runtime(eff_target, need_ort, need_sqlite)

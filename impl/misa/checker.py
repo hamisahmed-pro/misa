@@ -200,6 +200,21 @@ class Checker:
         # only), plus name -> library string.
         self.externs: Dict[str, ast.FnDecl] = {}
         self.extern_libs: Dict[str, str] = {}
+        # Overtake Wave 2 (FFI): C-layout structs: name -> StructDecl.
+        self.extern_structs: Dict[str, ast.StructDecl] = {}
+        # Phase 8 (overtake): interfaces. interfaces: name ->
+        # InterfaceDecl; impls: (iface, target) -> ImplDecl;
+        # iface_method_throws: (iface, method) -> frozenset of the
+        # interface method's declared E-codes (the dynamic-call
+        # contract). impl_ bodies are throws-checked under the
+        # canonical name f"impl.{iface}.{target}.{method}".
+        self.interfaces: Dict[str, ast.InterfaceDecl] = {}
+        self.impls: Dict[tuple, ast.ImplDecl] = {}
+        self.iface_method_throws: Dict[tuple, frozenset] = {}
+        # Phase 8 (overtake): interface bounds in scope while checking
+        # a generic fn body, e.g. {"T": "Drawable"} for
+        # `fn f<T: Drawable>(x: T)`.
+        self._tparam_bounds: Dict[str, str] = {}
         self.app_seen = False
         self._file_of: Optional[Dict[int, str]] = None
         # Phase 4 (M4): id: name -> component kind for the screen whose
@@ -254,7 +269,7 @@ class Checker:
         self.throws_graph = {
             name: {"declared": sorted(self._declared.get(name, ())),
                    "inferred": sorted(self._inferred.get(name, ()))}
-            for name in self.fns
+            for name, _ in self._throws_fn_items()
         }
         return self.errors
 
@@ -292,6 +307,20 @@ class Checker:
                 for fn in item.fns:
                     self._dup(self.externs, fn.name, fn, "extern function")
                     self.extern_libs[fn.name] = item.lib
+                # Overtake Wave 2 (FFI): C-layout structs share the
+                # flat namespace.
+                for st in item.structs:
+                    self._dup(self.extern_structs, st.name, st,
+                              "extern struct")
+            elif isinstance(item, ast.InterfaceDecl):
+                self._dup(self.interfaces, item.name, item, "interface")
+            elif isinstance(item, ast.ImplDecl):
+                key = (item.iface, item.target)
+                if key in self.impls:
+                    self.error("E210",
+                               f"duplicate impl of '{item.iface}' for "
+                               f"'{item.target}'", item.line, item.col)
+                self.impls[key] = item
             elif isinstance(item, ast.ImportDecl):
                 pass  # resolved by the loader before checking
 
@@ -326,6 +355,10 @@ class Checker:
             self._check_fn(item)
         elif isinstance(item, ast.ExternDecl):
             self._check_extern(item)
+        elif isinstance(item, ast.InterfaceDecl):
+            self._check_interface_decl(item)
+        elif isinstance(item, ast.ImplDecl):
+            self._check_impl_decl(item)
         elif isinstance(item, ast.TypeDecl):
             self._check_type_decl(item)
         elif isinstance(item, ast.TableDecl):
@@ -363,15 +396,26 @@ class Checker:
     # the boundary; everything else (structs, function types, lists,
     # maps, generics) is rejected with E225.
     FFI_TYPES = {"Int", "Float", "Text", "Bool", "Ptr", "Void"}
+    # Overtake Wave 2 (FFI): scalar types usable as C struct fields
+    # and callback signature parts (v1).
+    FFI_SCALARS = {"Int", "Float", "Text", "Bool", "Ptr"}
+    FFI_SCALARS_VOID = FFI_SCALARS | {"Void"}
 
     def _check_extern(self, decl: ast.ExternDecl):
         """Phase 7: validate an `extern` block. Library name must be a
         non-empty string; each signature may only use FFI-mappable
         types (E225 otherwise); no type parameters (E225); names must
-        not collide with Misa functions (E210)."""
+        not collide with Misa functions (E210).
+
+        Overtake Wave 2: also validates `struct` declarations (C
+        layout; scalar fields only in v1) and allows callback
+        (`(A, B) -> R`) parameter types plus `...` varargs.
+        """
         if not decl.lib:
             self.error("E225", "extern library name is empty",
                        decl.line, decl.col)
+        for st in decl.structs:
+            self._check_extern_struct(st)
         for fn in decl.fns:
             if fn.name in self.fns:
                 self.error("E210",
@@ -386,25 +430,526 @@ class Checker:
                            f"across FFI)",
                            fn.line, fn.col)
             for pn, te in fn.params:
-                self._check_ffi_type(te, fn.name, pn)
+                self._check_ffi_type(te, fn.name, pn, param=True)
             if fn.ret is not None:
-                self._check_ffi_type(fn.ret, fn.name, "return")
+                self._check_ffi_type(fn.ret, fn.name, "return",
+                                     param=False)
+
+    # -- Phase 8 (overtake): interfaces ---------------------------------
+
+    def _iface_sig_key(self, method: ast.FnDecl) -> str:
+        """Canonical signature string for interface method compatibility:
+        param types (after self) + return type."""
+        ps = [self._tname(te) for _, te in method.params[1:]]
+        r = self._tname(method.ret) if method.ret else "Void"
+        return f"({', '.join(ps)}) -> {r}"
+
+    def _check_interface_decl(self, decl: ast.InterfaceDecl):
+        """Validate an `interface` declaration: method names unique,
+        each with a `self` first parameter; record the declared throws
+        set per method (the dynamic-call contract)."""
+        if decl.name in self.types:
+            self.error("E210",
+                       f"interface '{decl.name}' collides with a type "
+                       f"of the same name", decl.line, decl.col)
+        seen = set()
+        for m in decl.methods:
+            if m.name in seen:
+                self.error("E210",
+                           f"duplicate method '{m.name}' in interface "
+                           f"'{decl.name}'", m.line, m.col)
+            seen.add(m.name)
+            if not m.params or m.params[0][0] != "self":
+                self.error("E200",
+                           f"interface method '{decl.name}.{m.name}' "
+                           f"must take 'self' as its first parameter",
+                           m.line, m.col)
+            for pn, te in m.params[1:]:
+                self._check_te(te, te.line, te.col)
+            if m.ret is not None:
+                self._check_te(m.ret, m.ret.line, m.ret.col)
+            for c in m.throws:
+                if not self._THROWS_CODE_RE.match(c):
+                    self.error("E227",
+                               f"unknown error code '{c}' in throws "
+                               f"clause (expected like E304 or EBAD)",
+                               m.throws_line or m.line,
+                               m.throws_col or m.col)
+        # The dynamic-call contract: (iface, method) -> declared codes.
+        for m in decl.methods:
+            self.iface_method_throws[(decl.name, m.name)] = frozenset(
+                c for c in m.throws
+                if self._THROWS_CODE_RE.match(c))
+
+    def _check_impl_decl(self, decl: ast.ImplDecl):
+        """Validate an `impl I for T` block: the interface exists, the
+        target is a plain record type, every method matches its
+        interface signature (E200), impl throws are a subset of the
+        interface's declared throws (E200), and no method is missing
+        or extra."""
+        iface = self.interfaces.get(decl.iface)
+        if iface is None:
+            self.error("E200",
+                       f"impl of unknown interface '{decl.iface}'",
+                       decl.line, decl.col)
+            return
+        target = self.types.get(decl.target)
+        if target is None or target.is_sum or target.type_params:
+            self.error("E200",
+                       f"impl target '{decl.target}' must be a plain "
+                       f"declared record type",
+                       decl.line, decl.col)
+            return
+        if decl.target in self.interfaces:
+            self.error("E200",
+                       f"cannot impl '{decl.iface}' for interface "
+                       f"'{decl.target}'",
+                       decl.line, decl.col)
+            return
+        imethods = {m.name: m for m in iface.methods}
+        seen = set()
+        for m in decl.methods:
+            if m.name in seen:
+                self.error("E210",
+                           f"duplicate method '{m.name}' in impl of "
+                           f"'{decl.iface}' for '{decl.target}'",
+                           m.line, m.col)
+            seen.add(m.name)
+            im = imethods.get(m.name)
+            if im is None:
+                self.error("E200",
+                           f"impl method '{m.name}' is not a member of "
+                           f"interface '{decl.iface}'",
+                           m.line, m.col)
+                continue
+            # `self` must be the target type (bare `self` was filled
+            # by the parser; an explicit annotation must match).
+            if not m.params or m.params[0][0] != "self":
+                self.error("E200",
+                           f"impl method '{m.name}' must take 'self' "
+                           f"as its first parameter",
+                           m.line, m.col)
+            elif m.params[0][1] is not None and \
+                    self._tname(m.params[0][1]) != decl.target:
+                self.error("E200",
+                           f"impl method '{m.name}' self has type "
+                           f"'{self._tname(m.params[0][1])}', want "
+                           f"'{decl.target}'",
+                           m.params[0][1].line, m.params[0][1].col)
+            # Signature compatibility (after self).
+            if self._iface_sig_key(m) != self._iface_sig_key(im):
+                self.error("E200",
+                           f"impl method '{m.name}' has signature "
+                           f"{self._iface_sig_key(m)}, want "
+                           f"{self._iface_sig_key(im)}",
+                           m.line, m.col)
+            # Throws contravariance: impl may throw a subset of the
+            # interface's declared set (callers only know the
+            # interface contract).
+            declared = self.iface_method_throws.get(
+                (decl.iface, m.name), frozenset())
+            extra = [c for c in m.throws if c not in declared]
+            if extra:
+                self.error("E200",
+                           f"impl method '{m.name}' throws "
+                           f"{', '.join(extra)} which is not in "
+                           f"interface '{decl.iface}.{m.name}' throws "
+                           f"{{{', '.join(sorted(declared))}}}",
+                           m.throws_line or m.line,
+                           m.throws_col or m.col,
+                           hint="an impl may only throw a subset of "
+                                "the interface's declared codes")
+            for c in m.throws:
+                if not self._THROWS_CODE_RE.match(c):
+                    self.error("E227",
+                               f"unknown error code '{c}' in throws "
+                               f"clause (expected like E304 or EBAD)",
+                               m.throws_line or m.line,
+                               m.throws_col or m.col)
+            # Check the body with `self: <target>` in scope.
+            self._check_impl_method(decl, m)
+        missing = [name for name in imethods if name not in seen]
+        if missing:
+            self.error("E200",
+                       f"impl of '{decl.iface}' for '{decl.target}' "
+                       f"is missing method(s): {', '.join(missing)}",
+                       decl.line, decl.col)
+
+    def _check_impl_method(self, decl: ast.ImplDecl, m: ast.FnDecl):
+        """Check one impl method body (like _check_fn, with the
+        interface bound in scope for nested generics)."""
+        saved_tparams, self._tparams = self._tparams, []
+        saved_bounds, self._tparam_bounds = self._tparam_bounds, {}
+        seen_params = set()
+        for pn, te in m.params:
+            if pn in seen_params:
+                self.error("E210", f"duplicate parameter '{pn}'",
+                           te.line, te.col)
+            seen_params.add(pn)
+            if te is not None:
+                self._check_te(te, te.line, te.col)
+        ret_name = self._tname(m.ret) if m.ret else "Void"
+        if m.ret:
+            self._check_te(m.ret, m.ret.line, m.ret.col)
+        scope = {pn: (self._tname(te) if te is not None
+                      else decl.target, False)
+                 for pn, te in m.params}
+        self._check_block(m.body, scope, fn_ret=ret_name)
+        if ret_name != "Void" and not self._block_returns(m.body):
+            leak = self._leak_node(m.body)
+            eline, ecol = ((leak.line, leak.col) if leak is not None
+                           else (m.line, m.col))
+            self.error("E211",
+                       f"method '{m.name}' may exit without returning "
+                       f"{ret_name}", eline, ecol,
+                       hint="every code path must end in 'return'")
+        self._tparams = saved_tparams
+        self._tparam_bounds = saved_bounds
+
+    # -- Phase 8 (overtake): method call resolution ---------------------
+
+    def _resolve_iface_method(self, rt: str, field: str, line: int,
+                              col: int, scope=None):
+        """Resolve `recv.field` where recv has static type `rt`.
+
+        Returns (disp, iface, method, target):
+          - ("iface", I, m, None): dynamic dispatch on interface I.
+          - ("impl", I, m, T): static dispatch to impl I for T.
+          - ("ufcs", fn, m, None): plain function call sugar.
+          - ("error", None, None, None): an E200 was emitted; the
+            caller should tombstone the call to avoid cascades.
+        Returns None when this is not a method call at all (fall
+        through to normal handling).
+        """
+        # 1. Interface-typed receiver: dynamic dispatch.
+        if rt in self.interfaces:
+            if field in [m.name for m in self.interfaces[rt].methods]:
+                return ("iface", rt, field, None)
+            self.error("E200",
+                       f"interface '{rt}' has no method '{field}'",
+                       line, col,
+                       hint="only the interface's declared methods "
+                            "are callable on an interface value")
+            return ("error", None, None, None)
+        # 2. Type variable with an interface bound: dynamic dispatch
+        # via the bound.
+        bound = self._tparam_bounds.get(rt)
+        if bound is not None:
+            if field in [m.name for m in self.interfaces[bound].methods]:
+                return ("iface", bound, field, None)
+            self.error("E200",
+                       f"interface '{bound}' has no method '{field}'",
+                       line, col)
+            return ("error", None, None, None)
+        # 3. Concrete type: static dispatch when exactly one impl
+        # provides the method; ambiguity is E200.
+        cands = [(iname, m) for (iname, tgt), impl in self.impls.items()
+                 if tgt == rt
+                 for m in impl.methods if m.name == field]
+        # Deduplicate (one entry per interface).
+        seen_iface = {}
+        for iname, m in cands:
+            seen_iface.setdefault(iname, m)
+        if len(seen_iface) == 1:
+            iname = next(iter(seen_iface))
+            return ("impl", iname, field, rt)
+        if len(seen_iface) > 1:
+            names = ", ".join(sorted(seen_iface))
+            self.error("E200",
+                       f"ambiguous method '{field}' on '{rt}' "
+                       f"(provided by: {names})",
+                       line, col,
+                       hint=f"ascribe the interface type, e.g. "
+                            f"`let d: {next(iter(sorted(seen_iface)))}"
+                            f" = ...`")
+            return ("error", None, None, None)
+        # 4. UFCS: `recv.m(args)` as sugar for `m(recv, args)` when a
+        # Misa function `m` takes the receiver as its first parameter.
+        # Builtins are excluded (they keep their call syntax); a local
+        # variable named `m` shadows the function (no rewrite).
+        if field in self.fns and (scope is None or field not in scope):
+            fn = self.fns[field]
+            if fn.params:
+                first_t = self._tname(fn.params[0][1])
+                # Generic fns: arity is checked by generic inference;
+                # the first param must mention a type variable.
+                if fn.type_params or self._assignable(first_t, rt):
+                    return ("ufcs", field, field, None)
+            self.error("E200",
+                       f"function '{field}' cannot be called as a "
+                       f"method on '{rt}'",
+                       line, col,
+                       hint="the first parameter does not accept "
+                            "the receiver type")
+            return ("error", None, None, None)
+        return None
+
+    def _rewrite_iface_call(self, e: ast.Call, recv: str, rt: str,
+                            field: str, scope: dict):
+        """Rewrite `recv.field(args)` to its canonical dispatch form,
+        prepending the receiver. See _resolve_iface_method."""
+        kind = self._resolve_iface_method(rt, field, e.line, e.col,
+                                          scope)
+        if kind is None:
+            return
+        disp, iname, mname, tgt = kind
+        recv_node = ast.Ident(name=recv, line=e.line, col=e.col)
+        if disp == "error":
+            e.name = "iface.!error"
+        elif disp == "iface":
+            e.name = f"iface.{iname}.{mname}"
+            e.args.insert(0, recv_node)
+        elif disp == "impl":
+            e.name = f"impl.{iname}.{tgt}.{mname}"
+            e.args.insert(0, recv_node)
+        elif disp == "ufcs":
+            e.name = iname
+            e.args.insert(0, recv_node)
+
+    def _check_iface_call_args(self, e: ast.Call, arg_ts: list,
+                               msig: ast.FnDecl, what: str) -> str:
+        """Arity/type-check a rewritten interface method call. args[0]
+        is the receiver; the rest check against params[1:]. Returns the
+        method's return type."""
+        want_arity = len(msig.params)
+        if len(e.args) != want_arity:
+            self.error("E102",
+                       f"{what} takes {want_arity - 1} arg(s), got "
+                       f"{len(e.args) - 1}", e.line, e.col)
+            return "unknown"
+        for (pn, te), a, at in zip(msig.params[1:], e.args[1:],
+                                   arg_ts[1:]):
+            # Bare `self` in interface signatures has te=None; only
+            # params[1:] are checked here, so te is always present.
+            want_t = self._tname(te)
+            if at != "unknown" and want_t != "unknown" \
+                    and not self._assignable(want_t, at):
+                self.error("E211",
+                           f"{what} argument '{pn}' wants {want_t}, "
+                           f"got {at}", a.line, a.col)
+        return self._tname(msig.ret) if msig.ret else "Void"
+
+    def _coerce_iface(self, want: str, got: str,
+                      expr: ast.Node) -> ast.Node:
+        """Insert interface conversions: where a concrete value of type
+        `got` flows into an interface-typed position `want`, wrap the
+        expression so the backends build an interface value.
+
+        List literals are coerced element-wise during `_infer` via the
+        expected type; this handles single values and non-literal
+        lists (via IfaceWrapList, single level — deeper nesting on
+        non-literals is E200 in v1)."""
+        if want == got or got == "unknown" or want == "unknown":
+            return expr
+        # A bounded type var already holds an interface value at
+        # runtime (wrapped where the generic was instantiated); wrapping
+        # again would double-wrap and break dispatch.
+        if got in self._tparam_bounds:
+            return expr
+        # Single value: T -> I (and T -> I?).
+        if want in self.interfaces and (want, got) in self.impls:
+            return ast.IfaceWrap(iface=want, concrete=got, expr=expr,
+                                 line=expr.line, col=expr.col)
+        if want.endswith("?") and want[:-1] in self.interfaces \
+                and (want[:-1], got) in self.impls:
+            return ast.IfaceWrap(iface=want[:-1], concrete=got,
+                                 expr=expr,
+                                 line=expr.line, col=expr.col)
+        # Non-literal list: [T] -> [I] element-wise at runtime.
+        if want.startswith("[") and want.endswith("]") \
+                and got.startswith("[") and got.endswith("]") \
+                and "," not in want[1:-1] and "," not in got[1:-1]:
+            w_e, g_e = want[1:-1], got[1:-1]
+            if w_e != g_e and not isinstance(expr, ast.ListLit):
+                if w_e in self.interfaces and (w_e, g_e) in self.impls:
+                    return ast.IfaceWrapList(iface=w_e, concrete=g_e,
+                                             expr=expr, line=expr.line,
+                                             col=expr.col)
+                if "[" in w_e or "[" in g_e:
+                    self.error("E200",
+                               f"nested interface conversion "
+                               f"'{got}' -> '{want}' is not supported "
+                               f"in v1",
+                               expr.line, expr.col,
+                               hint="build the list with a for loop or "
+                                    "map each element explicitly")
+        return expr
+
+    def _check_extern_struct(self, st: ast.StructDecl):
+        """Overtake Wave 2: validate a C-layout struct declaration."""
+        if st.name in self.fns or st.name in self.externs \
+                or st.name in self.types:
+            self.error("E210",
+                       f"extern struct '{st.name}' collides with an "
+                       f"existing declaration", st.line, st.col)
+            return
+        seen = set()
+        for fname, fte in st.fields:
+            if fname in seen:
+                self.error("E210",
+                           f"extern struct '{st.name}' has duplicate "
+                           f"field '{fname}'", fte.line, fte.col)
+                continue
+            seen.add(fname)
+            t = self._tname(fte)
+            if t not in ("Int", "Float", "Bool", "Ptr"):
+                self.error("E225",
+                           f"extern struct '{st.name}': field '{fname}' "
+                           f"has type '{t}', which cannot be a C struct "
+                           f"field in v1 (only Int, Float, Bool, Ptr)",
+                           fte.line, fte.col)
 
     def _check_ffi_type(self, te: ast.TypeExpr, fn_name: str,
-                        where: str):
+                        where: str, param: bool = True):
+        # Overtake Wave 2: callback types — `(Ptr, Ptr) -> Int` in
+        # parameter position means "C function pointer". v1: scalar
+        # param/return types only, no nesting, no struct crossing.
+        if te.is_func:
+            if not param:
+                self.error("E225",
+                           f"extern function '{fn_name}': {where} cannot "
+                           f"be a callback type (v1 supports callbacks "
+                           f"as parameters only)", te.line, te.col)
+                return
+            for pte in te.func_params:
+                pt = self._tname(pte)
+                if pte.is_func or pt not in self.FFI_SCALARS:
+                    self.error("E225",
+                               f"extern function '{fn_name}': callback "
+                               f"parameter has type '{pt}', which cannot "
+                               f"cross the FFI boundary (v1: Int, Float, "
+                               f"Text, Bool, Ptr only)", pte.line,
+                               pte.col)
+            rt = self._tname(te.func_ret)
+            if te.func_ret.is_func or rt not in self.FFI_SCALARS_VOID:
+                self.error("E225",
+                           f"extern function '{fn_name}': callback "
+                           f"return type '{rt}' cannot cross the FFI "
+                           f"boundary (v1: Int, Float, Text, Bool, Ptr, "
+                           f"Void only)", te.func_ret.line,
+                           te.func_ret.col)
+            return
         t = self._tname(te)
-        if t in self.FFI_TYPES:
+        if t in self.FFI_TYPES or t in self.extern_structs:
             return
         self.error("E225",
                    f"extern function '{fn_name}': {where} has type "
                    f"'{t}', which cannot cross the FFI boundary "
-                   f"(v1 supports only Int, Float, Text, Bool, Ptr, Void)",
+                   f"(v1 supports Int, Float, Text, Bool, Ptr, Void, "
+                   f"declared structs, and (A, B) -> R callbacks)",
                    te.line, te.col)
+
+    def _check_extern_arg(self, fn: ast.FnDecl, pn: str,
+                          te: ast.TypeExpr, a: ast.Node, at: str):
+        """Overtake Wave 2: check one fixed argument of an extern call
+        (callback, struct, or scalar)."""
+        want_t = self._tname(te)
+        # Phase 7 (concurrency): Task/Chan values may not cross the
+        # FFI boundary (E225), even as arguments.
+        if at != "unknown" and (at.startswith("Task<")
+                                or at.startswith("Chan<")):
+            self.error("E225",
+                       f"cannot pass {at} to extern function "
+                       f"'{fn.name}': Task/Chan values cannot cross the "
+                       f"FFI boundary", a.line, a.col)
+            return
+        # Callback parameter: the argument must be a function value
+        # with a matching signature.
+        if te.is_func:
+            if not self._callback_matches(want_t, at):
+                self.error("E211",
+                           f"argument '{pn}' wants callback {want_t}, "
+                           f"got {at}", a.line, a.col)
+            return
+        # Struct parameter: exact struct type required.
+        if want_t in self.extern_structs:
+            if at != want_t:
+                self.error("E211",
+                           f"argument '{pn}' wants {want_t}, got {at}",
+                           a.line, a.col)
+            return
+        if at != "unknown" and not self._assignable(want_t, at):
+            self.error("E211",
+                       f"argument '{pn}' wants {want_t}, got {at}",
+                       a.line, a.col)
+
+    def _callback_matches(self, want_t: str, at: str) -> bool:
+        """Do the function-type strings match for a C callback? Both
+        are `(P, ...) -> R` strings (or 'unknown')."""
+        if at == "unknown":
+            return True
+        wfp = self._func_parts(want_t)
+        afp = self._func_parts(at)
+        if wfp is None or afp is None:
+            return False
+        wps, wr = wfp
+        aps, ar = afp
+        if len(wps) != len(aps):
+            return False
+        if not self._assignable(wr, ar):
+            return False
+        return all(self._assignable(w, a) for w, a in zip(wps, aps))
+
+    def _check_vararg(self, fn: ast.FnDecl, a: ast.Node, at: str):
+        """Overtake Wave 2: check one `...` tail argument. Each
+        vararg's C type derives from its Misa type via the mapping
+        table; anything else is E225. (Values undergo C default
+        argument promotion: Bool->int, Int->long, Float->double.)"""
+        if at == "unknown":
+            return
+        if at.startswith("Task<") or at.startswith("Chan<"):
+            self.error("E225",
+                       f"cannot pass {at} as a vararg to extern "
+                       f"function '{fn.name}': Task/Chan values cannot "
+                       f"cross the FFI boundary", a.line, a.col)
+            return
+        if at not in self.FFI_SCALARS and at not in self.extern_structs:
+            self.error("E225",
+                       f"vararg to extern function '{fn.name}' has type "
+                       f"'{at}', which cannot cross the FFI boundary "
+                       f"(varargs support Int, Float, Text, Bool, Ptr, "
+                       f"and declared structs)",
+                       a.line, a.col)
+            return
+        # A struct larger than 16 bytes crosses the C ABI by invisible
+        # reference, which is not expressible for `...` tails in v1.
+        if at in self.extern_structs and \
+                self._ffi_struct_size(at, self.extern_structs) > 16:
+            self.error("E225",
+                       f"vararg to extern function '{fn.name}' has type "
+                       f"'{at}': structs larger than 16 bytes cannot "
+                       f"cross the FFI boundary via varargs (pass by "
+                       f"pointer instead)", a.line, a.col)
+
+    @staticmethod
+    def _ffi_struct_size(name: str, structs: dict) -> int:
+        """C layout size for a flat-scalar struct (v1 fields only)."""
+        size_align = {"Int": (8, 8), "Float": (8, 8),
+                      "Bool": (4, 4), "Ptr": (8, 8)}
+        offset, max_align = 0, 1
+        st = structs[name]
+        for _, fte in st.fields:
+            sz, al = size_align[fte.name]
+            offset = (offset + al - 1) // al * al
+            offset += sz
+            max_align = max(max_align, al)
+        return (offset + max_align - 1) // max_align * max_align
 
     def _check_fn(self, fn: ast.FnDecl):
         seen_params = set()
         # Phase 5c: type parameters are in scope for the signature.
         saved_tparams, self._tparams = self._tparams, list(fn.type_params)
+        # Phase 8 (overtake): interface bounds, e.g. {"T": "Drawable"}.
+        # Bounds must name declared interfaces (E200 otherwise).
+        saved_bounds, self._tparam_bounds = self._tparam_bounds, {}
+        for tp, bound in fn.type_param_bounds.items():
+            if bound not in self.interfaces:
+                self.error("E200",
+                           f"unknown interface bound '{bound}' for type "
+                           f"parameter '{tp}'",
+                           fn.line, fn.col)
+            else:
+                self._tparam_bounds[tp] = bound
         for pn, te in fn.params:
             if pn in seen_params:
                 self.error("E210", f"duplicate parameter '{pn}'",
@@ -427,6 +972,7 @@ class Checker:
                        eline, ecol,
                        hint="every code path must end in 'return'")
         self._tparams = saved_tparams
+        self._tparam_bounds = saved_bounds
 
     # -- checked throws (Phase 8 overtake) --------------------------------
 
@@ -454,6 +1000,17 @@ class Checker:
                     else:
                         codes.append(c)
                 self._declared[item.name] = frozenset(codes)
+            # Phase 8 (overtake): impl methods declare under their
+            # canonical name `impl.I.T.m`.
+            if isinstance(item, ast.ImplDecl):
+                for m in item.methods:
+                    if m.throws:
+                        codes = [
+                            c for c in m.throws
+                            if self._THROWS_CODE_RE.match(c)]
+                        self._declared[
+                            f"impl.{item.iface}.{item.target}.{m.name}"
+                        ] = frozenset(codes)
 
     def _effective_throws(self, name: str) -> frozenset:
         """A callee's throws set: its declared clause wins, else the
@@ -462,23 +1019,38 @@ class Checker:
             return self._declared[name]
         return self._inferred.get(name, frozenset())
 
+    def _throws_fn_items(self):
+        """(canonical name, FnDecl) for every throws-checked body:
+        top-level functions plus impl methods."""
+        for name, fn in self.fns.items():
+            yield name, fn
+        for (iname, tgt), impl in self.impls.items():
+            for m in impl.methods:
+                yield f"impl.{iname}.{tgt}.{m.name}", m
+
     def _infer_throws_fixpoint(self):
         """Fixed-point inference of every function's throws set. Sets
         only grow and E-codes are a small closed set, so this terminates."""
-        self._inferred = {name: frozenset() for name in self.fns}
+        self._inferred = {name: frozenset()
+                          for name, _ in self._throws_fn_items()}
         changed = True
         while changed:
             changed = False
-            for name, fn in self.fns.items():
-                s = self._throws_of_fn_body(fn, emit=False)
+            for name, fn in self._throws_fn_items():
+                s = self._throws_of_fn_body(fn, emit=False, cname=name)
                 if s != self._inferred[name]:
                     self._inferred[name] = s
                     changed = True
 
     def _verify_throws(self, prog: ast.Program):
         """Check every function body: uncaught codes must be declared."""
-        for _name, fn in self.fns.items():
-            self._throws_of_fn_body(fn, emit=True)
+        for name, fn in self._throws_fn_items():
+            self._throws_of_fn_body(fn, emit=True, cname=name)
+        # Screens are exempt in v1 (like top-level statements): screen
+        # handlers are inline lambdas, and the v1 limitation for those
+        # applies. Requiring try/catch in every UI handler would be the
+        # Java verbosity trap in the layer where handlers are most
+        # pervasive.
         # Screens are exempt in v1 (like top-level statements): screen
         # handlers are inline lambdas, and the v1 limitation for those
         # applies. Requiring try/catch in every UI handler would be the
@@ -508,9 +1080,12 @@ class Checker:
         c.update(over)
         return c
 
-    def _throws_of_fn_body(self, fn: ast.FnDecl, emit: bool) -> frozenset:
-        declared = self._declared.get(fn.name, frozenset())
-        ctx = self._throws_ctx(fn.name, declared, emit)
+    def _throws_of_fn_body(self, fn: ast.FnDecl, emit: bool,
+                           cname: Optional[str] = None) -> frozenset:
+        declared = self._declared.get(
+            cname if cname is not None else fn.name, frozenset())
+        ctx = self._throws_ctx(cname if cname is not None else fn.name,
+                               declared, emit)
         # Task-typed params: awaiting them may raise E306 (timeout /
         # cancel); the task's own codes are unknowable (v1 limitation).
         for pn, te in fn.params:
@@ -673,6 +1248,10 @@ class Checker:
             for i in e.items:
                 out |= self._throws_expr(i, ctx)
             return frozenset(out)
+        # Phase 8 (overtake): interface conversions raise nothing
+        # themselves; the wrapped expression may.
+        if isinstance(e, (ast.IfaceWrap, ast.IfaceWrapList)):
+            return self._throws_expr(e.expr, ctx)
         if isinstance(e, ast.RecordLit):
             out = set()
             for _, v in e.fields:
@@ -712,6 +1291,18 @@ class Checker:
                           frozenset({"E226"}))
         elif e.name in BUILTIN_THROWS:
             what, cset = f"call to '{e.name}'", BUILTIN_THROWS[e.name]
+        # Phase 8 (overtake): interface method calls. Dynamic calls
+        # (`iface.I.m`) contribute the interface's declared contract;
+        # static calls (`impl.I.T.m`) contribute the impl's set.
+        elif e.name.startswith("iface.") and e.name != "iface.!error":
+            _p, iname, mname = e.name.split(".")
+            cset = self.iface_method_throws.get((iname, mname),
+                                                frozenset())
+            what = f"call to '{iname}.{mname}'"
+        elif e.name.startswith("impl."):
+            cset = self._effective_throws(e.name)
+            _p, iname, _t, mname = e.name.split(".")
+            what = f"call to '{iname}.{mname}'"
         elif e.name in ctx["var_throws"]:
             kind, vset = ctx["var_throws"][e.name]
             # Only lambda-bound vars are callable here (task/stream
@@ -1051,6 +1642,9 @@ class Checker:
                                s.line, s.col)
                     t = want
                 else:
+                    # Phase 8 (overtake): wrap concrete values for
+                    # interface-typed bindings.
+                    s.value = self._coerce_iface(want, t, s.value)
                     t = want
             scope[s.name] = (t, s.mutable)
         elif isinstance(s, ast.AssignStmt):
@@ -1078,7 +1672,14 @@ class Checker:
                            s.line, s.col)
                 self._infer(s.value, scope)
             else:
-                self._infer(s.value, scope)
+                # Phase 8 (overtake): thread the variable's type as
+                # expected so list literals coerce to interfaces.
+                vt = self._infer(s.value, scope,
+                                 expected=scope[name][0])
+                # Phase 8 (overtake): wrap concrete values assigned to
+                # interface-typed variables.
+                s.value = self._coerce_iface(scope[name][0], vt,
+                                             s.value)
         elif isinstance(s, ast.IfStmt):
             self._infer(s.cond, scope)
             self._check_block(s.then, dict(scope), fn_ret,
@@ -1130,6 +1731,10 @@ class Checker:
                         self.error("E211",
                                    f"return wants {fn_ret}, got {t}",
                                    s.line, s.col)
+                else:
+                    # Phase 8 (overtake): wrap concrete values for
+                    # interface-typed returns.
+                    s.value = self._coerce_iface(fn_ret, t, s.value)
         elif isinstance(s, ast.TryStmt):
             self._check_block(s.body, dict(scope), fn_ret,
                                    _ret_collect=_ret_collect)
@@ -1228,7 +1833,7 @@ class Checker:
         declared = {fn: fte for fn, fte in decl.fields}
         bindings = bindings or {}
         seen = set()
-        for fn, fv in rec.fields:
+        for i, (fn, fv) in enumerate(rec.fields):
             seen.add(fn)
             if fn not in declared:
                 self.error("E202",
@@ -1255,12 +1860,16 @@ class Checker:
                                    f"field '{fn}' wants [{fte.name}] record",
                                    item.line, item.col)
                 continue
-            t = self._infer(fv, scope)
             want = self._tname(fte)
+            t = self._infer(fv, scope, expected=want)
             if t != "unknown" and not self._assignable(want, t):
                 self.error("E202",
                            f"field '{fn}' wants {want}, got {t}",
                            fv.line, fv.col)
+            else:
+                # Phase 8 (overtake): wrap concrete values for
+                # interface-typed fields.
+                rec.fields[i] = (fn, self._coerce_iface(want, t, fv))
         for fn in declared:
             if fn not in seen and not declared[fn].optional:
                 self.error("E202",
@@ -1415,8 +2024,30 @@ class Checker:
             ot = self._infer(e.obj, scope)
             if ot == "Error" and e.field in ("code", "message"):
                 return "Text"
+            # Phase 8 (overtake): field access on an interface-typed
+            # value is E200 — only the interface's methods are visible
+            # (use a method call `v.m(...)`, not `v.field`).
+            if ot in self.interfaces or ot in self._tparam_bounds:
+                oname = self._tparam_bounds.get(ot, ot)
+                self.error("E200",
+                           f"cannot access field '.{e.field}' on "
+                           f"interface '{oname}' value",
+                           e.line, e.col,
+                           hint="interfaces expose methods only; call "
+                                "a method instead")
+                return "unknown"
             # Phase 5c: field access on applied generic types.
             base, args = self._split_applied(ot)
+            # Overtake Wave 2 (FFI): field access on a C-layout struct.
+            if base in self.extern_structs:
+                st = self.extern_structs[base]
+                for fname, fte in st.fields:
+                    if fname == e.field:
+                        return self._tname(fte)
+                self.error("E101",
+                           f"struct '{base}' has no field '{e.field}'",
+                           e.line, e.col)
+                return "unknown"
             decl = self.types.get(base)
             if decl:
                 bindings: Dict[str, str] = {}
@@ -1449,13 +2080,31 @@ class Checker:
             vt = vts.pop() if len(vts) == 1 else "unknown"
             return f"Map<Text, {vt}>"
         if isinstance(e, ast.ListLit):
-            ts = {self._infer(i, scope) for i in e.items}
+            # Phase 8 (overtake): when the expected element type is an
+            # interface, coerce each element by its own inferred type
+            # (handles heterogeneous literals like [c, r]).
+            exp_elem = None
+            if expected and expected.startswith("[") \
+                    and expected.endswith("]") \
+                    and "," not in expected[1:-1]:
+                exp_elem = expected[1:-1]
+            ts = set()
+            new_items = []
+            for i in e.items:
+                it = self._infer(i, scope, expected=exp_elem)
+                ts.add(it)
+                if exp_elem:
+                    i = self._coerce_iface(exp_elem, it, i)
+                new_items.append(i)
+            e.items = new_items
             inner = ts.pop() if len(ts) == 1 else "unknown"
             return f"[{inner}]"
         if isinstance(e, ast.RecordLit):
             for _, v in e.fields:
                 self._infer(v, scope)
             return "record"
+        if isinstance(e, ast.StructLit):
+            return self._infer_struct_lit(e, scope)
         if isinstance(e, ast.Lambda):
             return self._infer_lambda(e, scope, expected)
         if isinstance(e, ast.BinOp):
@@ -1672,6 +2321,35 @@ class Checker:
                 e.name = f"builder.{field}"
                 e.args.insert(0, ast.Ident(name=recv, line=e.line,
                                            col=e.col))
+        # Phase 8 (overtake): interface method calls. `d.draw()`
+        # where `d: Drawable` rewrites to `iface.Drawable.draw` with the
+        # receiver prepended (dynamic dispatch); `c.draw()` where
+        # `c: Circle` and exactly one impl provides `draw` rewrites to
+        # `impl.Drawable.Circle.draw` (static dispatch); `x.draw()`
+        # where `x: T` and `T: Drawable` is bound rewrites to the
+        # dynamic form via the bound.
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if recv in scope:
+                rt = scope[recv][0]
+                if rt != "unknown":
+                    self._rewrite_iface_call(e, recv, rt, field, scope)
+        # Phase 8 (overtake): method call on a complex receiver, e.g.
+        # `items[0].draw()` — the callee is a Field over an expression.
+        if e.callee is not None and isinstance(e.callee, ast.Field):
+            rt = self._infer(e.callee.obj, scope)
+            if rt != "unknown":
+                recv_expr = e.callee.obj
+                kind = self._resolve_iface_method(rt, e.callee.field,
+                                                  e.line, e.col, scope)
+                if kind is not None:
+                    disp, iname, mname, _t = kind
+                    e.callee = None
+                    e.name = (f"iface.{iname}.{mname}"
+                              if disp == "iface"
+                              else f"impl.{iname}.{_t}.{mname}")
+                    e.args.insert(0, recv_expr)
         # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
         if e.callee is not None:
             ct = self._infer(e.callee, scope)
@@ -1757,40 +2435,42 @@ class Checker:
                            f"function '{e.name}' takes {want} args, "
                            f"got {len(e.args)}", e.line, e.col)
             else:
-                for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
+                for i, ((pn, te), a, at) in enumerate(
+                        zip(fn.params, e.args, arg_ts)):
                     want_t = self._tname(te)
                     if at != "unknown" and not self._assignable(want_t, at):
                         self.error("E211",
                                    f"argument '{pn}' wants {want_t}, "
                                    f"got {at}", a.line, a.col)
+                    else:
+                        # Phase 8 (overtake): wrap concrete args for
+                        # interface-typed parameters.
+                        e.args[i] = self._coerce_iface(want_t, at, a)
             return self._tname(fn.ret) if fn.ret else "Void"
         # Phase 7: extern (FFI) function calls — same arity/type
-        # checking as Misa functions.
+        # checking as Misa functions. Overtake Wave 2: varargs
+        # (`len(args) >= len(params)`), callback arguments (function
+        # values with matching signatures), and struct arguments.
         if e.name in self.externs:
             fn = self.externs[e.name]
             want = len(fn.params)
-            if len(e.args) != want:
+            if fn.varargs:
+                if len(e.args) < want:
+                    self.error("E102",
+                               f"extern function '{e.name}' takes at "
+                               f"least {want} args, got {len(e.args)}",
+                               e.line, e.col)
+                    return self._tname(fn.ret) if fn.ret else "Void"
+            elif len(e.args) != want:
                 self.error("E102",
                            f"extern function '{e.name}' takes {want} args, "
                            f"got {len(e.args)}", e.line, e.col)
-            else:
-                for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
-                    want_t = self._tname(te)
-                    # Phase 7 (concurrency): Task/Chan values may not
-                    # cross the FFI boundary (E225), even as arguments.
-                    if at != "unknown" \
-                            and (at.startswith("Task<")
-                                 or at.startswith("Chan<")):
-                        self.error("E225",
-                                   f"cannot pass {at} to extern function "
-                                   f"'{e.name}': Task/Chan values cannot "
-                                   f"cross the FFI boundary",
-                                   a.line, a.col)
-                    elif at != "unknown" \
-                            and not self._assignable(want_t, at):
-                        self.error("E211",
-                                   f"argument '{pn}' wants {want_t}, "
-                                   f"got {at}", a.line, a.col)
+                return self._tname(fn.ret) if fn.ret else "Void"
+            for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
+                self._check_extern_arg(fn, pn, te, a, at)
+            if fn.varargs:
+                for a, at in zip(e.args[want:], arg_ts[want:]):
+                    self._check_vararg(fn, a, at)
             return self._tname(fn.ret) if fn.ret else "Void"
         # Phase 5a: calling a variable holding a function value.
         if e.name in scope:
@@ -1816,6 +2496,30 @@ class Checker:
                                    f"argument wants {want_t}, got {at}",
                                    a.line, a.col)
             return fret
+        # Phase 8 (overtake): interface method dispatch. The
+        # receiver was prepended by _rewrite_iface_call, so args[0] is
+        # the receiver and the rest check against params[1:].
+        if e.name == "iface.!error":
+            return "unknown"
+        if e.name.startswith("iface."):
+            _p, iname, mname = e.name.split(".")
+            idecl = self.interfaces.get(iname)
+            msig = next((m for m in idecl.methods if m.name == mname),
+                        None) if idecl else None
+            if msig is None:
+                return "unknown"
+            return self._check_iface_call_args(
+                e, arg_ts, msig, f"interface '{iname}.{mname}'")
+        if e.name.startswith("impl."):
+            _p, iname, tgt, mname = e.name.split(".")
+            impl = self.impls.get((iname, tgt))
+            msig = next((m for m in impl.methods if m.name == mname),
+                        None) if impl else None
+            if msig is None:
+                return "unknown"
+            return self._check_iface_call_args(
+                e, arg_ts, msig,
+                f"impl '{iname}' for '{tgt}' method '{mname}'")
         # Phase 7 (concurrency): `chan` / `sleep` / `fetch_all` /
         # `close` / `chan.send` / `chan.recv`. Placed after user
         # functions and variables so a user-defined `sleep` etc.
@@ -2193,6 +2897,15 @@ class Checker:
 
     def _infer_match(self, e: ast.Match, scope: dict) -> str:
         st = self._infer(e.scrutinee, scope)
+        # Phase 8 (overtake): `match` on an interface value is E200 in
+        # v1 (the concrete type is hidden by design; use methods).
+        if st in self.interfaces:
+            self.error("E200",
+                       f"cannot match on interface '{st}' value",
+                       e.scrutinee.line, e.scrutinee.col,
+                       hint="interfaces expose methods only — call a "
+                            "method instead of matching")
+            return "unknown"
         # Phase 5c: applied sum types — `match` on `Result<Int>`.
         base, args = self._split_applied(st)
         decl = self.types.get(base)
@@ -2296,6 +3009,41 @@ class Checker:
             s += "?"
         return s
 
+    def _infer_struct_lit(self, e: ast.StructLit, scope: dict) -> str:
+        """Overtake Wave 2: check `Point { x: 1.0, y: 2.0 }`. All
+        declared fields are required (E211); unknown fields are E101;
+        mistyped fields are E211."""
+        st = self.extern_structs.get(e.name)
+        if st is None:
+            self.error("E101", f"unknown struct '{e.name}'",
+                       e.line, e.col)
+            return "unknown"
+        want = {fname: self._tname(fte) for fname, fte in st.fields}
+        seen = set()
+        for fname, fv in e.fields:
+            if fname not in want:
+                self.error("E101",
+                           f"struct '{e.name}' has no field '{fname}'",
+                           fv.line, fv.col)
+                continue
+            if fname in seen:
+                self.error("E210",
+                           f"duplicate field '{fname}' in struct "
+                           f"'{e.name}' literal", fv.line, fv.col)
+                continue
+            seen.add(fname)
+            vt = self._infer(fv, scope)
+            if vt != "unknown" and not self._assignable(want[fname], vt):
+                self.error("E211",
+                           f"struct '{e.name}' field '{fname}' wants "
+                           f"{want[fname]}, got {vt}", fv.line, fv.col)
+        for fname in want:
+            if fname not in seen:
+                self.error("E211",
+                           f"struct '{e.name}' literal is missing field "
+                           f"'{fname}'", e.line, e.col)
+        return e.name
+
     def _known_type(self, te: Optional[ast.TypeExpr]) -> bool:
         if te is None:
             return False
@@ -2331,6 +3079,12 @@ class Checker:
         base = te.name
         # Phase 5c: type parameters in scope are known types.
         if base in self._tparams:
+            return True
+        # Overtake Wave 2 (FFI): declared C-layout structs are types.
+        if base in self.extern_structs:
+            return True
+        # Phase 8 (overtake): interfaces are types.
+        if base in self.interfaces:
             return True
         return (base in PRIMITIVES or base in MEDIA or base in SPECIAL
                 or base in self.types)
@@ -2660,7 +3414,14 @@ class Checker:
                    if isinstance(a, ast.Lambda)}
         for i, a in enumerate(e.args):
             if i not in lam_idx:
-                arg_ts[i] = self._infer(a, scope)
+                # Phase 8 (overtake): thread the bound-view as expected
+                # so list literals coerce elements to the bound
+                # interface (e.g. [c, r] for [T] with T: Drawable).
+                exp = None
+                if i < len(fn.params) and fn.type_param_bounds:
+                    exp = self._tname(self._subst_te(
+                        fn.params[i][1], fn.type_param_bounds))
+                arg_ts[i] = self._infer(a, scope, expected=exp)
         if not explicit:
             for i, a in enumerate(e.args):
                 if i in lam_idx or i >= len(fn.params):
@@ -2716,13 +3477,38 @@ class Checker:
         # Phase 5c: annotate the call with concrete type args for AOT
         # monomorphization (explicit pinning already set them).
         e.type_args = [self._parse_tstr(bindings[p]) for p in tparams]
-        for (pn, pte), a, at in zip(fn.params, e.args, arg_ts):
+        # Phase 8 (overtake): verify interface bounds — each bounded
+        # type var's concrete binding must implement (or be) the bound.
+        if fn.type_param_bounds and not had_conflict:
+            for tp, bound in fn.type_param_bounds.items():
+                concrete = bindings.get(tp)
+                if concrete is None or concrete == "unknown":
+                    continue
+                if concrete != bound and (bound, concrete) not in self.impls \
+                        and concrete not in self._tparam_bounds:
+                    self.error("E200",
+                               f"type '{concrete}' does not implement "
+                               f"interface '{bound}' (bound on '{tp}' "
+                               f"in '{fn.name}')",
+                               e.line, e.col)
+        for i, ((pn, pte), a, at) in enumerate(
+                zip(fn.params, e.args, arg_ts)):
             want_t = self._tname(self._subst_te(pte, bindings))
             if not had_conflict and at != "unknown" \
                     and not self._assignable(want_t, at):
                 self.error("E211",
                            f"argument '{pn}' wants {want_t}, got {at}",
                            a.line, a.col)
+            # Phase 8 (overtake): a parameter whose (pre-substitution)
+            # type mentions a bounded type var receives the argument
+            # as an interface value — wrap it so method calls inside
+            # the generic body dispatch dynamically.
+            if not had_conflict and at != "unknown" \
+                    and fn.type_param_bounds:
+                view = self._tname(self._subst_te(
+                    pte, fn.type_param_bounds))
+                if view != want_t:
+                    e.args[i] = self._coerce_iface(view, at, a)
         if fn.ret:
             return self._tname(self._subst_te(fn.ret, bindings))
         return "Void"
@@ -2842,6 +3628,20 @@ class Checker:
         # to any list type (so `var xs: [Int] = []` checks).
         if (got == "[unknown]" and want.startswith("[")
                 and want.endswith("]")):
+            return True
+        # Phase 8 (overtake): a concrete type is assignable to an
+        # interface it implements (`impl I for T` exists). Optional
+        # interfaces accept the concrete type too.
+        if want in self.interfaces and (want, got) in self.impls:
+            return True
+        if want.endswith("?") and want[:-1] in self.interfaces \
+                and (want[:-1], got) in self.impls:
+            return True
+        # Phase 8 (overtake): a bounded type var is assignable to
+        # its bound interface (the value was wrapped at the generic
+        # instantiation site).
+        if want in self.interfaces and got in self._tparam_bounds \
+                and self._tparam_bounds[got] == want:
             return True
         # H-3: list covariance — [Text] is assignable to [any], etc.
         # (db.exec/db.query bind args accept heterogeneous scalars).

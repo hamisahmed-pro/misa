@@ -109,6 +109,17 @@ class PtrValue:
 
 
 @dataclass
+class IfaceValue:
+    """Phase 8 (overtake): an interface-typed value. Carries the
+    interface name, the concrete implementing type, and the payload
+    (the concrete record value). Method dispatch looks up
+    impls[(iface, concrete)]."""
+    iface: str
+    concrete: str
+    payload: object
+
+
+@dataclass
 class TokenStreamHandle:
     decl: ast.ModelDecl
     arg_values: list
@@ -263,6 +274,9 @@ def render_value(v: Any) -> str:
             return f"{v.type_name}.{v.variant}"
         inner = ", ".join(render_value(x) for x in v.fields)
         return f"{v.type_name}.{v.variant}({inner})"
+    # Phase 8 (overtake): interface values render as their payload.
+    if isinstance(v, IfaceValue):
+        return render_value(v.payload)
     return str(v)
 
 
@@ -295,12 +309,25 @@ class Interpreter:
         self.evals: Dict[str, ast.EvalDecl] = {}
         self.tests: Dict[str, ast.TestDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
+        # Phase 8 (overtake): interfaces: name -> InterfaceDecl;
+        # impls: (iface, target) -> ImplDecl.
+        self.interfaces: Dict[str, ast.InterfaceDecl] = {}
+        self.impls: Dict[tuple, ast.ImplDecl] = {}
         # Screen state: the current screen frame (dict with name, args,
         # states, dirty, handlers) or None outside a screen.
         self._screen_frame: Optional[dict] = None
         # Phase 7: extern (FFI) functions: name -> (ctypes callable,
         # FnDecl signature). Loaded lazily on first load().
         self.extern_fns: Dict[str, tuple] = {}
+        # Overtake Wave 2 (FFI): struct name -> ctypes.Structure
+        # subclass; struct name -> StructDecl (for field types).
+        self.extern_struct_ctypes: Dict[str, type] = {}
+        self.extern_struct_decls: Dict[str, ast.StructDecl] = {}
+        # Callback trampolines stay alive for the interpreter's
+        # lifetime (v1: a callback must not be invoked after its
+        # extern call returns, but GC of the trampoline mid-call
+        # would segfault — this prevents that class of crash).
+        self._cb_keepalive: list = []
         self.provider_cache: Dict[tuple, Provider] = {}
         self.global_env = Env()
         self.current_screen = None
@@ -408,6 +435,10 @@ class Interpreter:
                 self.tests[item.name] = item
             elif isinstance(item, ast.FnDecl):
                 self.fns[item.name] = item
+            elif isinstance(item, ast.InterfaceDecl):
+                self.interfaces[item.name] = item
+            elif isinstance(item, ast.ImplDecl):
+                self.impls[(item.iface, item.target)] = item
             elif isinstance(item, ast.ExternDecl):
                 self._load_extern(item)
             elif isinstance(item, ast.ImportDecl):
@@ -418,22 +449,41 @@ class Interpreter:
     # null-terminated UTF-8 copies (both directions); Ptr is an opaque
     # address. Load/symbol failures raise FFIError (E226), never a
     # raw traceback.
+    #
+    # Overtake Wave 2: structs map to ctypes.Structure subclasses
+    # (built per declaration in _load_extern); a `(A, B) -> R` param
+    # type maps to a CFUNCTYPE callback.
 
-    @staticmethod
-    def _ffi_ctype(tname: str):
+    def _ffi_ctype(self, tname: str):
         import ctypes
+        if tname in self.extern_struct_ctypes:
+            return self.extern_struct_ctypes[tname]
         return {"Int": ctypes.c_long,
                 "Float": ctypes.c_double,
                 "Text": ctypes.c_char_p,
                 "Bool": ctypes.c_int,
                 "Ptr": ctypes.c_void_p}[tname]
 
-    @staticmethod
-    def _ffi_restype(tname: str):
-        import ctypes
+    def _ffi_restype(self, tname: str):
         if tname == "Void":
             return None
-        return Interpreter._ffi_ctype(tname)
+        return self._ffi_ctype(tname)
+
+    def _ffi_callback_ctype(self, te: ast.TypeExpr):
+        """ctypes type for a `(A, B) -> R` callback parameter."""
+        import ctypes
+        params = [self._ffi_ctype(self._tname_of(te_p))
+                  for te_p in te.func_params]
+        restype = self._ffi_restype(self._tname_of(te.func_ret))
+        return ctypes.CFUNCTYPE(restype, *params)
+
+    @staticmethod
+    def _tname_of(te: ast.TypeExpr) -> str:
+        if te.is_func:
+            ps = ", ".join(Interpreter._tname_of(p)
+                           for p in te.func_params)
+            return f"({ps}) -> {Interpreter._tname_of(te.func_ret)}"
+        return te.name
 
     def _load_extern(self, decl: ast.ExternDecl):
         import ctypes
@@ -442,12 +492,30 @@ class Interpreter:
         try:
             if lib == "c":
                 cdll = ctypes.CDLL(None)
+            elif "/" in lib or lib.endswith((".so", ".dylib", ".dll")):
+                # Overtake Wave 2: a direct shared-object path.
+                cdll = ctypes.CDLL(lib)
             else:
                 resolved = ctypes.util.find_library(lib)
                 cdll = ctypes.CDLL(resolved or ("lib" + lib))
         except OSError as ex:
             raise FFIError(f"cannot load library '{lib}': {ex}",
                            line=decl.line, col=decl.col)
+        # Overtake Wave 2: build a ctypes.Structure subclass per
+        # declared C-layout struct (v1 fields: Int/Float/Bool/Ptr).
+        for st in decl.structs:
+            fields = []
+            for fname, fte in st.fields:
+                ft = fte.name
+                ctype = {"Int": ctypes.c_long,
+                         "Float": ctypes.c_double,
+                         "Bool": ctypes.c_int,
+                         "Ptr": ctypes.c_void_p}[ft]
+                fields.append((fname, ctype))
+            cls = type("MisaStruct_" + st.name, (ctypes.Structure,),
+                       {"_fields_": fields, "_misa_name": st.name})
+            self.extern_struct_ctypes[st.name] = cls
+            self.extern_struct_decls[st.name] = st
         for fn in decl.fns:
             try:
                 cfn = getattr(cdll, fn.name)
@@ -455,27 +523,64 @@ class Interpreter:
                 raise FFIError(
                     f"library '{lib}' has no symbol '{fn.name}'",
                     line=fn.line, col=fn.col)
-            # The checker guarantees FFI-mappable simple types, so
-            # te.name is the whole story here.
-            cfn.argtypes = [self._ffi_ctype(te.name)
-                            for _, te in fn.params]
+            # The checker guarantees FFI-mappable types. Callback
+            # params (`(A, B) -> R`) become CFUNCTYPE slots; varargs
+            # functions declare only their fixed prefix (ctypes
+            # passes the tail as given).
+            argtypes = []
+            for _, te in fn.params:
+                if te.is_func:
+                    argtypes.append(self._ffi_callback_ctype(te))
+                else:
+                    argtypes.append(self._ffi_ctype(te.name))
+            cfn.argtypes = argtypes
             cfn.restype = self._ffi_restype(
                 fn.ret.name if fn.ret else "Void")
             self.extern_fns[fn.name] = (cfn, fn)
 
     def call_extern(self, name: str, args: list, node) -> Any:
+        import ctypes
         cfn, fn = self.extern_fns[name]
         c_args = []
+        # Lifetimes: encoded Text bytes for varargs must outlive the
+        # call; callback trampolines live in _cb_keepalive.
+        keepalive = []
         for (pn, te), a in zip(fn.params, args):
             t = te.name
-            if t == "Text":
+            if te.is_func:
+                # Overtake Wave 2: Misa closure -> C function pointer.
+                c_args.append(self._make_callback(te, a, node))
+            elif t == "Text":
                 c_args.append(a.encode("utf-8"))
             elif t == "Ptr":
                 c_args.append(a.addr if isinstance(a, PtrValue) else 0)
             elif t == "Bool":
                 c_args.append(1 if a else 0)
+            elif t in self.extern_struct_ctypes:
+                # Struct by value: the value already is a ctypes
+                # Structure instance (built by StructLit eval).
+                c_args.append(a)
             else:
                 c_args.append(a)
+        if fn.varargs:
+            # Overtake Wave 2: the tail converts explicitly per the
+            # mapping table (ctypes does not convert varargs).
+            for a, at in zip(args[len(fn.params):],
+                             self._vararg_tnames(fn, args, node)):
+                ct = self._ffi_ctype(at)
+                if at == "Text":
+                    b = a.encode("utf-8")
+                    keepalive.append(b)
+                    c_args.append(ct(b))
+                elif at == "Bool":
+                    c_args.append(ct(1 if a else 0))
+                elif at == "Ptr":
+                    c_args.append(ct(a.addr if isinstance(a, PtrValue)
+                                      else 0))
+                elif at in self.extern_struct_ctypes:
+                    c_args.append(a)
+                else:
+                    c_args.append(ct(a))
         try:
             r = cfn(*c_args)
         except Exception as ex:
@@ -491,7 +596,95 @@ class Interpreter:
             return PtrValue(r or 0)
         if ret == "Bool":
             return bool(r)
+        if ret in self.extern_struct_ctypes:
+            # Struct by value: ctypes returns an instance.
+            return r
         return r
+
+    def _vararg_tnames(self, fn: ast.FnDecl, args: list,
+                       node) -> list:
+        """Misa type names for the `...` tail of an extern call. The
+        checker already validated them; this re-derives them from the
+        runtime values for marshalling."""
+        out = []
+        for a in args[len(fn.params):]:
+            if isinstance(a, bool):
+                out.append("Bool")
+            elif isinstance(a, int):
+                out.append("Int")
+            elif isinstance(a, float):
+                out.append("Float")
+            elif isinstance(a, str):
+                out.append("Text")
+            elif isinstance(a, PtrValue):
+                out.append("Ptr")
+            else:
+                import ctypes as _ct
+                if isinstance(a, _ct.Structure):
+                    out.append(a._misa_name)
+                else:
+                    raise FFIError(
+                        f"cannot marshal vararg of type "
+                        f"{type(a).__name__}", line=node.line,
+                        col=node.col)
+        return out
+
+    def _make_callback(self, te: ast.TypeExpr, lam, node):
+        """Overtake Wave 2: wrap a Misa closure as a C function
+        pointer (ctypes CFUNCTYPE). v1 rule: the callback is valid
+        only for the duration of the extern call."""
+        import ctypes
+        if not isinstance(lam, (LambdaValue, FnValue)):
+            raise FFIError("callback argument must be a function "
+                           "value", line=node.line, col=node.col)
+        FUNCTYPE = self._ffi_callback_ctype(te)
+        pnames = [self._tname_of(p) for p in te.func_params]
+        rname = self._tname_of(te.func_ret)
+
+        def _trampoline(*c_args):
+            misa_args = [self._c_to_misa(t, v)
+                         for t, v in zip(pnames, c_args)]
+            if isinstance(lam, LambdaValue):
+                r = self.invoke_lambda_value(lam, misa_args, node)
+            else:
+                r = self.call_fn(lam.decl, misa_args, node)
+            return self._misa_to_c(rname, r, node)
+
+        cfunc = FUNCTYPE(_trampoline)
+        self._cb_keepalive.append(cfunc)
+        return cfunc
+
+    @staticmethod
+    def _c_to_misa(tname: str, v):
+        if tname == "Int":
+            return int(v)
+        if tname == "Float":
+            return float(v)
+        if tname == "Bool":
+            return bool(v)
+        if tname == "Text":
+            return v.decode("utf-8") if v is not None else ""
+        if tname == "Ptr":
+            return PtrValue(v or 0)
+        return v
+
+    def _misa_to_c(self, tname: str, v, node):
+        if tname == "Int":
+            return int(v)
+        if tname == "Float":
+            return float(v)
+        if tname == "Bool":
+            return 1 if v else 0
+        if tname == "Text":
+            b = v.encode("utf-8") if isinstance(v, str) else b""
+            self._cb_keepalive.append(b)
+            return b
+        if tname == "Ptr":
+            return v.addr if isinstance(v, PtrValue) else 0
+        if tname == "Void":
+            return None
+        raise FFIError(f"cannot return {tname} from a callback",
+                       line=node.line, col=node.col)
 
     def run(self, prog: ast.Program):
         self.load(prog)
@@ -513,6 +706,7 @@ class Interpreter:
                                      ast.EvalDecl, ast.TestDecl,
                                      ast.FnDecl,
                                      ast.ExternDecl,
+                                     ast.InterfaceDecl, ast.ImplDecl,
                                      ast.ImportDecl)):
                     continue
                 try:
@@ -720,6 +914,17 @@ class Interpreter:
                             line=e.line, col=e.col)
                     return SumValue(decl.name, v.name, [])
             obj = self.eval_expr(e.obj, env)
+            # Overtake Wave 2 (FFI): field read on a C-layout struct.
+            import ctypes as _ct2
+            if isinstance(obj, _ct2.Structure):
+                return self.struct_field_get(obj, e.field, e)
+            # Phase 8 (overtake): field access on an interface value
+            # is E200 statically; this is the runtime backstop.
+            if isinstance(obj, IfaceValue):
+                raise RuntimeError_(
+                    f"cannot access field '.{e.field}' on interface "
+                    f"'{obj.iface}' value",
+                    line=e.line, col=e.col)
             if isinstance(obj, dict):
                 if e.field not in obj:
                     raise RuntimeError_(f"no field '{e.field}'",
@@ -748,11 +953,20 @@ class Interpreter:
                                     line=e.line, col=e.col)
         if isinstance(e, ast.ListLit):
             return [self.eval_expr(i, env) for i in e.items]
+        # Phase 8 (overtake): interface conversions (checker-inserted).
+        if isinstance(e, ast.IfaceWrap):
+            return IfaceValue(e.iface, e.concrete,
+                              self.eval_expr(e.expr, env))
+        if isinstance(e, ast.IfaceWrapList):
+            return [IfaceValue(e.iface, e.concrete, v)
+                    for v in self.eval_expr(e.expr, env)]
         if isinstance(e, ast.MapLit):
             return MapValue({k: self.eval_expr(v, env)
                              for k, v in e.entries})
         if isinstance(e, ast.RecordLit):
             return {k: self.eval_expr(v, env) for k, v in e.fields}
+        if isinstance(e, ast.StructLit):
+            return self.eval_struct_lit(e, env)
         if isinstance(e, ast.Lambda):
             return LambdaValue([pn for pn, _ in e.params],
                                e.body, e.expr_body, env)
@@ -831,12 +1045,32 @@ class Interpreter:
             return l * r
         if op == "/":
             # C-5: clean E300, never a Python traceback (and catchable).
+            if isinstance(l, int) and isinstance(r, int):
+                if r == 0:
+                    raise RuntimeError_("division by zero",
+                                         line=e.line, col=e.col)
+                # Truncating integer division (LLVM sdiv semantics),
+                # matching the checker (Int/Int -> Int) and the AOT
+                # backend. The interpreter previously did float
+                # division here -- a three-way divergence.
+                if l == -(1 << 63) and r == -1:
+                    return wrap_i64(l)  # wraps to INT64_MIN
+                q = abs(l) // abs(r)
+                return wrap_i64(-q if (l < 0) != (r < 0) else q)
             try:
                 return l / r
             except ZeroDivisionError:
                 raise RuntimeError_("division by zero",
                                      line=e.line, col=e.col)
         if op == "%":
+            if isinstance(l, int) and isinstance(r, int):
+                if r == 0:
+                    raise RuntimeError_("integer modulo by zero",
+                                         line=e.line, col=e.col)
+                # srem semantics (sign follows dividend), matching AOT.
+                # Python's % floors (sign follows divisor) -- diverged.
+                m = abs(l) % abs(r)
+                return wrap_i64(-m if l < 0 else m)
             try:
                 return l % r
             except ZeroDivisionError:
@@ -953,6 +1187,36 @@ class Interpreter:
                 return SumValue(head, var, args)
         if name in self.fns:
             return self.call_fn(self.fns[name], args, e)
+        # Phase 8 (overtake): interface method dispatch. `iface.I.m`
+        # is dynamic (receiver is an IfaceValue); `impl.I.T.m` is a
+        # static call to the impl method with the payload as `self`.
+        if name.startswith("iface.") and name.count(".") == 2:
+            _p, iname, mname = name.split(".")
+            recv = args[0]
+            if not isinstance(recv, IfaceValue):
+                raise RuntimeError_(
+                    f"interface dispatch needs an interface value, "
+                    f"got {type(recv).__name__}",
+                    line=e.line, col=e.col)
+            impl = self.impls.get((iname, recv.concrete))
+            fn = next((m for m in impl.methods if m.name == mname),
+                      None) if impl else None
+            if fn is None:
+                raise RuntimeError_(
+                    f"no impl of '{iname}' for '{recv.concrete}' "
+                    f"providing '{mname}'",
+                    line=e.line, col=e.col)
+            return self.call_fn(fn, [recv.payload] + args[1:], e)
+        if name.startswith("impl.") and name.count(".") == 3:
+            _p, iname, tgt, mname = name.split(".")
+            impl = self.impls.get((iname, tgt))
+            fn = next((m for m in impl.methods if m.name == mname),
+                      None) if impl else None
+            if fn is None:
+                raise RuntimeError_(
+                    f"no impl of '{iname}' for '{tgt}' providing "
+                    f"'{mname}'", line=e.line, col=e.col)
+            return self.call_fn(fn, args, e)
         # Phase 7: extern (FFI) function calls.
         if name in self.extern_fns:
             return self.call_extern(name, args, e)
@@ -2247,6 +2511,57 @@ class Interpreter:
         self.check_budget(handle.decl, usage, latency_ms,
                           handle.model_id)
         return value
+
+    def eval_struct_lit(self, e: ast.StructLit, env: Env):
+        """Overtake Wave 2: `Point { x: 1.0, y: 2.0 }` — build a
+        ctypes Structure instance (C layout, by value). The checker
+        validated fields; re-check defensively for unchecked ASTs."""
+        import ctypes
+        cls = self.extern_struct_ctypes.get(e.name)
+        decl = self.extern_struct_decls.get(e.name)
+        if cls is None or decl is None:
+            raise RuntimeError_(f"unknown struct '{e.name}'",
+                                line=e.line, col=e.col)
+        want = {fname: fte.name for fname, fte in decl.fields}
+        kwargs = {}
+        for fname, fv in e.fields:
+            if fname not in want:
+                raise RuntimeError_(f"struct '{e.name}' has no field "
+                                    f"'{fname}'", line=fv.line,
+                                    col=fv.col)
+            v = self.eval_expr(fv, env)
+            ft = want[fname]
+            if ft == "Bool":
+                v = 1 if v else 0
+            elif ft == "Ptr":
+                v = v.addr if isinstance(v, PtrValue) else 0
+            kwargs[fname] = v
+        try:
+            return cls(**kwargs)
+        except (TypeError, ValueError) as ex:
+            raise RuntimeError_(f"bad struct '{e.name}' literal: {ex}",
+                                line=e.line, col=e.col)
+
+    def struct_field_get(self, obj, field: str, node) -> Any:
+        """Overtake Wave 2: `p.x` on a struct value, converted back
+        to Misa values by declared field type."""
+        import ctypes
+        decl = self.extern_struct_decls.get(obj._misa_name)
+        if decl is None:
+            raise RuntimeError_("cannot access field on struct value",
+                                line=node.line, col=node.col)
+        ftype = next((fte.name for fname, fte in decl.fields
+                      if fname == field), None)
+        if ftype is None:
+            raise RuntimeError_(f"struct '{obj._misa_name}' has no "
+                                f"field '{field}'", line=node.line,
+                                col=node.col)
+        v = getattr(obj, field)
+        if ftype == "Bool":
+            return bool(v)
+        if ftype == "Ptr":
+            return PtrValue(v or 0)
+        return v
 
     def invoke_lambda(self, lam: LambdaValue, args: list, env: Env):
         return self.invoke_lambda_value(lam, args, None)

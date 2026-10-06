@@ -361,6 +361,24 @@ void *misa_as_ptr(MVal *v) {
     return v->u.ptr;
 }
 
+/* Overtake Wave 2 (FFI): C-layout struct values. The payload reuses
+ * the `ptr` union slot: a misa_alloc'd byte buffer holding the raw
+ * struct. The emitter knows each struct's LLVM type and reads fields
+ * via GEP; the runtime only boxes/unboxes the buffer. */
+MVal *misa_struct_new(void *bytes) {
+    MVal *x = val_new(M_TAG_STRUCT);
+    x->u.ptr = bytes;
+    return x;
+}
+
+void *misa_struct_bytes(MVal *v) {
+    if (v->tag != M_TAG_STRUCT) {
+        misa_raise("E200", "expected struct value", 0, 0);
+        return NULL;
+    }
+    return v->u.ptr;
+}
+
 /* ------------------------------------------------------------------ */
 /* inspection                                                         */
 /* ------------------------------------------------------------------ */
@@ -585,6 +603,23 @@ static void render_into(Str *s, MVal *v) {
             }
             break;
         }
+        /* Phase 8 (overtake): interface values render as their
+         * payload (the __fields list's single element), matching the
+         * interpreter. */
+        int64_t idisp_idx = -1, ifields_idx = -1;
+        for (int64_t i = 0; i < v->u.record.len; i++) {
+            if (strcmp(v->u.record.names[i], "__iface_disp") == 0)
+                idisp_idx = i;
+            else if (strcmp(v->u.record.names[i], "__fields") == 0)
+                ifields_idx = i;
+        }
+        if (idisp_idx >= 0 && ifields_idx >= 0) {
+            MVal *fl = v->u.record.vals[ifields_idx];
+            if (fl->tag == M_TAG_LIST && fl->u.list.len > 0) {
+                render_into(s, fl->u.list.items[0]);
+                break;
+            }
+        }
         str_puts(s, "{ ");
         for (int64_t i = 0; i < v->u.record.len; i++) {
             if (i) str_puts(s, ", ");
@@ -774,7 +809,15 @@ MVal *misa_mul(MVal *a, MVal *b, int line, int col) {
 }
 
 MVal *misa_div(MVal *a, MVal *b, int line, int col) {
-    /* Misa `/` is always float division (interpreter parity). */
+    /* Int/Int is truncating integer division (C99/LLVM sdiv semantics),
+       matching the checker (Int/Int -> Int) and the AOT unboxed path.
+       Mixed Int/Float is float division. */
+    if (both_int(a, b)) {
+        int64_t x = a->u.i, y = b->u.i;
+        if (y == 0) { misa_raise("E300", "division by zero", line, col); return NULL; }
+        if (x == INT64_MIN && y == -1) return misa_int(INT64_MIN); /* wraps */
+        return misa_int(x / y);
+    }
     if (!both_num(a, b)) {
         misa_raise("E200", "cannot divide these values", line, col);
         return NULL;
@@ -784,15 +827,14 @@ MVal *misa_div(MVal *a, MVal *b, int line, int col) {
     return misa_float(to_f(a) / d);
 }
 
-/* Python-style floored modulo. */
+/* Truncated modulo (C99/LLVM srem semantics: sign follows dividend),
+   matching the AOT unboxed path. */
 MVal *misa_mod(MVal *a, MVal *b, int line, int col) {
     if (both_int(a, b)) {
         int64_t x = a->u.i, y = b->u.i;
         if (y == 0) { misa_raise("E300", "integer modulo by zero", line, col); return NULL; }
         if (y == -1) return misa_int(0); /* x % -1 == 0; also dodges INT64_MIN/-1 UB */
-        int64_t r = x % y; /* truncated; safe now */
-        if (r != 0 && ((r < 0) != (y < 0))) r += y; /* floor it, Python-style */
-        return misa_int(r);
+        return misa_int(x % y); /* truncated */
     }
     if (both_num(a, b)) {
         double x = to_f(a), y = to_f(b);
@@ -948,6 +990,24 @@ int64_t misa_len(MVal *v, int line, int col) {
 
 int64_t misa_list_len(MVal *l) { return l->u.list.len; }
 MVal *misa_list_get(MVal *l, int64_t i) { return l->u.list.items[i]; }
+
+/* Phase 8 (overtake): wrap each element of a list as an interface
+ * value `{__tag, __fields: [elem], __iface_disp}` with the given impl
+ * tag. Used for [T] -> [I] conversions. */
+MVal *misa_iface_wrap_list(int64_t tag, MVal *l) {
+    MVal *out = val_new(M_TAG_LIST);
+    for (int64_t i = 0; i < l->u.list.len; i++) {
+        MVal *r = val_new(M_TAG_RECORD);
+        misa_record_set_cstr(r, "__tag", misa_int(tag));
+        MVal *fields = val_new(M_TAG_LIST);
+        misa_list_push(fields, l->u.list.items[i]);
+        misa_record_set_cstr(r, "__fields", fields);
+        misa_record_set_cstr(r, "__iface_disp",
+                             misa_text_cstr("__iface_payload"));
+        misa_list_push(out, r);
+    }
+    return out;
+}
 
 /* Phase 5 (stdlib2): struct iteration for misa_json.c. */
 int64_t misa_record_len(MVal *rec) { return rec->u.record.len; }

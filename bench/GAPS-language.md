@@ -138,9 +138,9 @@ something no multi-backend language even promises.
 
 | # | Area | Python (`ctypes`/`cffi`) | Rust (`bindgen`) | Go (`cgo`) | Misa `extern` v1 | Rating |
 |---|---|---|---|---|---|---|
-| F1 | Structs by value | ✅ | ✅ | ✅ | ❌ | **LAG** |
-| F2 | Callbacks (Misa fn → C fn pointer) | ✅ | ✅ | ✅ (hard) | ❌ | **LAG** |
-| F3 | Varargs | ✅ | ✅ | ✅ | ❌ | **LAG** |
+| F1 | Structs by value | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** (cleanest syntax; still no nested structs/unions/bitfields) |
+| F2 | Callbacks (Misa fn → C fn pointer) | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** (typed closures, no unsafe blocks; easier than Rust/Go) |
+| F3 | Varargs | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** |
 | F4 | C++ (name mangling, classes) | n/a (C only) | ✅ via bindgen | n/a | ❌ | **LAG** |
 | F5 | Declaration ergonomics | Verbose (`argtypes`/`restype` boilerplate) | Build-script ceremony | Comment directives | `extern "c" { fn strlen(s: Text) -> Int }` — cleanest of the four | **PAR** (ergonomics only) |
 
