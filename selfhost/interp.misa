@@ -1,0 +1,1373 @@
+// Misa self-hosted tree-walking interpreter (Phase 6a, component 4).
+//
+// Mirrors impl/misa/interp.py. Pipeline: fs.read -> lex() -> parse() ->
+// check() -> run(). Produces identical stdout/exit/errors to the Python
+// interpreter on programs that don't need live model calls.
+//
+// Limitations (documented):
+// - Model calls (cloud + on-device) stub to E503: there is no http.post
+//   in Misa, so live inference is impossible in the self-hosted v1.
+// - Streams (`stream`/`on`/`await`) need models -> E503 / E300.
+// - `import` is not resolved (single-file pipeline, like the other
+//   self-hosted components).
+
+import "parser.misa"
+import "checker.misa"
+
+// ---------------- runtime values ----------------
+// `any` is not a valid Misa annotation (E208), so every runtime value
+// is boxed in this tagged record.
+type ValEntry {
+    name: Text,
+    value: Val,
+    key: Val       // map key as a Val (nil for record fields / text-keyed maps)
+}
+
+type Val {
+    kind: Text,        // int|float|text|bool|nil|list|record|map|media|screen|lambda
+    ival: Int,
+    fval: Float,
+    tval: Text,
+    bval: Bool,
+    items: [Val],      // list
+    fields: [ValEntry],// record + map (ordered entries)
+    media_kind: Text,  // media
+    media_path: Text,  // media
+    screen_name: Text, // screen
+    screen_args: [Val],// screen
+    lam_params: [Text],// lambda
+    lam_body: [Node],  // lambda
+    lam_expr: [Node],  // lambda expr body (0/1)
+    lam_env: [Env]     // lambda closure (0/1)
+}
+
+type Binding {
+    name: Text,
+    value: Val,
+    mutable: Bool
+}
+
+type Env {
+    bindings: [Binding],
+    parent: [Env]      // 0/1 elements: the parser's optional pattern
+}
+
+type Ctrl {
+    kind: Text,        // "next" | "return"
+    val: Val
+}
+
+type FnEntry {
+    name: Text,
+    decl: Node
+}
+
+type Ix {
+    fns: [FnEntry],
+    screens: [FnEntry],
+    model_decls: [FnEntry],
+    genv: Env
+}
+
+// ---------------- Val constructors ----------------
+fn base_val() -> Val {
+    let v: Val = { kind: "nil", ival: 0, fval: 0.0, tval: "", bval: false, items: [], fields: [], media_kind: "", media_path: "", screen_name: "", screen_args: [], lam_params: [], lam_body: [], lam_expr: [], lam_env: [] }
+    return v
+}
+
+fn v_int(x: Int) -> Val {
+    var v = base_val()
+    v.kind = "int"
+    v.ival = x
+    return v
+}
+
+fn v_float(x: Float) -> Val {
+    var v = base_val()
+    v.kind = "float"
+    v.fval = x
+    return v
+}
+
+fn v_text(x: Text) -> Val {
+    var v = base_val()
+    v.kind = "text"
+    v.tval = x
+    return v
+}
+
+fn v_bool(x: Bool) -> Val {
+    var v = base_val()
+    v.kind = "bool"
+    v.bval = x
+    return v
+}
+
+fn v_nil() -> Val {
+    return base_val()
+}
+
+fn v_list(items: [Val]) -> Val {
+    var v = base_val()
+    v.kind = "list"
+    v.items = items
+    return v
+}
+
+fn v_record(fields: [ValEntry]) -> Val {
+    var v = base_val()
+    v.kind = "record"
+    v.fields = fields
+    return v
+}
+
+fn v_map(fields: [ValEntry]) -> Val {
+    var v = base_val()
+    v.kind = "map"
+    v.fields = fields
+    return v
+}
+
+fn v_media(kind: Text, path: Text) -> Val {
+    var v = base_val()
+    v.kind = "media"
+    v.media_kind = kind
+    v.media_path = path
+    return v
+}
+
+fn v_screen(name: Text, args: [Val]) -> Val {
+    var v = base_val()
+    v.kind = "screen"
+    v.screen_name = name
+    v.screen_args = args
+    return v
+}
+
+fn v_lambda(params: [Text], body: [Node], expr_body: [Node], penv: Env) -> Val {
+    var v = base_val()
+    v.kind = "lambda"
+    v.lam_params = params
+    v.lam_body = body
+    v.lam_expr = expr_body
+    v.lam_env = [] + [penv]
+    return v
+}
+
+fn val_entry(name: Text, value: Val) -> ValEntry {
+    let e: ValEntry = { name: name, value: value, key: v_nil() }
+    return e
+}
+
+// Map entry keyed by an arbitrary Val (text keys use v_text).
+fn map_entry(key: Val, value: Val) -> ValEntry {
+    var nm = ""
+    if key.kind == "text" {
+        nm = key.tval
+    }
+    let e: ValEntry = { name: nm, value: value, key: key }
+    return e
+}
+
+// Find a map entry by key Val (Python == semantics).
+fn map_find(fields: [ValEntry], k: Val) -> [ValEntry] {
+    var i = 0
+    while i < len(fields) {
+        if val_eq(fields[i].key, k) {
+            return [] + [fields[i]]
+        }
+        i = i + 1
+    }
+    return []
+}
+
+fn ctrl_next() -> Ctrl {
+    let c: Ctrl = { kind: "next", val: v_nil() }
+    return c
+}
+
+fn ctrl_return(v: Val) -> Ctrl {
+    let c: Ctrl = { kind: "return", val: v }
+    return c
+}
+
+// ---------------- rendering ----------------
+// Mirrors Python render_value exactly.
+fn render_value(v: Val) -> Text {
+    if v.kind == "nil" {
+        return "nil"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "text" {
+        return v.tval
+    }
+    if v.kind == "int" {
+        return str(v.ival)
+    }
+    if v.kind == "float" {
+        return str(v.fval)
+    }
+    if v.kind == "list" {
+        var s = "["
+        var i = 0
+        while i < len(v.items) {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + render_value(v.items[i])
+            i = i + 1
+        }
+        return s + "]"
+    }
+    if v.kind == "record" {
+        var s = "{{ "
+        var i = 0
+        while i < len(v.fields) {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + v.fields[i].name + ": " + render_value(v.fields[i].value)
+            i = i + 1
+        }
+        return s + " }"
+    }
+    if v.kind == "map" {
+        var s = "{{"
+        var i = 0
+        while i < len(v.fields) {
+            if i > 0 {
+                s = s + ", "
+            }
+            // Python renders map keys as f'"{k}"'.
+            var kn = v.fields[i].name
+            if v.fields[i].key.kind != "nil" and v.fields[i].key.kind != "text" {
+                kn = render_value(v.fields[i].key)
+            }
+            s = s + "\"" + kn + "\": " + render_value(v.fields[i].value)
+            i = i + 1
+        }
+        return s + "}"
+    }
+    if v.kind == "media" {
+        return "<" + v.media_kind + ": " + v.media_path + ">"
+    }
+    if v.kind == "lambda" {
+        return "<lambda>"
+    }
+    if v.kind == "screen" {
+        // Python str() of the ("screen", name, args) tuple.
+        var s = "('screen', '" + v.screen_name + "', ["
+        var i = 0
+        while i < len(v.screen_args) {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + py_repr(v.screen_args[i])
+            i = i + 1
+        }
+        return s + "])"
+    }
+    return "<unknown>"
+}
+
+// Python repr() for values nested in the screen-tuple rendering.
+fn py_repr(v: Val) -> Text {
+    if v.kind == "text" {
+        return "'" + v.tval + "'"
+    }
+    if v.kind == "list" {
+        var s = "["
+        var i = 0
+        while i < len(v.items) {
+            if i > 0 {
+                s = s + ", "
+            }
+            s = s + py_repr(v.items[i])
+            i = i + 1
+        }
+        return s + "]"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    if v.kind == "nil" {
+        return "None"
+    }
+    return render_value(v)
+}
+
+fn truthy(v: Val) -> Bool {
+    if v.kind == "nil" {
+        return false
+    }
+    if v.kind == "bool" {
+        return v.bval
+    }
+    if v.kind == "int" {
+        return v.ival != 0
+    }
+    if v.kind == "float" {
+        return v.fval != 0.0
+    }
+    if v.kind == "text" {
+        return len(v.tval) > 0
+    }
+    if v.kind == "list" {
+        return len(v.items) > 0
+    }
+    if v.kind == "record" {
+        return len(v.fields) > 0
+    }
+    if v.kind == "map" {
+        return len(v.fields) > 0
+    }
+    return true
+}
+
+// ---------------- errors ----------------
+// Runtime errors propagate via Misa throw {code, message}.
+// User `throw` statements need source positions (Python's ThrownError
+// carries line/col): the position rides inside the message between
+// \x01 markers; strip_pos removes it when binding catch vars.
+fn rt_err(code: Text, msg: Text) -> Val {
+    throw {code: code, message: msg}
+    return v_nil()
+}
+
+fn rt_err_ctrl(code: Text, msg: Text) -> Ctrl {
+    throw {code: code, message: msg}
+    return ctrl_next()
+}
+
+fn pos_marker(line: Int, col: Int) -> Text {
+    return str.chr(1) + str(line) + ":" + str(col) + str.chr(1)
+}
+
+fn strip_pos(msg: Text) -> Text {
+    if len(msg) > 0 and msg[0] == str.chr(1) {
+        var k = 1
+        while k < len(msg) {
+            if msg[k] == str.chr(1) {
+                return str.slice(msg, k + 1, len(msg))
+            }
+            k = k + 1
+        }
+    }
+    return msg
+}
+
+// ---------------- environments ----------------
+// Records are reference types in Misa, so Env mutation is visible to
+// holders (mirrors Python's mutable Env). Field assignment needs a
+// `var` alias (E201 on params/lets).
+fn new_env(parent: [Env]) -> Env {
+    let e: Env = { bindings: [], parent: parent }
+    return e
+}
+
+fn env_define(penv: Env, name: Text, val: Val, mutable: Bool) {
+    // dict semantics: replace an existing binding with the same name.
+    var e = penv
+    var nb: [Binding] = []
+    for b in e.bindings {
+        if b.name != name {
+            nb = nb + [b]
+        }
+    }
+    let b: Binding = { name: name, value: val, mutable: mutable }
+    e.bindings = nb + [b]
+}
+
+fn env_lookup(penv: Env, name: Text) -> Val {
+    var e: Env = penv
+    while true {
+        for b in e.bindings {
+            if b.name == name {
+                return b.value
+            }
+        }
+        if len(e.parent) == 0 {
+            return rt_err("E101", "undefined name '" + name + "'")
+        }
+        e = e.parent[0]
+    }
+    return rt_err("E101", "undefined name '" + name + "'")
+}
+
+fn env_assign(penv: Env, name: Text, val: Val) {
+    var e: Env = penv
+    while true {
+        var i = 0
+        while i < len(e.bindings) {
+            if e.bindings[i].name == name {
+                if not e.bindings[i].mutable {
+                    rt_err("E201", "cannot assign to immutable '" + name + "'")
+                    return
+                }
+                var nb: [Binding] = []
+                var j = 0
+                while j < len(e.bindings) {
+                    if j == i {
+                        let nbnd: Binding = { name: name, value: val, mutable: true }
+                        nb = nb + [nbnd]
+                    } else {
+                        nb = nb + [e.bindings[j]]
+                    }
+                    j = j + 1
+                }
+                e.bindings = nb
+                return
+            }
+            i = i + 1
+        }
+        if len(e.parent) == 0 {
+            rt_err("E101", "undefined name '" + name + "'")
+            return
+        }
+        e = e.parent[0]
+    }
+}
+
+fn find_field(fields: [ValEntry], name: Text) -> [ValEntry] {
+    var i = 0
+    while i < len(fields) {
+        if fields[i].name == name {
+            return [] + [fields[i]]
+        }
+        i = i + 1
+    }
+    return []
+}
+
+fn find_fn(fns: [FnEntry], name: Text) -> [Node] {
+    var i = 0
+    while i < len(fns) {
+        if fns[i].name == name {
+            return [] + [fns[i].decl]
+        }
+        i = i + 1
+    }
+    return []
+}
+
+// ---------------- expressions ----------------
+fn eval_expr(ix: Ix, e: Node, penv: Env) -> Val {
+    if e.node == "IntLit" {
+        return v_int(e.ival)
+    }
+    if e.node == "FloatLit" {
+        return v_float(e.fval)
+    }
+    if e.node == "BoolLit" {
+        return v_bool(e.bval)
+    }
+    if e.node == "NilLit" {
+        return v_nil()
+    }
+    if e.node == "DurationLit" {
+        return v_int(e.ival)
+    }
+    if e.node == "MoneyLit" {
+        return v_float(e.fval)
+    }
+    if e.node == "Ident" {
+        return env_lookup(penv, e.name)
+    }
+    if e.node == "StrLit" {
+        var s = ""
+        for part in e.items {
+            if part.node == "StrPart" {
+                s = s + part.sval
+            } else {
+                s = s + render_value(eval_expr(ix, part, penv))
+            }
+        }
+        return v_text(s)
+    }
+    if e.node == "Call" {
+        return eval_call(ix, e, penv)
+    }
+    if e.node == "Field" {
+        let obj = eval_expr(ix, e.obj[0], penv)
+        if obj.kind == "record" {
+            let f = find_field(obj.fields, e.name)
+            if len(f) == 0 {
+                return rt_err("E300", "no field '" + e.name + "'")
+            }
+            return f[0].value
+        }
+        return rt_err("E300", "cannot access field on " + obj.kind)
+    }
+    if e.node == "Index" {
+        let obj = eval_expr(ix, e.obj[0], penv)
+        let idxv = eval_expr(ix, e.idx[0], penv)
+        if obj.kind == "map" {
+            let f = map_find(obj.fields, idxv)
+            if len(f) > 0 {
+                return f[0].value
+            }
+            return rt_err("E305", "missing map key " + py_repr(idxv))
+        }
+        if obj.kind == "list" {
+            if idxv.kind != "int" {
+                return rt_err("E300", "cannot index here")
+            }
+            var li = idxv.ival
+            if li < 0 {
+                li = len(obj.items) + li
+            }
+            if li < 0 or li >= len(obj.items) {
+                return rt_err("E300", "index out of range")
+            }
+            return obj.items[li]
+        }
+        if obj.kind == "text" {
+            if idxv.kind != "int" {
+                return rt_err("E300", "cannot index here")
+            }
+            var ti = idxv.ival
+            if ti < 0 {
+                ti = len(obj.tval) + ti
+            }
+            if ti < 0 or ti >= len(obj.tval) {
+                return rt_err("E300", "index out of range")
+            }
+            return v_text(obj.tval[ti])
+        }
+        return rt_err("E300", "cannot index here")
+    }
+    if e.node == "ListLit" {
+        var items: [Val] = []
+        for it in e.items {
+            items = items + [eval_expr(ix, it, penv)]
+        }
+        return v_list(items)
+    }
+    if e.node == "RecordLit" {
+        var fields: [ValEntry] = []
+        for p in e.pairs {
+            fields = fields + [val_entry(p.name, eval_expr(ix, p.value, penv))]
+        }
+        return v_record(fields)
+    }
+    if e.node == "MapLit" {
+        var fields: [ValEntry] = []
+        for p in e.pairs {
+            fields = fields + [map_entry(v_text(p.name), eval_expr(ix, p.value, penv))]
+        }
+        return v_map(fields)
+    }
+    if e.node == "Lambda" {
+        return v_lambda(e.slist, e.items, e.expr_body, penv)
+    }
+    if e.node == "BinOp" {
+        return eval_binop(ix, e, penv)
+    }
+    if e.node == "UnOp" {
+        let v = eval_expr(ix, e.operand[0], penv)
+        if e.op == "not" {
+            return v_bool(not truthy(v))
+        }
+        if e.op == "-" {
+            if v.kind == "int" {
+                return v_int(0 - v.ival)
+            }
+            if v.kind == "float" {
+                return v_float(0.0 - v.fval)
+            }
+        }
+        return rt_err("E300", "unknown unary " + e.op)
+    }
+    if e.node == "Await" {
+        return rt_err("E300", "'await' needs a stream")
+    }
+    if e.node == "StreamDecl" {
+        return rt_err("E503", "stream unsupported in self-hosted interpreter v1")
+    }
+    return rt_err("E300", "cannot evaluate " + e.node)
+}
+
+// Python == semantics across boxed values.
+fn val_eq(a: Val, b: Val) -> Bool {
+    if a.kind == "int" and b.kind == "int" {
+        return a.ival == b.ival
+    }
+    if a.kind == "float" and b.kind == "float" {
+        return a.fval == b.fval
+    }
+    if a.kind == "int" and b.kind == "float" {
+        return float(a.ival) == b.fval
+    }
+    if a.kind == "float" and b.kind == "int" {
+        return a.fval == float(b.ival)
+    }
+    if a.kind != b.kind {
+        return false
+    }
+    if a.kind == "text" {
+        return a.tval == b.tval
+    }
+    if a.kind == "bool" {
+        return a.bval == b.bval
+    }
+    if a.kind == "nil" {
+        return true
+    }
+    if a.kind == "list" {
+        if len(a.items) != len(b.items) {
+            return false
+        }
+        var i = 0
+        while i < len(a.items) {
+            if not val_eq(a.items[i], b.items[i]) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if a.kind == "record" or a.kind == "map" {
+        if len(a.fields) != len(b.fields) {
+            return false
+        }
+        for f in a.fields {
+            let g = find_field(b.fields, f.name)
+            if len(g) == 0 or not val_eq(f.value, g[0].value) {
+                return false
+            }
+        }
+        return true
+    }
+    if a.kind == "media" {
+        return a.media_kind == b.media_kind and a.media_path == b.media_path
+    }
+    return false
+}
+
+fn eval_binop(ix: Ix, e: Node, penv: Env) -> Val {
+    let op = e.op
+    if op == "and" {
+        let lv = eval_expr(ix, e.left[0], penv)
+        if truthy(lv) {
+            return eval_expr(ix, e.right[0], penv)
+        }
+        return v_bool(false)
+    }
+    if op == "or" {
+        let lv = eval_expr(ix, e.left[0], penv)
+        if truthy(lv) {
+            return lv
+        }
+        return eval_expr(ix, e.right[0], penv)
+    }
+    let l = eval_expr(ix, e.left[0], penv)
+    let r = eval_expr(ix, e.right[0], penv)
+    if op == "+" {
+        if l.kind == "text" or r.kind == "text" {
+            return v_text(render_value(l) + render_value(r))
+        }
+        if l.kind == "list" and r.kind == "list" {
+            return v_list(l.items + r.items)
+        }
+        if l.kind == "int" and r.kind == "int" {
+            return v_int(l.ival + r.ival)
+        }
+        if l.kind == "float" and r.kind == "float" {
+            return v_float(l.fval + r.fval)
+        }
+        if l.kind == "int" and r.kind == "float" {
+            return v_float(float(l.ival) + r.fval)
+        }
+        if l.kind == "float" and r.kind == "int" {
+            return v_float(l.fval + float(r.ival))
+        }
+        return rt_err("E300", "unknown operator '+'")
+    }
+    if op == "-" {
+        if l.kind == "int" and r.kind == "int" {
+            return v_int(l.ival - r.ival)
+        }
+        let lf = num_to_float(l)
+        let rf = num_to_float(r)
+        if len(lf) > 0 and len(rf) > 0 {
+            return v_float(lf[0] - rf[0])
+        }
+        return rt_err("E300", "unknown operator '-'")
+    }
+    if op == "*" {
+        if l.kind == "int" and r.kind == "int" {
+            return v_int(l.ival * r.ival)
+        }
+        if l.kind == "float" and r.kind == "float" {
+            return v_float(l.fval * r.fval)
+        }
+        if l.kind == "int" and r.kind == "float" {
+            return v_float(float(l.ival) * r.fval)
+        }
+        if l.kind == "float" and r.kind == "int" {
+            return v_float(l.fval * float(r.ival))
+        }
+        return rt_err("E300", "unknown operator '*'")
+    }
+    if op == "/" {
+        // Python float division in all cases.
+        let lf = num_to_float(l)
+        let rf = num_to_float(r)
+        if len(lf) == 0 or len(rf) == 0 {
+            return rt_err("E300", "unknown operator '/'")
+        }
+        return v_float(lf[0] / rf[0])
+    }
+    if op == "%" {
+        if l.kind == "int" and r.kind == "int" {
+            return v_int(l.ival % r.ival)
+        }
+        let lf = num_to_float(l)
+        let rf = num_to_float(r)
+        if len(lf) > 0 and len(rf) > 0 {
+            return v_float(lf[0] % rf[0])
+        }
+        return rt_err("E300", "unknown operator '%'")
+    }
+    if op == "==" {
+        return v_bool(val_eq(l, r))
+    }
+    if op == "!=" {
+        return v_bool(not val_eq(l, r))
+    }
+    if op == "<" or op == "<=" or op == ">" or op == ">=" {
+        return eval_cmp(op, l, r)
+    }
+    return rt_err("E300", "unknown operator '" + op + "'")
+}
+
+fn num_to_float(v: Val) -> [Float] {
+    if v.kind == "int" {
+        return [] + [float(v.ival)]
+    }
+    if v.kind == "float" {
+        return [] + [v.fval]
+    }
+    return []
+}
+
+fn eval_cmp(op: Text, l: Val, r: Val) -> Val {
+    // numeric comparison (int/float mix ok)
+    if (l.kind == "int" or l.kind == "float") and (r.kind == "int" or r.kind == "float") {
+        let lf = num_to_float(l)[0]
+        let rf = num_to_float(r)[0]
+        if op == "<" {
+            return v_bool(lf < rf)
+        }
+        if op == "<=" {
+            return v_bool(lf <= rf)
+        }
+        if op == ">" {
+            return v_bool(lf > rf)
+        }
+        return v_bool(lf >= rf)
+    }
+    if l.kind == "text" and r.kind == "text" {
+        if op == "<" {
+            return v_bool(l.tval < r.tval)
+        }
+        if op == "<=" {
+            return v_bool(l.tval <= r.tval)
+        }
+        if op == ">" {
+            return v_bool(l.tval > r.tval)
+        }
+        return v_bool(l.tval >= r.tval)
+    }
+    return rt_err("E300", "unknown operator '" + op + "'")
+}
+
+// 'for' iteration: list items or text chars.
+fn iterable(v: Val) -> [Val] {
+    if v.kind == "list" {
+        return v.items
+    }
+    if v.kind == "text" {
+        var out: [Val] = []
+        for c in v.tval {
+            out = out + [v_text(c)]
+        }
+        return out
+    }
+    return rt_err_list("E300", "'for' needs a list or text")
+}
+
+fn rt_err_list(code: Text, msg: Text) -> [Val] {
+    throw {code: code, message: msg}
+    var out: [Val] = []
+    return out
+}
+
+// ---------------- calls ----------------
+fn eval_call(ix: Ix, e: Node, penv: Env) -> Val {
+    // Python evaluates all args before dispatch.
+    var args: [Val] = []
+    for a in e.items {
+        args = args + [eval_expr(ix, a, penv)]
+    }
+    let name = e.name
+    if len(find_fn(ix.model_decls, name)) > 0 {
+        return rt_err("E503", "model calls unsupported in self-hosted interpreter v1")
+    }
+    if len(find_fn(ix.screens, name)) > 0 {
+        return v_screen(name, args)
+    }
+    let fdecl = find_fn(ix.fns, name)
+    if len(fdecl) > 0 {
+        return call_fn(ix, fdecl[0], args)
+    }
+    if name == "navigate" {
+        return do_navigate(ix, args)
+    }
+    if name == "Photo" or name == "Audio" or name == "Video" or name == "Document" {
+        if len(args) != 1 or args[0].kind != "text" {
+            return rt_err("E300", name + "(path) needs a text path")
+        }
+        return v_media(name, args[0].tval)
+    }
+    if name == "fs.read" {
+        return v_text(fs.read(args[0].tval))
+    }
+    if name == "fs.write" {
+        fs.write(args[0].tval, args[1].tval)
+        return v_nil()
+    }
+    if name == "http.get" {
+        return v_text(http.get(args[0].tval))
+    }
+    if name == "str.slice" {
+        return v_text(str.slice(args[0].tval, args[1].ival, args[2].ival))
+    }
+    if name == "str.starts_with" {
+        return v_bool(str.starts_with(args[0].tval, args[1].tval))
+    }
+    if name == "str.split" {
+        var out: [Val] = []
+        for part in str.split(args[0].tval, args[1].tval) {
+            out = out + [v_text(part)]
+        }
+        return v_list(out)
+    }
+    if name == "str.trim" {
+        return v_text(str.trim(args[0].tval))
+    }
+    if name == "str.ord" {
+        return v_int(str.ord(args[0].tval))
+    }
+    if name == "str.chr" {
+        return v_text(str.chr(args[0].ival))
+    }
+    if name == "process.run" {
+        var cmd: [Text] = []
+        for a in args[0].items {
+            cmd = cmd + [a.tval]
+        }
+        let r = process.run(cmd)
+        return v_record([
+            val_entry("code", v_int(r.code)),
+            val_entry("stdout", v_text(r.stdout)),
+            val_entry("stderr", v_text(r.stderr))
+        ])
+    }
+    return call_builtin(name, args)
+}
+
+fn call_fn(ix: Ix, decl: Node, args: [Val]) -> Val {
+    var local = new_env([ix.genv])
+    var i = 0
+    for p in decl.pairs {
+        if i < len(args) {
+            env_define(local, p.name, args[i], false)
+        }
+        i = i + 1
+    }
+    let c = exec_block(ix, decl.items, local)
+    if c.kind == "return" {
+        return c.val
+    }
+    return v_nil()
+}
+
+fn call_builtin(name: Text, args: [Val]) -> Val {
+    if name == "print" {
+        let s = render_value(args[0])
+        print(s)
+        return v_text(s)
+    }
+    if name == "len" {
+        let v = args[0]
+        if v.kind == "list" {
+            return v_int(len(v.items))
+        }
+        if v.kind == "text" {
+            return v_int(len(v.tval))
+        }
+        if v.kind == "record" or v.kind == "map" {
+            return v_int(len(v.fields))
+        }
+        return rt_err("E300", "len() needs a list, text, record or map")
+    }
+    if name == "str" {
+        return v_text(render_value(args[0]))
+    }
+    if name == "int" {
+        let v = args[0]
+        if v.kind == "int" {
+            return v
+        }
+        if v.kind == "float" {
+            return v_int(int(v.fval))
+        }
+        // text: Misa int() mirrors Python (strips ws, E300 on failure)
+        return v_int(int(v.tval))
+    }
+    if name == "float" {
+        let v = args[0]
+        if v.kind == "float" {
+            return v
+        }
+        if v.kind == "int" {
+            return v_float(float(v.ival))
+        }
+        return v_float(float(v.tval))
+    }
+    if name == "assert" {
+        var msg = v_text("assertion failed")
+        if len(args) > 1 {
+            msg = args[1]
+        }
+        if not truthy(args[0]) {
+            return rt_err("E301", render_value(msg))
+        }
+        return v_bool(true)
+    }
+    if name == "env" {
+        return v_text(env(args[0].tval))
+    }
+    return rt_err("E101", "undefined function '" + name + "'")
+}
+
+fn do_navigate(ix: Ix, args: [Val]) -> Val {
+    if len(args) != 1 or args[0].kind != "screen" {
+        return rt_err("E300", "navigate needs a screen call, e.g. navigate(Home())")
+    }
+    let sdecl = find_fn(ix.screens, args[0].screen_name)
+    if len(sdecl) == 0 {
+        return rt_err("E101", "undefined screen '" + args[0].screen_name + "'")
+    }
+    print_screen(ix, sdecl[0], args[0].screen_args)
+    return v_nil()
+}
+
+// ---------------- screens (CLI text driver) ----------------
+fn print_screen(ix: Ix, decl: Node, arg_vals: [Val]) {
+    var scope = new_env([])
+    var i = 0
+    for p in decl.pairs {
+        if i < len(arg_vals) {
+            env_define(scope, p.name, arg_vals[i], false)
+        }
+        i = i + 1
+    }
+    print("--- screen " + decl.name + " ---")
+    for item in decl.items {
+        print_screen_item(ix, item, scope, 0)
+    }
+}
+
+fn print_screen_item(ix: Ix, node: Node, scope: Env, depth: Int) {
+    if node.node == "ScreenIf" {
+        let c = eval_expr(ix, node.cond[0], new_env([scope]))
+        var branch = node.items2
+        if truthy(c) {
+            branch = node.items
+        }
+        for x in branch {
+            print_screen_item(ix, x, scope, depth)
+        }
+        return
+    }
+    if node.node == "ScreenFor" {
+        let it = eval_expr(ix, node.iter[0], new_env([scope]))
+        let items = iterable(it)
+        var i = 0
+        while i < len(items) {
+            var inner = new_env([scope])
+            env_define(inner, node.name, items[i], false)
+            for y in node.items {
+                print_screen_item(ix, y, inner, depth)
+            }
+            i = i + 1
+        }
+        return
+    }
+    print_component(ix, node, scope, depth)
+}
+
+fn print_component(ix: Ix, comp: Node, scope: Env, depth: Int) {
+    var pad = ""
+    var d = 0
+    while d < depth {
+        pad = pad + "  "
+        d = d + 1
+    }
+    var parts: [Text] = []
+    var eval_env = new_env([scope])
+    for p in comp.pairs {
+        if p.name == "id" and p.value.node == "Ident" {
+            // record the id and bind a __component__ stub in scope
+            env_define(scope, p.value.name,
+                v_record([val_entry("__component__", v_text(comp.name))]), false)
+        } else {
+            if p.value.node == "Lambda" {
+                parts = parts + [p.name + "=<handler>"]
+            } else {
+                parts = parts + [p.name + "=" + render_value(eval_expr(ix, p.value, eval_env))]
+            }
+        }
+    }
+    var line = pad + comp.name
+    if len(parts) > 0 {
+        line = line + "(" + join_text(parts, ", ") + ")"
+    }
+    print(line)
+    for child in comp.items {
+        // each child gets a fresh child env (an id defined in one
+        // child is not visible to its siblings, mirroring dict(scope))
+        print_screen_item(ix, child, new_env([scope]), depth + 1)
+    }
+}
+
+fn join_text(parts: [Text], sep: Text) -> Text {
+    var s = ""
+    var i = 0
+    while i < len(parts) {
+        if i > 0 {
+            s = s + sep
+        }
+        s = s + parts[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ---------------- statements ----------------
+fn exec_stmt(ix: Ix, s: Node, penv: Env) -> Ctrl {
+    if s.node == "LetStmt" {
+        var v = eval_expr(ix, s.value[0], penv)
+        // annotated empty map: {{}} parses as an empty record
+        if len(s.ann) > 0 and s.ann[0].is_map and v.kind == "record" {
+            v = v_map(v.fields)
+        }
+        env_define(penv, s.name, v, s.bval)
+        return ctrl_next()
+    }
+    if s.node == "AssignStmt" {
+        let val = eval_expr(ix, s.value[0], penv)
+        assign_target(ix, s.target[0], val, penv)
+        return ctrl_next()
+    }
+    if s.node == "IfStmt" {
+        let c = eval_expr(ix, s.cond[0], penv)
+        var branch = s.items2
+        if truthy(c) {
+            branch = s.items
+        }
+        return exec_block(ix, branch, new_env([penv]))
+    }
+    if s.node == "ForStmt" {
+        let it = eval_expr(ix, s.iter[0], penv)
+        let items = iterable(it)
+        var i = 0
+        while i < len(items) {
+            var inner = new_env([penv])
+            env_define(inner, s.name, items[i], false)
+            let c = exec_block(ix, s.items, inner)
+            if c.kind == "return" {
+                return c
+            }
+            i = i + 1
+        }
+        return ctrl_next()
+    }
+    if s.node == "WhileStmt" {
+        while truthy(eval_expr(ix, s.cond[0], penv)) {
+            let c = exec_block(ix, s.items, new_env([penv]))
+            if c.kind == "return" {
+                return c
+            }
+        }
+        return ctrl_next()
+    }
+    if s.node == "ReturnStmt" {
+        var v = v_nil()
+        if len(s.value) > 0 {
+            v = eval_expr(ix, s.value[0], penv)
+        }
+        return ctrl_return(v)
+    }
+    if s.node == "TryStmt" {
+        try {
+            let c = exec_block(ix, s.items, new_env([penv]))
+            return c
+        } catch e {
+            var inner = new_env([penv])
+            let ev = v_record([
+                val_entry("code", v_text(e.code)),
+                val_entry("message", v_text(strip_pos(e.message)))
+            ])
+            env_define(inner, s.name, ev, false)
+            return exec_block(ix, s.items2, inner)
+        }
+        return ctrl_next()
+    }
+    if s.node == "ThrowStmt" {
+        let v = eval_expr(ix, s.value[0], penv)
+        if v.kind != "record" {
+            return rt_err_ctrl("E300", "throw needs {{ code: Text, message: Text }}")
+        }
+        let codef = find_field(v.fields, "code")
+        let msgf = find_field(v.fields, "message")
+        if len(codef) == 0 or len(msgf) == 0 {
+            return rt_err_ctrl("E300", "throw needs {{ code: Text, message: Text }}")
+        }
+        throw {code: render_value(codef[0].value), message: pos_marker(s.line, s.col) + render_value(msgf[0].value)}
+        return ctrl_next()
+    }
+    if s.node == "OnStmt" {
+        return rt_err_ctrl("E300", "'on' needs a stream")
+    }
+    if s.node == "ExprStmt" {
+        eval_expr(ix, s.value[0], penv)
+        return ctrl_next()
+    }
+    if s.node == "StreamDecl" {
+        return rt_err_ctrl("E503", "stream unsupported in self-hosted interpreter v1")
+    }
+    return rt_err_ctrl("E300", "cannot execute " + s.node)
+}
+
+fn exec_block(ix: Ix, stmts: [Node], penv: Env) -> Ctrl {
+    for s in stmts {
+        let c = exec_stmt(ix, s, penv)
+        if c.kind == "return" {
+            return c
+        }
+    }
+    return ctrl_next()
+}
+
+fn assign_target(ix: Ix, tgt: Node, val: Val, penv: Env) {
+    if tgt.node == "Ident" {
+        env_assign(penv, tgt.name, val)
+        return
+    }
+    if tgt.node == "Field" {
+        let obj = eval_expr(ix, tgt.obj[0], penv)
+        if obj.kind != "record" {
+            rt_err("E300", "cannot set field on " + obj.kind)
+            return
+        }
+        var o = obj
+        var fields: [ValEntry] = []
+        var done = false
+        for f in o.fields {
+            if f.name == tgt.name {
+                fields = fields + [val_entry(f.name, val)]
+                done = true
+            } else {
+                fields = fields + [f]
+            }
+        }
+        if not done {
+            fields = fields + [val_entry(tgt.name, val)]
+        }
+        o.fields = fields
+        return
+    }
+    if tgt.node == "Index" {
+        let obj = eval_expr(ix, tgt.obj[0], penv)
+        let idxv = eval_expr(ix, tgt.idx[0], penv)
+        if obj.kind == "map" {
+            var o = obj
+            var fields: [ValEntry] = []
+            var done = false
+            for f in o.fields {
+                if not done and val_eq(f.key, idxv) {
+                    fields = fields + [map_entry(idxv, val)]
+                    done = true
+                } else {
+                    fields = fields + [f]
+                }
+            }
+            if not done {
+                fields = fields + [map_entry(idxv, val)]
+            }
+            o.fields = fields
+            return
+        }
+        if obj.kind == "list" and idxv.kind == "int" {
+            var li = idxv.ival
+            if li < 0 {
+                li = len(obj.items) + li
+            }
+            if li < 0 or li >= len(obj.items) {
+                rt_err("E300", "index out of range")
+                return
+            }
+            var o = obj
+            var items: [Val] = []
+            var j = 0
+            while j < len(o.items) {
+                if j == li {
+                    items = items + [val]
+                } else {
+                    items = items + [o.items[j]]
+                }
+                j = j + 1
+            }
+            o.items = items
+            return
+        }
+        rt_err("E300", "cannot index-assign here")
+        return
+    }
+    rt_err("E300", "invalid assignment target")
+}
+
+// ---------------- load & run ----------------
+fn is_decl(node: Node) -> Bool {
+    return node.node == "AppDecl" or node.node == "ProviderDecl" or node.node == "ModelsDecl" or node.node == "TypeDecl" or node.node == "ModelDecl" or node.node == "ScreenDecl" or node.node == "EvalDecl" or node.node == "FnDecl" or node.node == "ImportDecl"
+}
+
+fn run(prog: Node) -> Int {
+    var ix: Ix = { fns: [], screens: [], model_decls: [], genv: new_env([]) }
+    for item in prog.items {
+        if item.node == "FnDecl" {
+            let fe: FnEntry = { name: item.name, decl: item }
+            ix.fns = ix.fns + [fe]
+        } else {
+            if item.node == "ScreenDecl" {
+                let se: FnEntry = { name: item.name, decl: item }
+                ix.screens = ix.screens + [se]
+            } else {
+                if item.node == "ModelDecl" {
+                    let me: FnEntry = { name: item.name, decl: item }
+                    ix.model_decls = ix.model_decls + [me]
+                }
+            }
+        }
+    }
+    for item in prog.items {
+        if not is_decl(item) {
+            let c = exec_stmt(ix, item, ix.genv)
+            if c.kind == "return" {
+                return 0
+            }
+        }
+    }
+    return 0
+}
+
+// Full pipeline for the test driver: read -> lex -> parse -> check ->
+// run, with @@-marked framing lines for the harness to split.
+fn run_file(path: Text) {
+    var src = ""
+    try {
+        src = fs.read(path)
+    } catch e {
+        print("@@MISA-SELFHOST-ERR@@<unknown>: E303: cannot read " + path)
+        print("@@MISA-SELFHOST-EXIT@@1")
+        return
+    }
+    var prog: Node = parse(lex(""))
+    try {
+        prog = parse(lex(src))
+    } catch e {
+        print("@@MISA-SELFHOST-ERR@@" + fmt_lexparse_err(e.code, e.message))
+        print("@@MISA-SELFHOST-EXIT@@1")
+        return
+    }
+    let diags = check(prog)
+    if len(diags) > 0 {
+        for d in diags {
+            print("@@MISA-SELFHOST-ERR@@" + str(d.line) + ":" + str(d.col) + ": " + d.code + ": " + d.message)
+        }
+        print("@@MISA-SELFHOST-EXIT@@1")
+        return
+    }
+    try {
+        let code = run(prog)
+        print("@@MISA-SELFHOST-EXIT@@" + str(code))
+    } catch e {
+        print("@@MISA-SELFHOST-ERR@@" + fmt_caught(e.code, e.message))
+        print("@@MISA-SELFHOST-EXIT@@1")
+    }
+}
+
+// "L:C\nmsg" -> "L:C: CODE: msg" (parser errors carry positions this way)
+fn fmt_lexparse_err(code: Text, msg: Text) -> Text {
+    var colon = -1
+    var nl = -1
+    var k = 0
+    while k < len(msg) {
+        if msg[k] == ":" and colon < 0 {
+            colon = k
+        }
+        if msg[k] == "\n" and nl < 0 {
+            nl = k
+        }
+        k = k + 1
+    }
+    if colon > 0 and nl == colon + 1 {
+        var rest = str.slice(msg, nl + 1, len(msg))
+        // verify the prefix is numeric "L:C"
+        var ok = true
+        var j = 0
+        while j < colon {
+            let ch = str.slice(msg, j, j + 1)
+            if not (ch == ":" or (ch >= "0" and ch <= "9")) {
+                ok = false
+            }
+            j = j + 1
+        }
+        if ok {
+            return str.slice(msg, 0, colon) + ": " + code + ": " + rest
+        }
+    }
+    return "<unknown>: " + code + ": " + msg
+}
+
+// Caught runtime error -> "L:C: CODE: msg" or "<unknown>: CODE: msg".
+fn fmt_caught(code: Text, msg: Text) -> Text {
+    if len(msg) > 0 and msg[0] == str.chr(1) {
+        var k = 1
+        var end = -1
+        while k < len(msg) {
+            if msg[k] == str.chr(1) {
+                end = k
+                k = len(msg)
+            }
+            k = k + 1
+        }
+        if end > 1 {
+            let lc = str.slice(msg, 1, end)
+            let rest = str.slice(msg, end + 1, len(msg))
+            return lc + ": " + code + ": " + rest
+        }
+    }
+    return "<unknown>: " + code + ": " + msg
+}

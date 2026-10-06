@@ -46,7 +46,7 @@ type StrTab {
 type Cx {
     errors: [Diag],
     types: StrTab,
-    models: StrTab,
+    model_tab: StrTab,
     providers: StrTab,
     screens: StrTab,
     evals: StrTab,
@@ -84,7 +84,7 @@ fn empty_tab() -> StrTab {
 }
 
 fn make_cx() -> Cx {
-    let c: Cx = { errors: [], types: empty_tab(), models: empty_tab(), providers: empty_tab(), screens: empty_tab(), evals: empty_tab(), fns: empty_tab(), alias_names: [], alias_provs: [], alias_mids: [], app_seen: false, has_idk: false, idk_names: [], idk_kinds: [] }
+    let c: Cx = { errors: [], types: empty_tab(), model_tab: empty_tab(), providers: empty_tab(), screens: empty_tab(), evals: empty_tab(), fns: empty_tab(), alias_names: [], alias_provs: [], alias_mids: [], app_seen: false, has_idk: false, idk_names: [], idk_kinds: [] }
     return c
 }
 
@@ -241,10 +241,11 @@ fn builtin_arity_ok(name: Text, n: Int) -> Bool {
 }
 
 fn builtin_arity_text(name: Text) -> Text {
+    // Python always formats as "{lo}-{hi}"
     if name == "assert" {
         return "1-2"
     }
-    return "1"
+    return "1-1"
 }
 
 fn is_ns_builtin(name: Text) -> Bool {
@@ -382,7 +383,7 @@ fn assignable(want: Text, got: Text) -> Bool {
     if want == "Float" and got == "Int" {
         return true
     }
-    if str.starts_with(want, "") and len(want) > 0 and want[len(want) - 1] == "?" {
+    if len(want) > 1 and want[len(want) - 1] == "?" {
         let base = str.slice(want, 0, len(want) - 1)
         if got == "nil" {
             return true
@@ -391,7 +392,7 @@ fn assignable(want: Text, got: Text) -> Bool {
             return true
         }
     }
-    if got == "[unknown]" and str.starts_with(want, "[") and len(want) > 0 and want[len(want) - 1] == "]" {
+    if got == "[unknown]" and len(want) >= 2 and want[0] == "[" and want[len(want) - 1] == "]" {
         return true
     }
     return false
@@ -425,13 +426,24 @@ fn map_val_type(map_t: Text) -> Text {
 // ---------------- entry point ----------------
 
 fn check(prog: Node) -> [Diag] {
+    // imports cannot be resolved from a source string (mirrors
+    // check_source: return the single E112 immediately)
+    var i = 0
+    while i < len(prog.items) {
+        if prog.items[i].node == "ImportDecl" {
+            return [make_diag("E112", "cannot resolve import '" + prog.items[i].sval + "' from a source string", prog.items[i].line, prog.items[i].col)]
+        }
+        i = i + 1
+    }
     var cx = make_cx()
     cx = collect(cx, prog)
     var scope: [ScopeEntry] = []
-    var i = 0
-    while i < len(prog.items) {
-        cx = check_item(cx, prog.items[i], scope)
-        i = i + 1
+    var j = 0
+    while j < len(prog.items) {
+        let r = check_item(cx, prog.items[j], scope)
+        cx = r.cx
+        scope = r.scope
+        j = j + 1
     }
     return cx.errors
 }
@@ -501,7 +513,7 @@ fn dup_put(cx: Cx, kind: Text, item: Node) -> Cx {
         tab = c.providers
     } else {
         if kind == "model" {
-            tab = c.models
+            tab = c.model_tab
         } else {
             if kind == "screen" {
                 tab = c.screens
@@ -524,7 +536,7 @@ fn dup_put(cx: Cx, kind: Text, item: Node) -> Cx {
         c.providers = tab
     } else {
         if kind == "model" {
-            c.models = tab
+            c.model_tab = tab
         } else {
             if kind == "screen" {
                 c.screens = tab
@@ -546,8 +558,9 @@ fn dup_put(cx: Cx, kind: Text, item: Node) -> Cx {
 
 // ---------------- items ----------------
 
-fn check_item(cx: Cx, item: Node, scope: [ScopeEntry]) -> Cx {
+fn check_item(cx: Cx, item: Node, scope: [ScopeEntry]) -> StmtRes {
     var c = cx
+    var sc = scope
     if item.node == "ModelDecl" {
         c = check_model(c, item)
     } else {
@@ -563,34 +576,27 @@ fn check_item(cx: Cx, item: Node, scope: [ScopeEntry]) -> Cx {
                     if item.node == "AppDecl" or item.node == "ProviderDecl" or item.node == "ModelsDecl" or item.node == "TypeDecl" or item.node == "ImportDecl" {
                         // nothing to check
                     } else {
-                        var blk: [Node] = [] + [item]
-                        let r = check_block(c, blk, scope, [], false)
+                        // bare top-level statement: check in global scope
+                        let r = check_stmt(c, item, sc, [])
                         c = r.cx
+                        sc = r.scope
                     }
                 }
             }
         }
     }
-    return c
+    return make_stmtres(c, sc)
 }
 
-// block result: updated cx
-type BlkRes {
-    cx: Cx
-}
+// (BlkRes removed; check_block_sc returns StmtRes)
 
-fn make_blkres(cx: Cx) -> BlkRes {
-    let r: BlkRes = { cx: cx }
-    return r
-}
-
-fn check_fn(cx: Cx, fn: Node) -> Cx {
+fn check_fn(cx: Cx, fdecl: Node) -> Cx {
     var c = cx
     var seen: [Text] = []
     var scope: [ScopeEntry] = []
     var i = 0
-    while i < len(fn.pairs) {
-        let p = fn.pairs[i]
+    while i < len(fdecl.pairs) {
+        let p = fdecl.pairs[i]
         var dup = false
         var j = 0
         while j < len(seen) {
@@ -611,17 +617,17 @@ fn check_fn(cx: Cx, fn: Node) -> Cx {
     }
     var ret_name = "Void"
     var has_ret = false
-    if len(fn.ret) > 0 {
+    if len(fdecl.ret) > 0 {
         has_ret = true
-        ret_name = tname(fn.ret)
-        if not known_type(c, fn.ret) {
-            c = cx_err(c, "E208", "unknown type '" + tname(fn.ret) + "'", fn.ret[0].line, fn.ret[0].col)
+        ret_name = tname(fdecl.ret)
+        if not known_type(c, fdecl.ret) {
+            c = cx_err(c, "E208", "unknown type '" + tname(fdecl.ret) + "'", fdecl.ret[0].line, fdecl.ret[0].col)
         }
     }
-    let br = check_block_sc(c, fn.items, scope, [] + [ret_name])
+    let br = check_block_sc(c, fdecl.items, scope, [] + [ret_name])
     c = br.cx
-    if ret_name != "Void" and not block_returns(fn.items) {
-        c = cx_err(c, "E211", "function '" + fn.name + "' may exit without returning " + ret_name, fn.line, fn.col)
+    if ret_name != "Void" and not block_returns(fdecl.items) {
+        c = cx_err(c, "E211", "function '" + fdecl.name + "' may exit without returning " + ret_name, fdecl.line, fdecl.col)
     }
     return c
 }
@@ -843,7 +849,7 @@ fn check_handler_body(cx: Cx, lam: Node, scope: [ScopeEntry]) -> Cx {
         let ir = infer(c, lam.expr_body[0], hscope)
         c = ir.cx
     } else {
-        let br = check_block(c, lam.items, hscope, [], false)
+        let br = check_block_sc(c, lam.items, hscope, [])
         c = br.cx
     }
     return c
@@ -851,7 +857,7 @@ fn check_handler_body(cx: Cx, lam: Node, scope: [ScopeEntry]) -> Cx {
 
 fn check_eval(cx: Cx, e: Node) -> Cx {
     var c = cx
-    let mv = tab_get(c.models, e.model_name)
+    let mv = tab_get(c.model_tab, e.model_name)
     if len(mv) == 0 {
         c = cx_err(c, "E101", "unknown model '" + e.model_name + "'", e.line, e.col)
         return c
@@ -939,18 +945,7 @@ fn text_list_str(xs: [Text]) -> Text {
 // ---------------- statements ----------------
 
 // fn_ret: [Text] — 0 elements = not in a function, else [return type name]
-fn check_block(cx: Cx, stmts: [Node], scope: [ScopeEntry], fn_ret: [Text]) -> BlkRes {
-    var c = cx
-    var sc = scope
-    var i = 0
-    while i < len(stmts) {
-        let r = check_stmt(c, stmts[i], sc, fn_ret)
-        c = r.cx
-        sc = r.scope
-        i = i + 1
-    }
-    return make_blkres2(c, sc)
-}
+// check_block_sc threads the scope (let bindings persist)
 
 type StmtRes {
     cx: Cx,
@@ -967,11 +962,7 @@ fn make_boolres(cx: Cx, ok: Bool) -> BoolRes {
     return r
 }
 
-fn make_blkres2(cx: Cx, scope: [ScopeEntry]) -> BlkRes {
-    // check_block returns BlkRes; scope is threaded via StmtRes inside
-    let r: BlkRes = { cx: cx }
-    return r
-}
+// (make_blkres2 removed; check_block_sc returns StmtRes directly)
 
 fn make_stmtres(cx: Cx, scope: [ScopeEntry]) -> StmtRes {
     let r: StmtRes = { cx: cx, scope: scope }
@@ -1039,7 +1030,7 @@ fn check_stmt(cx: Cx, s: Node, scope: [ScopeEntry], fn_ret: [Text]) -> StmtRes {
                                     let ev = is_error_value(c, s.value[0], sc)
                                     c = ev.cx
                                     if not ev.ok {
-                                        c = cx_err(c, "E212", "'throw' needs an Error ({{ code: Text, message: Text }})", s.line, s.col)
+                                        c = cx_err(c, "E212", "'throw' needs an Error ({{ code: Text, message: Text })", s.line, s.col)
                                     }
                                 } else {
                                     if s.node == "OnStmt" {
@@ -1175,7 +1166,7 @@ fn check_return(cx: Cx, s: Node, scope: [ScopeEntry], fn_ret: [Text]) -> Cx {
 
 fn check_stream_decl(cx: Cx, s: Node, scope: [ScopeEntry]) -> Cx {
     var c = cx
-    if len(s.call) > 0 and s.call[0].node == "Call" and tab_has(c.models, s.call[0].name) {
+    if len(s.call) > 0 and s.call[0].node == "Call" and tab_has(c.model_tab, s.call[0].name) {
         c = check_model_call(c, s.call[0], scope)
     } else {
         c = cx_err(c, "E205", "'stream' must wrap a model call", s.line, s.col)
@@ -1541,7 +1532,7 @@ fn infer_ident(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
     }
     let f = scope_find(scope, e.name)
     if len(f) == 0 {
-        if tab_has(c.models, e.name) or tab_has(c.screens, e.name) {
+        if tab_has(c.model_tab, e.name) or tab_has(c.screens, e.name) {
             return make_infres(c, "unknown")
         }
         c = cx_err(c, "E101", "undefined name '" + e.name + "'", e.line, e.col)
@@ -1619,9 +1610,9 @@ fn infer_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
         arg_ts = arg_ts + [ar.t]
         i = i + 1
     }
-    if tab_has(c.models, e.name) {
+    if tab_has(c.model_tab, e.name) {
         c = check_model_call(c, e, scope)
-        let mv = tab_get(c.models, e.name)
+        let mv = tab_get(c.model_tab, e.name)
         return make_infres(c, tname(mv[0].ret))
     }
     if tab_has(c.screens, e.name) {
@@ -1634,23 +1625,23 @@ fn infer_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
     }
     if tab_has(c.fns, e.name) {
         let fv = tab_get(c.fns, e.name)
-        let fn = fv[0]
-        let want2 = len(fn.pairs)
+        let fdecl = fv[0]
+        let want2 = len(fdecl.pairs)
         if len(e.items) != want2 {
             c = cx_err(c, "E102", "function '" + e.name + "' takes " + str(want2) + " args, got " + str(len(e.items)), e.line, e.col)
         } else {
             var j = 0
             while j < want2 {
-                let want_t = tname([] + [fn.pairs[j].value])
+                let want_t = tname([] + [fdecl.pairs[j].value])
                 let at = arg_ts[j]
                 if at != "unknown" and not assignable(want_t, at) {
-                    c = cx_err(c, "E211", "argument '" + fn.pairs[j].name + "' wants " + want_t + ", got " + at, e.items[j].line, e.items[j].col)
+                    c = cx_err(c, "E211", "argument '" + fdecl.pairs[j].name + "' wants " + want_t + ", got " + at, e.items[j].line, e.items[j].col)
                 }
                 j = j + 1
             }
         }
-        if len(fn.ret) > 0 {
-            return make_infres(c, tname(fn.ret))
+        if len(fdecl.ret) > 0 {
+            return make_infres(c, tname(fdecl.ret))
         }
         return make_infres(c, "Void")
     }
@@ -1694,7 +1685,7 @@ fn infer_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
 
 fn check_model_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> Cx {
     var c = cx
-    let mv = tab_get(c.models, e.name)
+    let mv = tab_get(c.model_tab, e.name)
     if len(mv) == 0 {
         return c
     }
