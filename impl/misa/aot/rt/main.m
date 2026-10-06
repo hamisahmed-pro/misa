@@ -9,6 +9,7 @@
  * No storyboard: the UI is 100% programmatic via the driver.
  */
 #import <UIKit/UIKit.h>
+#import <os/log.h>
 
 #import "misa_rt.h"   /* misa_rt_init() */
 #import "misa_ui.h"   /* misa_ui_create(), misa_ui_active() */
@@ -38,12 +39,18 @@ void misa_ui_set_root_view(MisaUI *ui, void *rootView);
     [self.window makeKeyAndVisible];
 
     /* Create the UIKit driver BEFORE any Misa code runs: generated
-     * screen/handler code reaches the driver via misa_ui_active(). */
-    MisaUI *ui = misa_ui_create();
+     * screen/handler code reaches the driver via misa_ui_active().
+     * Use misa_ui_active() (the global) — NOT a separate instance —
+     * so the root view lands on the same driver the screens use. */
+    os_log(OS_LOG_DEFAULT, "misa: didFinishLaunching, creating UI driver");
+    MisaUI *ui = misa_ui_active();
     misa_ui_set_root_view(ui, (__bridge void *)root.view);
 
+    os_log(OS_LOG_DEFAULT, "misa: calling misa_rt_init");
     misa_rt_init();   /* once, before any Misa call */
+    os_log(OS_LOG_DEFAULT, "misa: calling misa_main");
     misa_main();      /* builds the first screen through the driver */
+    os_log(OS_LOG_DEFAULT, "misa: misa_main returned, app alive");
     return YES;
 }
 

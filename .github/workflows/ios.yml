@@ -75,10 +75,13 @@ jobs:
             exit 0
           fi
           echo "SMOKE TEST FAILED: app process gone 10s after launch"
+          echo "--- our startup logs (did the app get through misa_main?) ---"
+          xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
+            | grep -i "misa:" | tail -15
           echo "--- who killed it? system logs mentioning our bundle ---"
           xcrun simctl spawn "$UDID" log show --last 6m 2>/dev/null \
             | grep -i "misa\|0x8badf00d\|jetsam\|termination\|SIGKILL\|exited" \
-            | grep -vi "misaapp:" | tail -25
+            | grep -vi "misaapp:" | grep -vi "misa:" | tail -25
           exit 1
 
       - name: Upload simulator screenshot
