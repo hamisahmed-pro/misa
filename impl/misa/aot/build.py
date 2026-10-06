@@ -71,6 +71,44 @@ def _resolve_model_src(model_file: str, decl_file: str):
             return c
     return None
 
+
+def ondevice_asset_files(path: str, target: str = ""):
+    """Return [(src_abs, asset_name)] for models that ship as packaged
+    assets on the given target.
+
+    Currently: .tflite models for Android triples (Phase 5 M4) — the
+    APK builder copies each src into the APK assets under asset_name
+    (the basename), matching what build() embeds in the program object.
+    Returns [] for targets with no asset models. Raises RuntimeError on
+    an unresolvable model file.
+    """
+    sys.path.insert(0, IMPL_DIR)
+    merged, errors, file_of = _frontend(path)
+    if errors:
+        raise RuntimeError(f"frontend errors: {errors[0].get('message')}")
+    eff = canonical_target(target or host_triple())
+    if eff not in ANDROID_TRIPLES:
+        return []
+    from misa.ast import ProviderDecl
+    assets = []
+    for item in merged.items:
+        if isinstance(item, ProviderDecl) and item.model_file:
+            if _ondevice_runtime(item.model_file) != "tflite":
+                continue
+            decl_file = file_of.get(id(item), "")
+            src = _resolve_model_src(item.model_file, decl_file)
+            if src is None:
+                raise RuntimeError(
+                    f"on-device model file not found: '{item.model_file}'")
+            assets.append((src, os.path.basename(src)))
+    # de-dup by asset name, keep first
+    seen, out = set(), []
+    for src, name in assets:
+        if name not in seen:
+            seen.add(name)
+            out.append((src, name))
+    return out
+
 # ----------------------------------------------------------------------
 # Android NDK (Phase 4, M6). Pinned version; unpacked under
 # ~/workspace/android-ndk (see scripts/build_apk.py for the SDK side).
@@ -83,6 +121,10 @@ NDK_LLVM_BIN = os.path.join(
 # minSdk the NDK clang targets (manifest may declare a lower minSdk;
 # __ANDROID_API__ follows this).
 NDK_API = "34"
+
+# Canonical LLVM triples that target Android (Phase 4 M6 / Phase 5 M4).
+ANDROID_TRIPLES = ("aarch64-linux-android", "armv7-linux-androideabi",
+                   "x86_64-linux-android")
 
 
 def _ndk_clang(triple: str) -> str:
@@ -594,6 +636,14 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
                                    f"(see spec/ONDEVICE.md)",
                         "line": item.line, "col": item.col, "hint": ""}]
                 staged_models.append(src)
+                continue
+            if rt == "tflite" and eff_target in ANDROID_TRIPLES:
+                # M4: the APK ships the .tflite as an asset (see
+                # scripts/build_apk.py); the program object carries only
+                # the asset name (basename), which the Android runtime
+                # resolves via MisaTflite. Nothing is staged next to the
+                # object file.
+                item.model_file = os.path.basename(src)
                 continue
             if rt == "coreml" and "apple" in eff_target:
                 # M3: the Xcode template compiles platform_apple.m with

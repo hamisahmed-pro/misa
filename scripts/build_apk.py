@@ -35,13 +35,21 @@ sys.path.insert(0, IMPL_DIR)
 
 from misa.aot.build import (  # noqa: E402
     build, canonical_target, ensure_runtime, runtime_flags,
-    NDK_DIR, NDK_LLVM_BIN, _ndk_clang,
+    ondevice_asset_files, NDK_DIR, NDK_LLVM_BIN, _ndk_clang,
 )
 
 HOME = os.path.expanduser("~")
 SDK_DIR = os.path.join(HOME, "workspace", "android-sdk")
 ANDROID_JAR = os.path.join(SDK_DIR, "platforms", "android-35", "android.jar")
 JAVA_HOME = os.path.join(HOME, "workspace", "tools", "jdk-21")
+
+# TensorFlow Lite Android AARs (Phase 5, M4). The 2.16.1 release is
+# split: tensorflow-lite (core + JNI .so) and tensorflow-lite-api
+# (DataType, Tensor, nnapi/NnApiDelegate). Both live durably here;
+# 2.17.0's tensorflow-lite artifact is a relocation-only POM, so
+# 2.16.1 is the pinned version.
+TFLITE_DIR = os.path.join(HOME, "workspace", "deps", "tflite")
+TFLITE_AARS = ("tensorflow-lite-2.16.1.aar", "tflite-api-2.16.1.aar")
 
 # ABI table: llvmlite/LLVM triple -> (APK abi dir, NDK clang triple prefix)
 ABIS = {
@@ -93,6 +101,54 @@ def _debug_keystore() -> str:
     return ks
 
 
+def _tflite_setup(workdir: str):
+    """Extract the TFLite AARs (Phase 5, M4).
+
+    Returns (classes_dir, so_by_abi): classes_dir holds the merged
+    org/tensorflow/lite/**/*.class tree for javac/d8; so_by_abi maps
+    APK abi dir -> libtensorflowlite_jni.so path for packaging.
+    Raises RuntimeError when the AARs are missing.
+    """
+    for aar in TFLITE_AARS:
+        p = os.path.join(TFLITE_DIR, aar)
+        if not os.path.isfile(p):
+            raise RuntimeError(
+                f"TFLite AAR missing: {p} (see spec/ONDEVICE.md M4)")
+    classes_dir = os.path.join(workdir, "tflite-classes")
+    os.makedirs(classes_dir, exist_ok=True)
+    so_by_abi = {}
+    for aar in TFLITE_AARS:
+        p = os.path.join(TFLITE_DIR, aar)
+        with open(p, "rb") as f:
+            data = f.read()
+        # minimal zip walk (no zipfile import needed at module top)
+        import zipfile, io
+        z = zipfile.ZipFile(io.BytesIO(data))
+        for name in z.namelist():
+            if name == "classes.jar":
+                cj = zipfile.ZipFile(io.BytesIO(z.read(name)))
+                for cn in cj.namelist():
+                    if cn.endswith(".class"):
+                        dst = os.path.join(classes_dir, cn)
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        with open(dst, "wb") as f:
+                            f.write(cj.read(cn))
+            elif name.startswith("jni/") and name.endswith(".so"):
+                # jni/<abi>/libtensorflowlite_jni.so
+                abi = name.split("/")[1]
+                dst = os.path.join(workdir, "tflite-so", abi,
+                                   os.path.basename(name))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    f.write(z.read(name))
+                so_by_abi[abi] = dst
+    ncls = sum(1 for _r, _d, fs in os.walk(classes_dir)
+               for f in fs if f.endswith(".class"))
+    print(f"  TFLite: {ncls} classes, "
+          f"native libs for {sorted(so_by_abi)}")
+    return classes_dir, so_by_abi
+
+
 def _build_native(workdir: str, abi_key: str):
     """Compile prog.o + runtime, link libmisa.so for one ABI."""
     triple, abi_dir = ABIS[abi_key]
@@ -120,8 +176,12 @@ def _build_native(workdir: str, abi_key: str):
     return lib_dir
 
 
-def _build_dex(workdir: str) -> str:
-    """javac the android/java sources, d8 to classes.dex."""
+def _build_dex(workdir: str, tflite_classes: str) -> str:
+    """javac the android/java sources, d8 to classes.dex.
+
+    tflite_classes: extracted org/tensorflow/lite/**/*.class tree
+    (Phase 5, M4) — on the javac classpath and fed to d8.
+    """
     javac = os.path.join(JAVA_HOME, "bin", "javac")
     src_dir = os.path.join(MISA_DIR, "android", "java")
     classes = os.path.join(workdir, "classes")
@@ -134,18 +194,24 @@ def _build_dex(workdir: str) -> str:
     env = dict(os.environ, JAVA_HOME=JAVA_HOME,
                PATH=os.path.join(JAVA_HOME, "bin") +
                os.pathsep + os.environ.get("PATH", ""))
-    _run([javac, "--release", "8", "-cp", ANDROID_JAR,
+    cp = ANDROID_JAR + os.pathsep + tflite_classes
+    _run([javac, "--release", "8", "-cp", cp,
           "-d", classes] + sources, env=env)
     dex_dir = os.path.join(workdir, "dex")
     os.makedirs(dex_dir, exist_ok=True)
+    d8_inputs = [
+        os.path.join(classes, "com", "misa", "app", "MisaActivity.class"),
+        os.path.join(classes, "com", "misa", "app", "MisaWidgets.class"),
+        os.path.join(classes, "com", "misa", "app", "MisaTflite.class"),
+        os.path.join(classes, "com", "misa", "app", "MisaNative.class"),
+    ]
+    # Every TFLite class the AARs ship (interpreter, API, NNAPI).
+    for root, _dirs, files in os.walk(tflite_classes):
+        for f in files:
+            if f.endswith(".class"):
+                d8_inputs.append(os.path.join(root, f))
     _run(["bash", _tool("d8"), "--lib", ANDROID_JAR,
-          "--min-api", "24", "--output", dex_dir,
-          os.path.join(classes, "com", "misa", "app",
-                       "MisaActivity.class"),
-          os.path.join(classes, "com", "misa", "app",
-                       "MisaWidgets.class"),
-          os.path.join(classes, "com", "misa", "app",
-                       "MisaNative.class")],
+          "--min-api", "24", "--output", dex_dir] + d8_inputs,
          env=env)
     dex = os.path.join(dex_dir, "classes.dex")
     # The dex must live at the APK ROOT (aapt add stores the given
@@ -154,6 +220,24 @@ def _build_dex(workdir: str) -> str:
     shutil.copy(dex, dex_root)
     print(f"  classes.dex ({os.path.getsize(dex_root)} bytes)")
     return dex_root
+
+
+def _stage_model_assets(workdir: str) -> str:
+    """Stage on-device model files (*.tflite, Phase 5 M4) into
+    workdir/assets so _package bundles them into the APK.
+
+    Returns the assets dir (may be empty). The asset names match what
+    build() embeds in the program object (basenames)."""
+    assets = os.path.join(workdir, "assets")
+    os.makedirs(assets, exist_ok=True)
+    if getattr(args, "no_assets", False):
+        return assets
+    for src, name in ondevice_asset_files(args.misa,
+                                          target="aarch64-linux-android"):
+        dst = os.path.join(assets, name)
+        shutil.copy2(src, dst)
+        print(f"  model asset: {name} ({os.path.getsize(dst)} bytes)")
+    return assets
 
 
 def _package(workdir: str) -> str:
@@ -171,11 +255,20 @@ def _package(workdir: str) -> str:
     unsigned = os.path.join(workdir, "unsigned.apk")
     cmd = [_tool("aapt"), "package", "-f",
            "-M", staged, "-I", ANDROID_JAR, "-F", unsigned]
-    assets = os.path.join(MISA_DIR, "android", "assets")
+    assets = os.path.join(workdir, "assets")
+    repo_assets = os.path.join(MISA_DIR, "android", "assets")
     if (not getattr(args, "no_assets", False)
-            and os.path.isdir(assets) and os.listdir(assets)):
+            and os.path.isdir(repo_assets) and os.listdir(repo_assets)):
         # Raw assets (e.g. *.mock.json for demo model scripts) ship
         # inside the APK; MisaActivity stages them into filesDir.
+        # _stage_model_assets already created workdir/assets (possibly
+        # with .tflite models); merge the repo assets in.
+        os.makedirs(assets, exist_ok=True)
+        for f in sorted(os.listdir(repo_assets)):
+            src = os.path.join(repo_assets, f)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(assets, f))
+    if os.path.isdir(assets) and os.listdir(assets):
         cmd += ["-A", assets]
     _run(cmd)
     return unsigned
@@ -205,8 +298,18 @@ def main() -> int:
     workdir = tempfile.mkdtemp(prefix="misa-apk-")
     print(f"workdir: {workdir}")
     try:
+        tflite_classes, tflite_sos = _tflite_setup(workdir)
         lib_dirs = [_build_native(workdir, a) for a in abis]
-        dex = _build_dex(workdir)
+        # TFLite JNI libs ride along in lib/<abi>/ (Phase 5, M4).
+        for lib_dir in lib_dirs:
+            abi = os.path.basename(lib_dir)
+            so = tflite_sos.get(abi)
+            if so:
+                shutil.copy2(so, os.path.join(lib_dir,
+                                             os.path.basename(so)))
+                print(f"  [{abi}] + {os.path.basename(so)}")
+        dex = _build_dex(workdir, tflite_classes)
+        _stage_model_assets(workdir)
         unsigned = _package(workdir)
 
         # add libs + dex with paths relative to workdir

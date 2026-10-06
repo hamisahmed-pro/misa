@@ -209,6 +209,21 @@ int misa_coreml_infer(const MModelMeta *meta, MVal **args, int nargs,
                       char **out_json, char *ecode,
                       char *errbuf, size_t errcap);
 
+/* TFLite on-device backend (platform_android.c; Android targets only).
+ * The model runs through the Java org.tensorflow.lite.Interpreter with
+ * the NNAPI delegate when available (CPU fallback otherwise); args are
+ * marshalled as JSON through com.misa.app.MisaTflite.infer(assetName,
+ * inputJson, namesJson). Same v1 type mapping and JSON contract as the
+ * CoreML backend above.
+ * Returns 1 on success, 0 when an E50x failure applies (ecode set to
+ * "E501"/"E502"/"E503", errbuf carries the message), -1 on
+ * load/inference failure (errbuf carries the message; the caller
+ * raises E400). Never called on non-Android targets (the call site in
+ * misa_model.c is guarded by #ifdef __ANDROID__). */
+int misa_tflite_infer(const MModelMeta *meta, MVal **args, int nargs,
+                      char **out_json, char *ecode,
+                      char *errbuf, size_t errcap);
+
 #ifdef __cplusplus
 }
 #endif

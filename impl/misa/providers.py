@@ -325,6 +325,46 @@ def _ort_session(model_path: str):
     return _ONNX_SESSIONS[model_path]
 
 
+# ai-edge-litert interpreters, keyed by resolved model path (lazy, per process)
+_TFLITE_INTERPS: dict = {}
+
+
+def _tflite_interp(model_path: str):
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+    except ImportError:
+        raise OnDeviceRuntimeUnavailable(
+            "TFLite models need the 'ai-edge-litert' package "
+            "(pip install ai-edge-litert)")
+    if model_path not in _TFLITE_INTERPS:
+        try:
+            itp = Interpreter(model_path=model_path)
+            itp.allocate_tensors()
+        except Exception as e:  # noqa: BLE001 - corrupt/foreign file
+            raise ModelError(
+                f"cannot load TFLite model '{model_path}': {e}")
+        _TFLITE_INTERPS[model_path] = itp
+    return _TFLITE_INTERPS[model_path]
+
+
+class _LiteMeta:
+    """Adapter: ai-edge-litert tensor details -> the {name, shape, type}
+    shape OnDeviceProvider.complete() expects (mirrors ORT's metadata)."""
+
+    def __init__(self, detail):
+        import numpy as np
+        self.name = detail["name"]
+        self.shape = tuple(int(d) for d in detail["shape"])
+        self.index = int(detail["index"])
+        kind = np.dtype(detail["dtype"]).kind
+        if kind == "f":
+            self.type = "tensor(float)"
+        elif kind in "OSU":
+            self.type = "tensor(string)"
+        else:
+            self.type = f"tensor({np.dtype(detail['dtype']).name})"
+
+
 def _sig_kind(te) -> Optional[str]:
     """v1 on-device type mapping. Returns 'scalar' | 'vec' | 'text'
     or None when the type is not supported on-device (E502)."""
@@ -346,8 +386,10 @@ def _sig_kind(te) -> Optional[str]:
 class OnDeviceProvider(Provider):
     """Runs a local model file with zero network traffic.
 
-    v1: ONNX Runtime only (.onnx). CoreML (.mlpackage/.mlmodelc) and
-    TFLite (.tflite) raise E503 until their milestones land.
+    v1: ONNX Runtime (.onnx) everywhere; TFLite (.tflite) via ai-edge-litert
+    in the interpreter (CPU) and via the NNAPI delegate in Android AOT
+    builds. CoreML (.mlpackage/.mlmodelc) raises E503 until Apple-side
+    interpreter support lands (AOT covers Apple targets since M3).
     """
     kind = "ondevice"
 
@@ -365,12 +407,33 @@ class OnDeviceProvider(Provider):
             raise OnDeviceRuntimeUnavailable(
                 "CoreML models (.mlpackage/.mlmodelc) need Apple "
                 "hardware - milestone M3")
-        if self.runtime == "tflite":
-            raise OnDeviceRuntimeUnavailable(
-                "TFLite models (.tflite) need Android - milestone M4")
 
-    def _session(self):
-        return _ort_session(self.model_path)
+    def _backend(self):
+        """(in_metas, out_metas, runner) for the selected runtime.
+
+        in/out_metas expose .name/.shape/.type (mirroring ORT metadata);
+        runner(feed, out_metas) returns the raw first-output array.
+        """
+        if self.runtime == "tflite":
+            itp = _tflite_interp(self.model_path)
+            in_metas = [_LiteMeta(d) for d in itp.get_input_details()]
+            out_metas = [_LiteMeta(d) for d in itp.get_output_details()]
+
+            def run(feed, outs):
+                for m in in_metas:
+                    itp.set_tensor(m.index, feed[m.name])
+                itp.invoke()
+                return itp.get_tensor(outs[0].index)
+
+            return in_metas, out_metas, run
+        sess = _ort_session(self.model_path)
+        in_metas = sess.get_inputs()
+        out_metas = sess.get_outputs()
+
+        def run(feed, outs):
+            return sess.run([outs[0].name], feed)[0]
+
+        return in_metas, out_metas, run
 
     def _to_input(self, value, kind: str, pname: str, meta):
         import numpy as np
@@ -385,7 +448,17 @@ class OnDeviceProvider(Provider):
                 raise OnDeviceSignatureError(
                     f"param '{pname}': model input '{meta.name}' is "
                     f"{exp_type}, not a string tensor")
-            return np.array(value, dtype=object)
+            arr = np.array(value, dtype=object)
+            # TFLite scalar (0-d) string tensors are unreliable in the
+            # Python binding (ai-edge-litert); the v1 convention is a
+            # [1] string tensor (mirrors the ORT backend).
+            if list(exp_shape) == [1]:
+                arr = arr.reshape(1)
+            elif exp_shape not in ([], [1]):
+                raise OnDeviceSignatureError(
+                    f"param '{pname}': model input '{meta.name}' has "
+                    f"unexpected string shape {exp_shape} (v1: [1])")
+            return arr
         # numeric kinds need float tensors
         if "float" not in exp_type:
             raise OnDeviceSignatureError(
@@ -451,8 +524,7 @@ class OnDeviceProvider(Provider):
         TypeExpr. Returns the first model output as JSON text so the
         interpreter's existing validation applies."""
         t0 = time.monotonic()
-        sess = self._session()
-        in_metas = sess.get_inputs()
+        in_metas, out_metas, run = self._backend()
         if args is None:
             args = []
         params = list(params)
@@ -477,10 +549,9 @@ class OnDeviceProvider(Provider):
                     f"{'[]' if te.is_list else ''} is not supported "
                     f"on-device in v1 (Float, [Float], Text)")
             feed[meta.name] = self._to_input(value, kind, pname, meta)
-        out_metas = sess.get_outputs()
         if not out_metas:
             raise OnDeviceSignatureError("model has no outputs")
-        raw = sess.run([out_metas[0].name], feed)[0]
+        raw = run(feed, out_metas)
         value = self._from_output(raw, ret_kind)
         latency_ms = int((time.monotonic() - t0) * 1000)
         return Completion(text=json.dumps(value),

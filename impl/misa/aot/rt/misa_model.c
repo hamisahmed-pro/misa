@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h> /* readlink (on-device model path resolution) */
 
 /* ------------------------------------------------------------------ */
 /* minimal JSON parser                                                */
@@ -700,7 +701,10 @@ static const char *ondevice_runtime(const char *path) {
 /* Resolve the embedded model path at runtime. build.py embeds the
  * absolute source path and stages a copy next to the binary, so try:
  * (1) the path as embedded, (2) <exe-dir>/<basename> (shipped app),
- * (3) ./<basename> (current directory). */
+ * (3) ./<basename> (current directory).
+ * Only used by the ORT backend (MISA_USE_ORT); the TFLite/CoreML
+ * backends resolve their models differently. */
+#ifdef MISA_USE_ORT
 static void ondevice_resolve_path(const char *given, char *out, size_t cap) {
     FILE *f = fopen(given, "rb");
     if (f) {
@@ -731,6 +735,7 @@ static void ondevice_resolve_path(const char *given, char *out, size_t cap) {
 #endif
     snprintf(out, cap, "%s", given);
 }
+#endif /* MISA_USE_ORT */
 
 #ifdef MISA_USE_ORT
 #include <onnxruntime_c_api.h>
@@ -1243,10 +1248,27 @@ static int provider_complete_ondevice(const MModelMeta *meta, MVal **args,
 #endif
     }
     if (strcmp(rt, "tflite") == 0) {
+#ifdef __ANDROID__
+        char *json = NULL;
+        char ce[8] = "";
+        int cr = misa_tflite_infer(meta, args, nargs, &json, ce,
+                                   errbuf, errcap);
+        if (cr == 1) {
+            out->text = json;
+            return PC_OK;
+        }
+        if (cr == 0) {
+            snprintf(out->ecode, sizeof out->ecode, "%s",
+                     ce[0] ? ce : "E502");
+            return PC_ECODE;
+        }
+        return PC_MODEL_ERR;
+#else
         snprintf(out->ecode, sizeof out->ecode, "E503");
         snprintf(errbuf, errcap,
                  "TFLite models (.tflite) need Android (milestone M4)");
         return PC_ECODE;
+#endif
     }
     if (strcmp(rt, "unknown") == 0) {
         snprintf(errbuf, errcap,

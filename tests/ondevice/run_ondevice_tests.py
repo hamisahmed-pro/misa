@@ -255,7 +255,7 @@ print(classify([0.5, -0.2, 0.9, 0.1]))
     assert "E503" in r.stderr, r.stderr
 
 
-@test("E503: TFLite unavailable on this platform")
+@test("E400: corrupt .tflite fails at load, not E503 (M4 lifted the ban)")
 def _():
     d = tempfile.mkdtemp(prefix="misa_tflite_")
     mp = os.path.join(d, "m.tflite")
@@ -276,7 +276,8 @@ print(classify([0.5, -0.2, 0.9, 0.1]))
 """ % mp)
     r = run_misa("run", p)
     assert r.returncode == 1, r.stdout
-    assert "E503" in r.stderr, r.stderr
+    assert "E503" not in r.stderr, r.stderr
+    assert "E400" in r.stderr, r.stderr
 
 
 @test("E504: misa build refines on-device refusal (M2)")

@@ -135,8 +135,53 @@ networking disabled and still diagnoses. That is the exit proof.
    non-numeric model → E502; missing .mlpackage → E400 with the
    resolved path in the message.
 
+### Device verification for M4 (pending hardware)
+
+1. `python3 scripts/build_apk.py --misa examples/plantdoc_edge_tflite.misa
+   --out dist/misa-plantdoc-tflite.apk` (the `.tflite` ships as an APK
+   asset; build must succeed — E504 is lifted for Android targets).
+2. Install on a physical Android phone; run fully offline (airplane
+   mode): the app must print the same probabilities as the
+   interpreter's offline run (`[0.4147, 0.2332, 0.3521]` for the
+   bundled symptom vector).
+3. Confirm the NNAPI delegate state: logcat `MISA` tag prints either
+   "TFLite NNAPI delegate active" or "TFLite CPU fallback" with the
+   reason — the probe inference at load guarantees the reported
+   state is the one actually used.
+4. Negative paths on device: wrong-length `[Float]` → E501;
+   non-float model → E502; missing asset → E400.
+
 ## 7. Non-goals (Phase 5)
 
 - Model downloading/hosting, quantization tooling, tokenizers
   (string models are pass-through), GPU delegate tuning, `Image`
   type, streaming from local models.
+
+## 8. M4 implementation record (2026-10-06)
+
+- Native: `misa_tflite_infer` in `impl/misa/aot/rt/platform_android.c`
+  (validates declared v1 types, marshals args to JSON, JNI →
+  `com.misa.app.MisaTflite.infer(assetName, inputJson, namesJson)`).
+  Java `E501:`/`E502:` exceptions become the matching E-codes;
+  anything else is E400. `misa_model.c` dispatches `.tflite` to it on
+  `__ANDROID__`, E503 elsewhere.
+- Java: `android/java/com/misa/app/MisaTflite.java` —
+  `org.tensorflow.lite.Interpreter` with the NNAPI delegate when a
+  zero-input probe proves the device can run the model, CPU fallback
+  otherwise. Assets are staged from the APK into
+  `<filesDir>/misa_models/` on first use. v1 marshalling: Float →
+  scalar float, [Float] → float tensor, Text → `[1]` string tensor
+  (scalar 0-d string tensors are unreliable in the ai-edge-litert
+  Python binding, so the v1 convention is `[1]`, mirroring ORT).
+- Build: `build.py` lifts E504 for `.tflite` on Android triples only
+  and embeds the asset basename; `ondevice_asset_files()` reports
+  the models to package. `scripts/build_apk.py` extracts the pinned
+  TFLite 2.16.1 AARs (core + api split, `~/workspace/deps/tflite/`)
+  onto the javac classpath and into d8, packages
+  `libtensorflowlite_jni.so` per ABI into `lib/<abi>/`, and stages
+  each `.tflite` as an APK asset.
+- Models: `examples/models/tiny_classifier.tflite` (4→8→3,
+  bit-identical outputs to `tiny_classifier.onnx`),
+  `tiny_affine.tflite` (`y = 2.5x - 1`), `tiny_strid.tflite`
+  (`[1]` string identity). Test suite:
+  `tests/ondevice/run_tflite_tests.py` (12/12).

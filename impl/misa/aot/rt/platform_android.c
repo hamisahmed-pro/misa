@@ -27,6 +27,7 @@
 #include "misa_platform.h"
 
 #include "jni_android.h"
+#include "misa_rt.h"   /* MVal/MModelMeta for misa_tflite_infer */
 
 #include <android/log.h>
 #include <jni.h>
@@ -407,4 +408,291 @@ void misa_platform_http_free(MisaHttpResp *r) {
         free(r->body); /* plain malloc'd, never a GC pointer */
         memset(r, 0, sizeof *r);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* TFLite on-device backend (Phase 5, M4)                             */
+/*                                                                    */
+/* Inference itself runs in Java (org.tensorflow.lite.Interpreter     */
+/* with the NNAPI delegate when available, CPU fallback otherwise) —  */
+/* that is the officially supported Android TFLite path. This layer   */
+/* validates the declared Misa types, marshals args to JSON, and       */
+/* forwards to com.misa.app.MisaTflite.infer(assetName, inputJson).    */
+/*                                                                    */
+/* Java raises RuntimeException("E501: ...") / ("E502: ...") for      */
+/* model-compat failures; anything else becomes E400.                 */
+/* ------------------------------------------------------------------ */
+
+static const char *tflite_sig_kind(const char *type) {
+    /* mirrors the v1 mapping: Float -> scalar, [Float] -> vec,
+     * Text -> string; anything else is E502. */
+    if (!type) return NULL;
+    while (*type == ' ') type++;
+    if (strcmp(type, "Float") == 0) return "scalar";
+    if (strcmp(type, "[Float]") == 0) return "vec";
+    if (strcmp(type, "Text") == 0) return "text";
+    return NULL;
+}
+
+/* Minimal growable buffer (local; misa_model.c's Buf is file-static). */
+typedef struct { char *buf; size_t len, cap; } TBuf;
+
+static void tbuf_reserve(TBuf *b, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 256;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *nb = (char *)realloc(b->buf, nc);
+        if (!nb) return; /* OOM: callers check via misa_platform_fatal */
+        b->buf = nb;
+        b->cap = nc;
+    }
+}
+
+static void tbuf_putn(TBuf *b, const char *p, size_t n) {
+    tbuf_reserve(b, n);
+    if (!b->buf) misa_platform_fatal("E300", "out of memory");
+    memcpy(b->buf + b->len, p, n);
+    b->len += n;
+    b->buf[b->len] = '\0';
+}
+
+static void tbuf_puts(TBuf *b, const char *p) { tbuf_putn(b, p, strlen(p)); }
+
+static void tbuf_put_json_str(TBuf *b, const char *s, size_t n) {
+    tbuf_putn(b, "\"", 1);
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"': tbuf_puts(b, "\\\""); break;
+        case '\\': tbuf_puts(b, "\\\\"); break;
+        case '\n': tbuf_puts(b, "\\n"); break;
+        case '\r': tbuf_puts(b, "\\r"); break;
+        case '\t': tbuf_puts(b, "\\t"); break;
+        default:
+            if (c < 0x20) {
+                char tmp[8];
+                snprintf(tmp, sizeof tmp, "\\u%04x", c);
+                tbuf_puts(b, tmp);
+            } else {
+                tbuf_putn(b, (const char *)&s[i], 1);
+            }
+        }
+    }
+    tbuf_putn(b, "\"", 1);
+}
+
+/* Append one MVal arg as JSON. Returns 0 with ecode set on E502. */
+static int tflite_arg_json(TBuf *b, MVal *av, const char *kind,
+                           const char *pname, char *ecode,
+                           char *errbuf, size_t errcap) {
+    if (strcmp(kind, "text") == 0) {
+        if (misa_tag(av) != M_TAG_TEXT) {
+            snprintf(errbuf, errcap,
+                     "E502: param '%s': Text value required", pname);
+            snprintf(ecode, 8, "E502");
+            return 0;
+        }
+        const char *tz = misa_text_z(av);
+        tbuf_put_json_str(b, tz ? tz : "", tz ? strlen(tz) : 0);
+        return 1;
+    }
+    if (strcmp(kind, "scalar") == 0) {
+        if (misa_tag(av) != M_TAG_FLOAT) {
+            snprintf(errbuf, errcap,
+                     "E502: param '%s': Float value required", pname);
+            snprintf(ecode, 8, "E502");
+            return 0;
+        }
+        char tmp[64];
+        snprintf(tmp, sizeof tmp, "%.17g", misa_as_float(av));
+        tbuf_puts(b, tmp);
+        return 1;
+    }
+    /* vec */
+    if (misa_tag(av) != M_TAG_LIST) {
+        snprintf(errbuf, errcap,
+                 "E502: param '%s': [Float] value required", pname);
+        snprintf(ecode, 8, "E502");
+        return 0;
+    }
+    int64_t len = misa_list_len(av), k;
+    tbuf_putn(b, "[", 1);
+    for (k = 0; k < len; k++) {
+        MVal *e = misa_list_get(av, k);
+        if (misa_tag(e) != M_TAG_FLOAT) {
+            snprintf(errbuf, errcap,
+                     "E502: param '%s': [Float] value required", pname);
+            snprintf(ecode, 8, "E502");
+            return 0;
+        }
+        char tmp[64];
+        if (k) tbuf_putn(b, ",", 1);
+        snprintf(tmp, sizeof tmp, "%.17g", misa_as_float(e));
+        tbuf_puts(b, tmp);
+    }
+    tbuf_putn(b, "]", 1);
+    return 1;
+}
+
+int misa_tflite_infer(const MModelMeta *meta, MVal **args, int nargs,
+                      char **out_json, char *ecode,
+                      char *errbuf, size_t errcap) {
+    if (ecode) ecode[0] = '\0';
+    if (!meta || !meta->model_file || !*meta->model_file) {
+        if (ecode) snprintf(ecode, 8, "E502");
+        snprintf(errbuf, errcap,
+                 "E502: on-device provider needs `model: file(\"...\")`");
+        return 0;
+    }
+    /* declared return type must be a v1 on-device type */
+    {
+        const char *schema = meta->schema ? meta->schema : "";
+        while (*schema == ' ') schema++;
+        if (!(strncmp(schema, "[Float]", 7) == 0 ||
+              strncmp(schema, "Float", 5) == 0 ||
+              strncmp(schema, "Text", 4) == 0)) {
+            if (ecode) snprintf(ecode, 8, "E502");
+            snprintf(errbuf, errcap,
+                     "E502: return type '%s' is not supported on-device "
+                     "in v1 (Float, [Float], Text)", schema);
+            return 0;
+        }
+    }
+    if (nargs != meta->nparams) {
+        if (ecode) snprintf(ecode, 8, "E502");
+        snprintf(errbuf, errcap,
+                 "E502: model takes %d param(s), called with %d arg(s)",
+                 meta->nparams, nargs);
+        return 0;
+    }
+
+    /* marshal args -> JSON array */
+    TBuf jb = {NULL, 0, 0};
+    tbuf_putn(&jb, "[", 1);
+    for (int i = 0; i < nargs; i++) {
+        const char *pname = meta->params[i].name;
+        const char *kind = tflite_sig_kind(meta->params[i].type);
+        char lecode[8] = "";
+        if (!kind) {
+            if (ecode) snprintf(ecode, 8, "E502");
+            snprintf(errbuf, errcap,
+                     "E502: param '%s': type '%s' is not supported "
+                     "on-device in v1 (Float, [Float], Text)",
+                     pname, meta->params[i].type
+                         ? meta->params[i].type : "?");
+            free(jb.buf);
+            return 0;
+        }
+        if (i) tbuf_putn(&jb, ",", 1);
+        if (!tflite_arg_json(&jb, args[i], kind, pname, lecode,
+                             errbuf, errcap)) {
+            if (ecode) snprintf(ecode, 8, "%s", lecode);
+            free(jb.buf);
+            return 0;
+        }
+    }
+    tbuf_putn(&jb, "]", 1);
+
+    /* asset name: basename of the embedded model path */
+    const char *asset = strrchr(meta->model_file, '/');
+    asset = asset ? asset + 1 : meta->model_file;
+
+    JNIEnv *env = misa_android_jnienv();
+    if (!env) {
+        snprintf(errbuf, errcap, "TFLite: no JNI environment");
+        free(jb.buf);
+        return -1;
+    }
+    jclass cls = (*env)->FindClass(env, "com/misa/app/MisaTflite");
+    if (!cls) {
+        (*env)->ExceptionClear(env);
+        snprintf(errbuf, errcap,
+                 "TFLite: com.misa.app.MisaTflite not found in APK "
+                 "(tensorflow-lite AAR missing?)");
+        free(jb.buf);
+        return -1;
+    }
+    jmethodID infer = (*env)->GetStaticMethodID(
+        env, cls, "infer",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)"
+        "Ljava/lang/String;");
+    if (!infer) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteLocalRef(env, cls);
+        snprintf(errbuf, errcap, "TFLite: MisaTflite.infer not found");
+        free(jb.buf);
+        return -1;
+    }
+    /* declared param names, for E501 messages */
+    TBuf nb = {NULL, 0, 0};
+    tbuf_putn(&nb, "[", 1);
+    for (int i = 0; i < nargs; i++) {
+        if (i) tbuf_putn(&nb, ",", 1);
+        tbuf_put_json_str(&nb, meta->params[i].name,
+                          strlen(meta->params[i].name));
+    }
+    tbuf_putn(&nb, "]", 1);
+    jstring jasset = (*env)->NewStringUTF(env, asset);
+    jstring jinput = (*env)->NewStringUTF(env, jb.buf ? jb.buf : "[]");
+    jstring jnames = (*env)->NewStringUTF(env, nb.buf ? nb.buf : "[]");
+    free(jb.buf);
+    free(nb.buf);
+    jstring jout = NULL;
+    if (jasset && jinput && jnames) {
+        jout = (jstring)(*env)->CallStaticObjectMethod(env, cls, infer,
+                                                       jasset, jinput,
+                                                       jnames);
+    }
+    (*env)->DeleteLocalRef(env, jasset);
+    (*env)->DeleteLocalRef(env, jinput);
+    (*env)->DeleteLocalRef(env, jnames);
+    (*env)->DeleteLocalRef(env, cls);
+
+    /* Java exceptions: "E50x: ..." -> E-code; anything else -> E400 */
+    jthrowable t = (*env)->ExceptionOccurred(env);
+    if (t) {
+        (*env)->ExceptionClear(env);
+        char detail[512] = "";
+        jclass tc = (*env)->GetObjectClass(env, t);
+        jmethodID getMessage = (*env)->GetMethodID(
+            env, tc, "getMessage", "()Ljava/lang/String;");
+        if (getMessage) {
+            jstring jm = (jstring)(*env)->CallObjectMethod(env, t,
+                                                           getMessage);
+            if (jm && !(*env)->ExceptionOccurred(env)) {
+                const char *c = (*env)->GetStringUTFChars(env, jm, NULL);
+                if (c) {
+                    strncpy(detail, c, sizeof detail - 1);
+                    (*env)->ReleaseStringUTFChars(env, jm, c);
+                }
+                (*env)->DeleteLocalRef(env, jm);
+            }
+            (*env)->ExceptionClear(env);
+        }
+        (*env)->DeleteLocalRef(env, tc);
+        (*env)->DeleteLocalRef(env, t);
+        if (!detail[0]) snprintf(detail, sizeof detail, "Java exception");
+        if (detail[0] == 'E' && detail[1] == '5' && detail[2] == '0' &&
+            detail[3] >= '1' && detail[3] <= '4' && detail[4] == ':') {
+            if (ecode) { memcpy(ecode, detail, 4); ecode[4] = '\0'; }
+            snprintf(errbuf, errcap, "%s", detail);
+            return 0;
+        }
+        snprintf(errbuf, errcap, "TFLite inference failed: %s", detail);
+        return -1;
+    }
+    if (!jout) {
+        snprintf(errbuf, errcap,
+                 "TFLite: MisaTflite.infer returned null");
+        return -1;
+    }
+    const char *c = (*env)->GetStringUTFChars(env, jout, NULL);
+    *out_json = strdup(c ? c : "");
+    if (c) (*env)->ReleaseStringUTFChars(env, jout, c);
+    (*env)->DeleteLocalRef(env, jout);
+    if (!*out_json) {
+        snprintf(errbuf, errcap, "TFLite: out of memory");
+        return -1;
+    }
+    return 1;
 }

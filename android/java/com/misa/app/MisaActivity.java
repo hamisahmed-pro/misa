@@ -50,6 +50,10 @@ public class MisaActivity extends Activity {
         widgets = new MisaWidgets(this, misaHandler);
         setContentView(widgets.rootView());
 
+        // On-device TFLite backend (Phase 5, M4): needs the app context
+        // before any native model call can reach it.
+        MisaTflite.init(this);
+
         final Bundle extras = getIntent() != null
                 ? getIntent().getExtras() : null;
         final String filesDir =
