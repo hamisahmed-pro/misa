@@ -1,0 +1,25 @@
+table users {
+  id: Int @primary,
+  name: Text,
+  email: Text?,
+  score: Float,
+}
+
+let db = db.open(":memory:")
+db.exec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score REAL)")
+print(db.exec(db, "INSERT INTO users (name, email, score) VALUES (?, ?, ?)", ["Hamis", "h@example.com", "9.5"]))
+print(db.exec(db, "INSERT INTO users (name, score) VALUES (?, ?)", ["Ada", "8.0"]))
+let rows = db.query(db, "SELECT id, name, score FROM users ORDER BY id")
+print(len(rows))
+for r in rows {
+  print(r.name)
+}
+let hamis = db.query(db, "SELECT email FROM users WHERE name = ?", ["Hamis"])
+print(hamis[0].email)
+print(db.exec(db, "UPDATE users SET score = ? WHERE name = ?", ["10.0", "Ada"]))
+let ada = db.query(db, "SELECT score FROM users WHERE name = ?", ["Ada"])
+print(ada[0].score)
+print(db.exec(db, "DELETE FROM users WHERE name = ?", ["Hamis"]))
+print(len(db.query(db, "SELECT * FROM users")))
+db.close(db)
+print("ok")

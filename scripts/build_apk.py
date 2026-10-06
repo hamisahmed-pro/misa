@@ -149,6 +149,18 @@ def _tflite_setup(workdir: str):
     return classes_dir, so_by_abi
 
 
+def _uses_db_source(path: str) -> bool:
+    """Phase 5 (DB): crude text scan for db.* usage (over-linking
+    sqlite when unused is harmless, just a bigger .so)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError:
+        return False
+    return any(tok in src for tok in
+               ("db.open", "db.exec", "db.query", "db.close"))
+
+
 def _build_native(workdir: str, abi_key: str):
     """Compile prog.o + runtime, link libmisa.so for one ABI."""
     triple, abi_dir = ABIS[abi_key]
@@ -162,7 +174,8 @@ def _build_native(workdir: str, abi_key: str):
     if not ok:
         raise RuntimeError(f"misa build failed for {triple}: {errors}")
 
-    rt_objs = ensure_runtime(triple)
+    rt_objs = ensure_runtime(triple,
+                             with_sqlite=_uses_db_source(args.misa))
     _defines, _cflags, libs = runtime_flags(triple)
     lib_dir = os.path.join(workdir, "lib", abi_dir)
     os.makedirs(lib_dir, exist_ok=True)

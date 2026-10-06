@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import os
+import sqlite3
 import sys
 import time
 import urllib.request
@@ -24,6 +25,13 @@ from .providers import (Provider, Usage, make_provider, guess_mime,
 class MediaHandle:
     kind: str  # Photo | Audio | Video | Document
     path: str
+
+
+@dataclass
+class DbHandle:
+    """Phase 5 (DB): an open SQLite connection (opaque `Db` value)."""
+    path: str
+    conn: Any  # sqlite3.Connection
 
 
 @dataclass
@@ -176,6 +184,8 @@ class Interpreter:
                     self.aliases[alias] = (prov, mid)
             elif isinstance(item, ast.TypeDecl):
                 self.types[item.name] = item
+            elif isinstance(item, ast.TableDecl):
+                pass  # Phase 5 (DB): check-time only; no runtime state.
             elif isinstance(item, ast.ModelDecl):
                 self.models[item.name] = item
             elif isinstance(item, ast.ScreenDecl):
@@ -192,6 +202,7 @@ class Interpreter:
         for item in prog.items:
             if isinstance(item, (ast.AppDecl, ast.ProviderDecl,
                                  ast.ModelsDecl, ast.TypeDecl,
+                                 ast.TableDecl,
                                  ast.ModelDecl, ast.ScreenDecl,
                                  ast.EvalDecl, ast.FnDecl,
                                  ast.ImportDecl)):
@@ -531,6 +542,17 @@ class Interpreter:
                 raise IOError_(f"fs.write failed: {ex}")
         if name == "http.get":
             return self.http_get(args[0])
+        # -- Phase 5 (DB): SQLite bindings ------------------------------
+        if name == "db.open":
+            return self.db_open(args[0], e)
+        if name == "db.exec":
+            return self.db_exec(args[0], args[1],
+                                args[2] if len(args) > 2 else [], e)
+        if name == "db.query":
+            return self.db_query(args[0], args[1],
+                                 args[2] if len(args) > 2 else [], e)
+        if name == "db.close":
+            return self.db_close(args[0], e)
         # -- Phase 6 prerequisites: str namespace + process.run ---------
         if name == "str.slice":
             s, i, j = args[0], args[1], args[2]
@@ -647,6 +669,80 @@ class Interpreter:
             return raw.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPError_(f"http.get {url}: body is not UTF-8 text")
+
+    # -- Phase 5 (DB): SQLite ------------------------------------------
+
+    @staticmethod
+    def _db_handle(v, op: str, node: ast.Node) -> "DbHandle":
+        if not isinstance(v, DbHandle):
+            raise RuntimeError_(
+                f"{op} needs a Db from db.open(), got "
+                f"{type(v).__name__}", line=node.line, col=node.col)
+        return v
+
+    def db_open(self, path, node: ast.Node) -> DbHandle:
+        if not isinstance(path, str):
+            raise RuntimeError_("db.open(path) needs a text path",
+                                line=node.line, col=node.col)
+        try:
+            conn = sqlite3.connect(path)
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.open failed: {ex}",
+                           line=node.line, col=node.col)
+        return DbHandle(path=path, conn=conn)
+
+    def db_exec(self, dbv, sql, args, node: ast.Node) -> int:
+        h = self._db_handle(dbv, "db.exec", node)
+        if not isinstance(sql, str):
+            raise RuntimeError_("db.exec needs a text SQL statement",
+                                line=node.line, col=node.col)
+        try:
+            cur = h.conn.execute(sql, list(args))
+            h.conn.commit()
+            return cur.rowcount if cur.rowcount >= 0 else 0
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.exec failed: {ex}",
+                           line=node.line, col=node.col)
+
+    def db_query(self, dbv, sql, args, node: ast.Node) -> list:
+        h = self._db_handle(dbv, "db.query", node)
+        if not isinstance(sql, str):
+            raise RuntimeError_("db.query needs a text SQL statement",
+                                line=node.line, col=node.col)
+        try:
+            cur = h.conn.execute(sql, list(args))
+            names = [d[0] for d in cur.description or []]
+            rows = []
+            for tup in cur.fetchall():
+                rec = {}
+                for name, val in zip(names, tup):
+                    rec[name] = self._db_value(val, node)
+                rows.append(rec)
+            return rows
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.query failed: {ex}",
+                           line=node.line, col=node.col)
+
+    @staticmethod
+    def _db_value(val, node: ast.Node):
+        # SQLite -> Misa: INTEGER->Int, REAL->Float, TEXT->Text,
+        # NULL->nil. BLOB has no Misa equivalent in v1.
+        if val is None or isinstance(val, (int, float, str)):
+            return val
+        if isinstance(val, bytes):
+            raise IOError_(
+                "db.query: BLOB columns are not supported in v1",
+                line=node.line, col=node.col)
+        return str(val)
+
+    def db_close(self, dbv, node: ast.Node) -> None:
+        h = self._db_handle(dbv, "db.close", node)
+        try:
+            h.conn.close()
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.close failed: {ex}",
+                           line=node.line, col=node.col)
+        return None
 
     def call_builtin(self, name: str, args: list, node: ast.Node) -> Any:
         if name == "print":

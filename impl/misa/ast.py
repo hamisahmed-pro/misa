@@ -77,10 +77,18 @@ class TypeDecl(Node):
 @dataclass
 class VariantDecl(Node):
     """Phase 5b: one variant of a sum type, e.g. `Circle(radius: Float)`."""
-    name: str = ""
-    # (field_name, TypeExpr); positional fields (e.g. `Some(Int)`) get
+    name: str = ""    # (field_name, TypeExpr); positional fields (e.g. `Some(Int)`) get
     # synthetic names `_0`, `_1`, ...
     fields: List[Tuple[str, TypeExpr]] = field(default_factory=list)
+
+
+@dataclass
+class TableDecl(Node):
+    """Phase 5 (DB): a declared table schema for typed SQL queries, e.g.
+    `table users { id: Int @primary, name: Text }`."""
+    name: str = ""
+    # (field_name, TypeExpr, is_primary)
+    fields: List[Tuple[str, TypeExpr, bool]] = field(default_factory=list)
 
 
 @dataclass

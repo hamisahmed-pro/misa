@@ -41,6 +41,54 @@ ORT_VERSION = "1.21.0"
 ORT_DIRNAME = f"onnxruntime-linux-x64-{ORT_VERSION}"
 
 
+def _sqlite_dir() -> str:
+    """SQLite amalgamation dir (Phase 5 DB), or '' when not vendored.
+
+    Expected layout: ~/workspace/deps/sqlite/sqlite3.{c,h} (public
+    domain amalgamation; see scripts/fetch_sqlite.py).
+    """
+    p = os.path.join(os.path.expanduser("~"), "workspace", "deps",
+                     "sqlite")
+    if os.path.isfile(os.path.join(p, "sqlite3.c")) \
+            and os.path.isfile(os.path.join(p, "sqlite3.h")):
+        return p
+    return ""
+
+
+def _uses_db(prog) -> bool:
+    """Does the program use the db.* namespace (or declare tables)?"""
+    from misa import ast as A
+
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if found or node is None:
+            return
+        if isinstance(node, A.TableDecl):
+            found = True
+            return
+        if isinstance(node, A.Call) and node.name.startswith("db."):
+            found = True
+            return
+        for f in getattr(node, "__dataclass_fields__", {}):
+            v = getattr(node, f)
+            if isinstance(v, A.Node):
+                visit(v)
+            elif isinstance(v, list):
+                for i in v:
+                    if isinstance(i, A.Node):
+                        visit(i)
+                    elif isinstance(i, tuple):
+                        for j in i:
+                            if isinstance(j, A.Node):
+                                visit(j)
+
+    for item in prog.items:
+        visit(item)
+    return found
+
+
 def _ort_root() -> str:
     """Extracted ORT dir, or '' when not vendored (graceful E504)."""
     p = os.path.join(os.path.expanduser("~"), "workspace", "deps",
@@ -420,57 +468,101 @@ def _cc_id(target: str) -> str:
     return _table_row(target).get("cc_id", "unknown-cc")
 
 
-def _rt_key(target: str = "", with_ort: bool = False) -> str:
+def _rt_key(target: str = "", with_ort: bool = False,
+            with_sqlite: bool = False) -> str:
     """Runtime cache key: target triple + C compiler id (fix B5) +
     flags + the full runtime source set (Phase 4 added platform_linux.c
     and ui_text.c to the hash). with_ort selects the ORT-linked
-    runtime variant (Phase 5, M2)."""
+    runtime variant (Phase 5, M2). with_sqlite adds the SQLite
+    amalgamation + misa_db.c (Phase 5, DB)."""
     target = canonical_target(target or host_triple())
     defines, cflags, libs = runtime_flags(target, with_ort)
     h = hashlib.sha256()
     h.update(target.encode())
     h.update(b"\x00" + _cc_id(target).encode())
     h.update(b"\x00" + (" ".join(defines + cflags + libs)).encode())
+    h.update(b"\x00sqlite" if with_sqlite else b"\x00nosqlite")
     for src in _rt_sources(target) + RT_HEADERS:
         p = os.path.join(RT_DIR, src)
         with open(p, "rb") as f:
             h.update(b"\x00" + f.read())
+    if with_sqlite:
+        for _, abspath in _sqlite_extra_sources():
+            with open(abspath, "rb") as f:
+                h.update(b"\x00" + f.read())
     return h.hexdigest()[:16]
 
 
-def ensure_runtime(target: str = "", with_ort: bool = False) -> list:
+def _sqlite_extra_sources():
+    """(display_name, abspath) pairs for the SQLite build, or []."""
+    d = _sqlite_dir()
+    if not d:
+        return []
+    return [("sqlite3.c", os.path.join(d, "sqlite3.c")),
+            ("misa_db.c", os.path.join(RT_DIR, "misa_db.c"))]
+
+
+def _sqlite_cflags():
+    d = _sqlite_dir()
+    if not d:
+        return []
+    # Self-contained: no pthread/dl dependency.
+    return ["-I" + d, "-DSQLITE_THREADSAFE=0",
+            "-DSQLITE_OMIT_LOAD_EXTENSION"]
+
+
+def ensure_runtime(target: str = "", with_ort: bool = False,
+                   with_sqlite: bool = False) -> list:
     """Compile the C runtime if stale; return [rt.o, ...].
 
     Host builds use gcc; the web target (M3) compiles with emcc.
     Other cross targets still need their toolchain (M6/M7).
     with_ort builds the ORT-linked variant (host only, Phase 5 M2).
+    with_sqlite adds the SQLite amalgamation + misa_db.c (Phase 5 DB).
     """
     target = canonical_target(target or host_triple())
     if target == "wasm32-unknown-emscripten":
         return _ensure_runtime_emcc(target)
     if target in ("aarch64-linux-android", "armv7-linux-androideabi",
                     "x86_64-linux-android"):
-        return _ensure_runtime_ndk(target)
+        return _ensure_runtime_ndk(target, with_sqlite)
     if target != host_triple():
         cc = _table_row(target).get("cc", "a cross C toolchain")
         raise RuntimeError(
             f"no C toolchain for target {target} yet "
             f"(needs: {cc}; Phase 4 M3/M6)")
+    if with_sqlite and not _sqlite_dir():
+        raise RuntimeError(
+            "db.* needs the SQLite amalgamation at "
+            "~/workspace/deps/sqlite/ (run scripts/fetch_sqlite.py)")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _rt_key(target, with_ort)
+    key = _rt_key(target, with_ort, with_sqlite)
     stamp = os.path.join(CACHE_DIR, f"stamp-{key}")
+    sources = list(_rt_sources(target))
+    extra = _sqlite_extra_sources() if with_sqlite else []
     objs = [os.path.join(CACHE_DIR,
-                         f"{src[:-2]}-{key}.o") for src in _rt_sources(target)]
+                         f"{src[:-2]}-{key}.o") for src in sources]
+    objs += [os.path.join(CACHE_DIR,
+                          f"{name[:-2]}-sqlite-{key}.o")
+             for name, _ in extra]
     if os.path.exists(stamp) and all(os.path.exists(o) for o in objs):
         return objs
     defines, cflags, _libs = runtime_flags(target, with_ort)
-    for src, out in zip(_rt_sources(target), objs):
+    for src, out in zip(sources, objs[:len(sources)]):
         cmd = (["gcc", "-O2", "-c", os.path.join(RT_DIR, src),
                 "-o", out] + defines + cflags)
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(
                 f"C runtime compile failed ({src}):\n{r.stderr}")
+    sflags = _sqlite_cflags()
+    for (name, abspath), out in zip(extra, objs[len(sources):]):
+        cmd = (["gcc", "-O2", "-c", abspath, "-o", out]
+               + defines + sflags)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"C runtime compile failed ({name}):\n{r.stderr}")
     with open(stamp, "w") as f:
         f.write("ok")
     return objs
@@ -500,22 +592,31 @@ def _ensure_runtime_emcc(target: str) -> list:
     return objs
 
 
-def _ensure_runtime_ndk(target: str) -> list:
+def _ensure_runtime_ndk(target: str, with_sqlite: bool = False) -> list:
     """Compile the Android runtime (platform_android.c + ui_android.c +
     jni_android.c) with the NDK clang (Phase 4, M6). Objects are
     cached under the same key scheme as the host; compiled -fPIC with
-    -Wall -Werror (zero warnings tolerated)."""
+    -Wall -Werror (zero warnings tolerated). with_sqlite adds the
+    SQLite amalgamation + misa_db.c (Phase 5, DB)."""
+    if with_sqlite and not _sqlite_dir():
+        raise RuntimeError(
+            "db.* needs the SQLite amalgamation at "
+            "~/workspace/deps/sqlite/ (run scripts/fetch_sqlite.py)")
     os.makedirs(CACHE_DIR, exist_ok=True)
-    key = _rt_key(target)
+    key = _rt_key(target, False, with_sqlite)
     stamp = os.path.join(CACHE_DIR, f"stamp-{key}")
-    sources = _rt_sources(target)
+    sources = list(_rt_sources(target))
+    extra = _sqlite_extra_sources() if with_sqlite else []
     objs = [os.path.join(CACHE_DIR, f"{src[:-2]}-{key}.o")
             for src in sources]
+    objs += [os.path.join(CACHE_DIR,
+                          f"{name[:-2]}-sqlite-{key}.o")
+             for name, _ in extra]
     if os.path.exists(stamp) and all(os.path.exists(o) for o in objs):
         return objs
     cc = _ndk_clang(canonical_target(target))
     defines, cflags, _libs = runtime_flags(target)
-    for src, out in zip(sources, objs):
+    for src, out in zip(sources, objs[:len(sources)]):
         cmd = ([cc, "-O2", "-fPIC", "-Wall", "-Werror",
                 "-DANDROID", "-c", os.path.join(RT_DIR, src),
                 "-o", out] + defines + cflags)
@@ -523,6 +624,16 @@ def _ensure_runtime_ndk(target: str) -> list:
         if r.returncode != 0:
             raise RuntimeError(
                 f"C runtime compile failed ({src}, {target}):\n{r.stderr}")
+    # SQLite: -O1 (faster build; still correct) and no -Werror — the
+    # amalgamation has warnings under -Wall that aren't ours to fix.
+    sflags = _sqlite_cflags()
+    for (name, abspath), out in zip(extra, objs[len(sources):]):
+        cmd = ([cc, "-O1", "-fPIC", "-DANDROID", "-c", abspath,
+                "-o", out] + defines + sflags)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"C runtime compile failed ({name}, {target}):\n{r.stderr}")
     with open(stamp, "w") as f:
         f.write("ok")
     return objs
@@ -690,6 +801,15 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
             f.write(str(mod))
 
     # --- web target: emcc link to misa.js + misa.wasm (M3) ------------
+    # Phase 5 (DB): SQLite ships for host + Android only in v1.
+    need_sqlite = _uses_db(merged)
+    if need_sqlite and eff_target not in (
+            host_triple(), "aarch64-linux-android",
+            "armv7-linux-androideabi", "x86_64-linux-android"):
+        return False, _err(
+            "E600",
+            f"db.* is not supported for target '{eff_target}' in v1 "
+            f"(host and Android only)")
     if eff_target == "wasm32-unknown-emscripten":
         return _link_emcc(obj_bytes, out_path, eff_target,
                           preload_files, verbose)
@@ -708,7 +828,7 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
     # --- host: link ----------------------------------------------------
     need_ort = bool(staged_models)
     _defines, _cflags, libs = runtime_flags(eff_target, need_ort)
-    rt_objs = ensure_runtime(eff_target, need_ort)
+    rt_objs = ensure_runtime(eff_target, need_ort, need_sqlite)
     with tempfile.TemporaryDirectory() as td:
         prog_o = os.path.join(td, "prog.o")
         with open(prog_o, "wb") as f:

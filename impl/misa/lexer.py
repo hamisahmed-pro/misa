@@ -17,6 +17,8 @@ KEYWORDS = {
     "fn", "import", "try", "catch", "throw",
     # Phase 5b: `match` expression for sum types.
     "match",
+    # Phase 5 (DB): `table` declarations for typed SQL queries.
+    "table",
 }
 
 # token kinds that trigger implicit semicolon insertion at newline
@@ -153,7 +155,8 @@ class Lexer:
             t = self._tok(two, two)
             self.advance(2)
             return t
-        if ch in "+-*/%()[]{}.,:|=?<>!":
+        if ch in "+-*/%()[]{}.,:|=?<>!@":
+            # Phase 5 (DB): `@` for `@primary` in table declarations.
             if ch == "!" :
                 raise LexError("unexpected '!'; did you mean '!=' or 'not'?",
                                line, col)

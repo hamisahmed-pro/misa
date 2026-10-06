@@ -141,6 +141,14 @@ MVal *misa_fs_read(MVal *path, int line, int col);          /* E303 */
 MVal *misa_fs_write(MVal *path, MVal *text, int line, int col); /* E303 */
 MVal *misa_http_get(MVal *url, int line, int col);           /* E304 */
 
+/* -- db (Phase 5): SQLite bindings (misa_db.c) ------------------------ */
+MVal *misa_db_open(MVal *path, int line, int col);           /* E303 */
+MVal *misa_db_exec(MVal *h, MVal *sql, MVal *args,
+                   int line, int col);                       /* E303 */
+MVal *misa_db_query(MVal *h, MVal *sql, MVal *args,
+                    int line, int col);                      /* E303 */
+MVal *misa_db_close(MVal *h, int line, int col);              /* E303 */
+
 /* -- screens (text preview tree, same as the interpreter) ------------- */
 /* Emitter filters out `id` args at compile time. */
 void  misa_screen_begin(const char *name);

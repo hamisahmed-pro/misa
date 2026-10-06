@@ -5,13 +5,14 @@ Collects diagnostics (does not raise on first error):
 """
 from __future__ import annotations
 import os
+import re
 from typing import Dict, List, Optional
 from . import ast
 
 
 PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void"}
 MEDIA = {"Photo", "Audio", "Video", "Document"}
-SPECIAL = {"TokenStream", "Embedding"}
+SPECIAL = {"TokenStream", "Embedding", "Db"}
 BUILTINS = {
     "print": (["Text"], "Text"),  # print accepts anything; modeled loosely
     "len": (["any"], "Int"),
@@ -40,6 +41,18 @@ NS_BUILTINS = {
     "str.ord": (["Text"], "Int"),
     "str.chr": (["Int"], "Text"),
     "process.run": (["[Text]"], "record"),
+    # Phase 5 (DB): SQLite bindings. `db.exec`/`db.query` take an
+    # optional third `args` list (see NS_BUILTIN_ARITY).
+    "db.open": (["Text"], "Db"),
+    "db.exec": (["Db", "Text", "[Text]"], "Int"),
+    "db.query": (["Db", "Text", "[Text]"], "[record]"),
+    "db.close": (["Db"], "Void"),
+}
+# Phase 5 (DB): namespaced builtins with optional trailing args:
+# name -> (min_arity, max_arity). Absent = exact arity from NS_BUILTINS.
+NS_BUILTIN_ARITY = {
+    "db.exec": (2, 3),
+    "db.query": (2, 3),
 }
 
 LAYOUT_COMPONENTS = {"Column", "Row"}
@@ -48,6 +61,32 @@ LEAF_COMPONENTS = {
     "Banner", "CameraButton", "Spacer",
 }
 ALL_COMPONENTS = LAYOUT_COMPONENTS | LEAF_COMPONENTS
+
+# Phase 5 (DB): minimal SELECT shape for typed db.query validation.
+_DB_SELECT_RE = re.compile(
+    r"^\s*SELECT\s+(?P<cols>.+?)\s+FROM\s+"
+    r"(?P<table>[A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+WHERE\s+(?P<where>.+?))?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL)
+_DB_WHERE_KW = {"and", "or", "not", "null", "like", "in", "is", "between",
+                "true", "false", "nil", "select", "from", "where"}
+
+
+def _split_top_commas(s: str) -> List[str]:
+    """Split on commas not nested inside parentheses."""
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
 
 
 class Checker:
@@ -68,6 +107,10 @@ class Checker:
         # Phase 5c: type parameters in scope while checking a generic
         # fn or type decl (e.g. `T` in `fn first<T>(...)`).
         self._tparams: List[str] = []
+        # Phase 5 (DB): declared table schemas, name -> TableDecl.
+        self.tables: Dict[str, ast.TableDecl] = {}
+        # Phase 5 (DB): counter for synthetic query-result record types.
+        self._query_seq = 0
 
     # -- diagnostics ----------------------------------------------------
 
@@ -105,6 +148,8 @@ class Checker:
                     self.aliases[alias] = (prov, mid)
             elif isinstance(item, ast.TypeDecl):
                 self._dup(self.types, item.name, item, "type")
+            elif isinstance(item, ast.TableDecl):
+                self._dup(self.tables, item.name, item, "table")
             elif isinstance(item, ast.ModelDecl):
                 self._dup(self.models, item.name, item, "model")
             elif isinstance(item, ast.ScreenDecl):
@@ -145,6 +190,8 @@ class Checker:
             self._check_fn(item)
         elif isinstance(item, ast.TypeDecl):
             self._check_type_decl(item)
+        elif isinstance(item, ast.TableDecl):
+            self._check_table_decl(item)
         elif isinstance(item, (ast.AppDecl, ast.ProviderDecl,
                                ast.ModelsDecl,
                                ast.ImportDecl)):
@@ -171,6 +218,11 @@ class Checker:
                     self._check_te(fte, fte.line, fte.col)
         finally:
             self._tparams = saved_tparams
+
+    def _check_table_decl(self, decl: ast.TableDecl):
+        """Phase 5 (DB): validate a table decl's column types."""
+        for _, fte, _ in decl.fields:
+            self._check_te(fte, fte.line, fte.col)
 
     def _check_fn(self, fn: ast.FnDecl):
         seen_params = set()
@@ -999,9 +1051,11 @@ class Checker:
             return fret
         if e.name in NS_BUILTINS:
             params, ret = NS_BUILTINS[e.name]
-            if len(e.args) != len(params):
+            lo, hi = NS_BUILTIN_ARITY.get(e.name, (len(params),
+                                                  len(params)))
+            if not (lo <= len(e.args) <= hi):
                 self.error("E102",
-                           f"'{e.name}' takes {len(params)} args, "
+                           f"'{e.name}' takes {lo}-{hi} args, "
                            f"got {len(e.args)}", e.line, e.col)
             else:
                 for want_t, a, at in zip(params, e.args, arg_ts):
@@ -1009,6 +1063,11 @@ class Checker:
                         self.error("E211",
                                    f"'{e.name}' wants {want_t}, got {at}",
                                    a.line, a.col)
+            # Phase 5 (DB): typed query results against `table` decls.
+            if e.name == "db.query" and len(e.args) >= 2:
+                typed = self._check_db_query(e, arg_ts)
+                if typed is not None:
+                    return typed
             return ret
         if e.name in BUILTINS:
             lo, hi = BUILTIN_ARITY[e.name]
@@ -1044,6 +1103,106 @@ class Checker:
             self.error("E102",
                        f"model '{e.name}' takes {want} args, "
                        f"got {len(e.args)}", e.line, e.col)
+
+    # -- Phase 5 (DB): typed queries ------------------------------------
+
+    def _check_db_query(self, e: ast.Call,
+                        arg_ts: list) -> Optional[str]:
+        """Validate `db.query(db, sql)` against `table` decls.
+
+        Returns the synthetic result type string (e.g. `[$query_0]`)
+        when the SQL is a plain string literal over a declared table,
+        else None (dynamic `[record]`, no static checking).
+        Unknown tables/columns are E224.
+        """
+        sql_arg = e.args[1]
+        # Only plain (non-interpolated) string literals are statically
+        # checkable: StrLit.parts is [str] for plain strings.
+        if not isinstance(sql_arg, ast.StrLit) \
+                or len(sql_arg.parts) != 1 \
+                or not isinstance(sql_arg.parts[0], str):
+            return None
+        parsed = self._parse_select(sql_arg.parts[0])
+        if parsed is None:
+            return None
+        table_name, cols, where_cols = parsed
+        decl = self.tables.get(table_name)
+        if decl is None:
+            # Undeclared table: dynamic records, not an error.
+            return None
+        col_types = {fn: fte for fn, fte, _ in decl.fields}
+        # Validate WHERE identifiers (v1: name validation only).
+        for wc in where_cols:
+            if wc not in col_types:
+                self.error("E224",
+                           f"unknown column '{wc}' in WHERE clause "
+                           f"(table '{table_name}' has no such column)",
+                           sql_arg.line, sql_arg.col)
+        # Resolve the select list.
+        if cols == ["*"]:
+            sel = [(fn, fte) for fn, fte, _ in decl.fields]
+        else:
+            sel = []
+            for cname, _alias in cols:
+                if cname not in col_types:
+                    self.error("E224",
+                               f"unknown column '{cname}' "
+                               f"(table '{table_name}' has no such column)",
+                               sql_arg.line, sql_arg.col)
+                    continue
+                sel.append((cname, col_types[cname]))
+        # Synthesize a record type for the result rows so field
+        # access type-checks through the existing machinery.
+        self._query_seq += 1
+        tname = f"$query_{self._query_seq}"
+        self.types[tname] = ast.TypeDecl(
+            name=tname,
+            fields=[(fn, fte) for fn, fte in sel],
+            line=e.line, col=e.col)
+        return f"[{tname}]"
+
+    @staticmethod
+    def _parse_select(sql: str):
+        """Minimal SELECT parser (v1). Returns
+        (table, [(col, alias)], [where_cols]) or None when the SQL
+        isn't a plain `SELECT ... FROM ... [WHERE ...]`."""
+        m = _DB_SELECT_RE.match(sql)
+        if not m:
+            return None
+        table = m.group("table")
+        raw_cols = m.group("cols").strip()
+        if raw_cols == "*":
+            cols = ["*"]
+        else:
+            cols = []
+            for part in _split_top_commas(raw_cols):
+                part = part.strip()
+                if not part:
+                    return None
+                # `t.col`, `col AS alias`, `col alias`
+                toks = part.split()
+                first = toks[0]
+                cname = first.rpartition(".")[2]
+                alias = None
+                if len(toks) >= 3 and toks[1].upper() == "AS":
+                    alias = toks[2]
+                elif len(toks) == 2:
+                    alias = toks[1]
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cname):
+                    return None  # expressions: not v1-checkable
+                cols.append((cname, alias or cname))
+        where_cols = []
+        where = m.group("where")
+        if where:
+            # strip string literals so 'O''Brien' doesn't yield identifiers
+            no_str = re.sub(r"'(?:[^']|'')*'", " ", where)
+            for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", no_str):
+                if tok.lower() not in _DB_WHERE_KW \
+                        and not tok[0].isdigit():
+                    wc = tok.rpartition(".")[2]
+                    if wc not in where_cols:
+                        where_cols.append(wc)
+        return table, cols, where_cols
 
     # -- Phase 5b: sum types ------------------------------------------
 

@@ -57,6 +57,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E221 | **(Phase 5c)** Type-argument arity mismatch (`'Box' takes 1 type argument(s), got 2`). |
 | E222 | **(Phase 5c)** Unbound type variable — a name used as a type inside a generic declaration that is not one of its type parameters (`unbound type variable 'K'`). |
 | E223 | **(Phase 5c)** Monomorphization depth exceeded — recursive generic instantiation in AOT (`f<T>` calling `f<[T]>`); restructure to avoid infinite specialization. |
+| E224 | **(Phase 5 DB)** Unknown table or column in a `db.query` SQL string validated against `table` declarations (`unknown column 'nam' (table 'users' has no such column)`). Queries over undeclared tables are dynamic, not errors. |
 
 ## E3xx — runtime
 

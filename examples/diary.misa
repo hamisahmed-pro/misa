@@ -1,0 +1,28 @@
+// diary.misa — offline diary. SQLite storage, zero network.
+// Adds two entries, then lists them newest-first.
+
+table entries {
+  id: Int @primary,
+  body: Text,
+  created: Text,
+}
+
+fn add_entry(db: Db, body: Text) {
+  db.exec(db, "INSERT INTO entries (body, created) VALUES (?, ?)",
+          [body, "2026-10-06"])
+}
+
+fn list_entries(db: Db) {
+  let rows = db.query(db, "SELECT id, body, created FROM entries ORDER BY id")
+  print("--- diary ---")
+  for r in rows {
+    print("{r.id}: {r.body} ({r.created})")
+  }
+}
+
+let db = db.open("diary.db")
+db.exec(db, "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY, body TEXT, created TEXT)")
+add_entry(db, "Shipped the Misa database story.")
+add_entry(db, "SQLite runs offline on my phone now.")
+list_entries(db)
+db.close(db)

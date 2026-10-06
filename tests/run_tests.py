@@ -1525,6 +1525,144 @@ def _():
     eq(run_src(src), "2\n1\n")
 
 
+# ---------------------------------------------------------------- Phase 5: database (SQLite)
+
+@test("db: open/exec/query/close roundtrip")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")\n'
+           'print(db.exec(db, "INSERT INTO t (name) VALUES (?)", ["x"]))\n'
+           'let rows = db.query(db, "SELECT id, name FROM t")\n'
+           'print(len(rows))\n'
+           'print(rows[0].name)\n'
+           'db.close(db)\n'
+           'print("closed")\n')
+    eq(run_src(src), "1\n1\nx\nclosed\n")
+
+
+@test("db: type mapping int/float/text/null")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE m (i INTEGER, f REAL, t TEXT, n TEXT)")\n'
+           'db.exec(db, "INSERT INTO m VALUES (1, 2.5, \'hi\', NULL)")\n'
+           'let r = db.query(db, "SELECT i, f, t, n FROM m")[0]\n'
+           'print(r.i)\n'
+           'print(r.f)\n'
+           'print(r.t)\n'
+           'print(r.n)\n'
+           'db.close(db)\n')
+    eq(run_src(src), "1\n2.5\nhi\nnil\n")
+
+
+@test("db: exec returns rows changed; update/delete")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec(db, "CREATE TABLE u (name TEXT)")\n'
+           'db.exec(db, "INSERT INTO u VALUES (?), (?), (?)", ["a", "b", "c"])\n'
+           'print(db.exec(db, "UPDATE u SET name = ? WHERE name = ?", ["z", "a"]))\n'
+           'print(db.exec(db, "DELETE FROM u WHERE name = ?", ["b"]))\n'
+           'print(len(db.query(db, "SELECT name FROM u")))\n'
+           'db.close(db)\n')
+    eq(run_src(src), "1\n1\n2\n")
+
+
+@test("db: sql error throws E303")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'try {\n    db.exec(db, "CREATE TABL broken")\n'
+           '} catch e {\n    print(e.code)\n}\n'
+           'db.close(db)\n')
+    eq(run_src(src), "E303\n")
+
+
+@test("db: query on missing table throws E303")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'try {\n    db.query(db, "SELECT * FROM nope")\n'
+           '} catch e {\n    print(e.code)\n}\n'
+           'db.close(db)\n')
+    eq(run_src(src), "E303\n")
+
+
+@test("db: checker table decl + typed query")
+def _():
+    src = ('table users {\n'
+           '  id: Int @primary,\n'
+           '  name: Text,\n'
+           '}\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id, name FROM users")\n'
+           'for r in rows {\n'
+           '  print(r.name)\n'
+           '}\n')
+    eq(check_source(src), [])
+
+
+@test("db: checker E224 unknown column")
+def _():
+    src = ('table users {\n'
+           '  id: Int @primary,\n'
+           '  name: Text,\n'
+           '}\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id, nam FROM users")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E224" and "nam" in e["message"]
+               for e in errs), errs
+
+
+@test("db: checker E224 unknown column in WHERE")
+def _():
+    src = ('table users {\n'
+           '  id: Int @primary,\n'
+           '  name: Text,\n'
+           '}\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id FROM users WHERE age > 3")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E224" and "age" in e["message"]
+               for e in errs), errs
+
+
+@test("db: checker query on undeclared table is dynamic (no error)")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT a FROM whatever")\n')
+    eq(check_source(src), [])
+
+
+@test("db: checker db.exec arity E102")
+def _():
+    errs = check_source('let db = db.open(":memory:")\n'
+                        'db.exec(db)\n')
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("db: checker db.query arg type E211")
+def _():
+    errs = check_source('let db = db.open(":memory:")\n'
+                        'db.query(db, 42)\n')
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("db: checker duplicate table E210")
+def _():
+    errs = check_source('table t {\n  a: Int,\n}\n'
+                        'table t {\n  b: Int,\n}\n')
+    assert any(e["code"] == "E210" for e in errs), errs
+
+
+@test("db: parser rejects unknown table attribute")
+def _():
+    from misa.parser import ParseError
+    try:
+        parse_source('table t {\n  a: Int @bogus,\n}\n')
+    except ParseError as ex:
+        assert "bogus" in str(ex), ex
+        return
+    raise AssertionError("expected ParseError for @bogus")
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

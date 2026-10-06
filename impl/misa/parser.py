@@ -77,6 +77,8 @@ class Parser:
             return self.parse_models()
         if k == "type":
             return self.parse_type_decl()
+        if k == "table":
+            return self.parse_table_decl()
         if k == "model":
             return self.parse_model_decl()
         if k == "screen":
@@ -172,6 +174,35 @@ class Parser:
             self.skip_semis()
         self.expect("}", "'}'")
         return ast.ModelsDecl(entries=entries, line=t.line, col=t.col)
+
+    def parse_table_decl(self) -> ast.TableDecl:
+        """Phase 5 (DB): `table users { id: Int @primary, name: Text }`."""
+        t = self.expect("table", "'table'")
+        name = self.expect_ident("table name").value
+        self.expect("{", "'{'")
+        fields = []
+        self.skip_semis()
+        while not self.at("}"):
+            fk = self.expect_ident("column name").value
+            self.expect(":", "':'")
+            te = self.parse_type_expr()
+            primary = False
+            if self.at("@"):
+                self.advance()
+                attr = self.expect_ident("attribute name").value
+                if attr != "primary":
+                    raise ParseError(
+                        f"unknown table attribute '@{attr}' "
+                        f"(only '@primary' is supported)",
+                        self.peek().line, self.peek().col)
+                primary = True
+            fields.append((fk, te, primary))
+            if self.at(","):
+                self.advance()
+            self.skip_semis()
+        self.expect("}", "'}'")
+        return ast.TableDecl(name=name, fields=fields,
+                             line=t.line, col=t.col)
 
     def parse_type_decl(self) -> ast.TypeDecl:
         t = self.expect("type", "'type'")

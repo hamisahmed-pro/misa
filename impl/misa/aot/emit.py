@@ -136,6 +136,11 @@ _RT_SIGS = {
     "misa_fs_read": (PTR, [PTR, I32, I32]),
     "misa_fs_write": (PTR, [PTR, PTR, I32, I32]),
     "misa_http_get": (PTR, [PTR, I32, I32]),
+    # Phase 5 (DB): SQLite bindings.
+    "misa_db_open": (PTR, [PTR, I32, I32]),
+    "misa_db_exec": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_db_query": (PTR, [PTR, PTR, PTR, I32, I32]),
+    "misa_db_close": (PTR, [PTR, I32, I32]),
     "misa_text_z": (PTR, [PTR]),
     "misa_screen_begin": (ir.VoidType(), [PTR]),
     "misa_screen_comp_begin": (ir.VoidType(), [PTR, I32]),
@@ -548,6 +553,7 @@ class Emitter:
         top_stmts = [item for item in self.prog.items
                      if not isinstance(item, (A.AppDecl, A.ProviderDecl,
                                              A.ModelsDecl, A.TypeDecl,
+                                             A.TableDecl,
                                              A.ModelDecl, A.ScreenDecl,
                                              A.EvalDecl, A.FnDecl,
                                              A.ImportDecl))]
@@ -556,7 +562,8 @@ class Emitter:
         scope = ctx.scope
         for item in self.prog.items:
             if isinstance(item, (A.AppDecl, A.ProviderDecl, A.ModelsDecl,
-                                 A.TypeDecl, A.ModelDecl, A.ScreenDecl,
+                                 A.TypeDecl, A.TableDecl, A.ModelDecl,
+                                 A.ScreenDecl,
                                  A.EvalDecl, A.FnDecl, A.ImportDecl)):
                 continue
             self.emit_stmt(item, ctx)
@@ -1147,6 +1154,23 @@ class Emitter:
                              [arg(0), arg(1), line, col], e)
         if name == "http.get":
             return self.call(ctx, "misa_http_get", [arg(0), line, col],
+                             e)
+        # Phase 5 (DB): SQLite bindings. The optional `args` list
+        # defaults to an empty list.
+        if name == "db.open":
+            return self.call(ctx, "misa_db_open", [arg(0), line, col], e)
+        if name == "db.exec":
+            alist = arg(2) if len(e.args) > 2 else self.call(
+                ctx, "misa_list_new", [], e, check=False)
+            return self.call(ctx, "misa_db_exec",
+                             [arg(0), arg(1), alist, line, col], e)
+        if name == "db.query":
+            alist = arg(2) if len(e.args) > 2 else self.call(
+                ctx, "misa_list_new", [], e, check=False)
+            return self.call(ctx, "misa_db_query",
+                             [arg(0), arg(1), alist, line, col], e)
+        if name == "db.close":
+            return self.call(ctx, "misa_db_close", [arg(0), line, col],
                              e)
         if name in self._MEDIA_KIND:
             return self.call(ctx, "misa_builtin_media",

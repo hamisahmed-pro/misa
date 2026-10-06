@@ -50,6 +50,37 @@ untrusted Misa programs — a program can read and write your files.
 |---|---|---|
 | `process.run` | `process.run(cmd: [Text]) -> record` | Run a command; returns `{code: Int, stdout: Text, stderr: Text}`. Throws `Error{code: "E303"}` when the command cannot be started or times out (5 minutes). **Security note:** a Misa program with `process.run` can execute arbitrary commands — treat it with the same care as `fs.write`. |
 
+## 3d. Database (`db` namespace) — Phase 5
+
+SQLite, zero dependencies. `Db` is an opaque handle type.
+
+| Function | Signature | Description |
+|---|---|---|
+| `db.open` | `db.open(path: Text) -> Db` | Open (creating if needed) a SQLite database; `":memory:"` for transient DBs. |
+| `db.exec` | `db.exec(db: Db, sql: Text, args: [Text]?) -> Int` | Run a statement; returns rows changed. `?` placeholders bound from `args`. |
+| `db.query` | `db.query(db: Db, sql: Text, args: [Text]?) -> [record]` | Run a SELECT; returns a list of records (column name → value). INTEGER→Int, REAL→Float, TEXT→Text, NULL→nil; BLOB is an E303 error in v1. |
+| `db.close` | `db.close(db: Db) -> Void` | Close the handle. |
+
+All four throw `Error{code: "E303"}` on SQLite failures.
+
+**Typed queries.** Declare schemas with `table`; the checker validates
+table/column names in `db.query` SQL at compile time (E224) and infers
+the result record type:
+
+```misa
+table users {
+  id: Int @primary,
+  name: Text,
+  email: Text?,
+}
+let rows = db.query(db, "SELECT id, name FROM users")
+// rows: [{id: Int, name: Text}] — r.name type-checks
+```
+
+Queries over undeclared tables return dynamic `[record]` (no static
+checking, not an error). v1 validates names in SELECT/FROM/WHERE only —
+no JOIN or expression type-checking.
+
 ## 4. Maps
 
 `Map<K, V>` with `K` = `Text` or `Int`:

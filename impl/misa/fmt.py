@@ -38,6 +38,7 @@ class Formatter:
         return self.text()
 
     _DECLS = (ast.AppDecl, ast.ProviderDecl, ast.ModelsDecl, ast.TypeDecl,
+              ast.TableDecl,
               ast.ModelDecl, ast.ScreenDecl, ast.EvalDecl, ast.FnDecl,
               ast.ImportDecl)
 
@@ -89,6 +90,15 @@ class Formatter:
             else:
                 for fn, fte in item.fields:
                     self.w(f"{fn}: {self.fmt_type(fte)},")
+            self.ind -= 1
+            self.w("}")
+        elif isinstance(item, ast.TableDecl):
+            # Phase 5 (DB): table declarations.
+            self.w(f"table {item.name} {{")
+            self.ind += 1
+            for fn, fte, primary in item.fields:
+                attr = " @primary" if primary else ""
+                self.w(f"{fn}: {self.fmt_type(fte)}{attr},")
             self.ind -= 1
             self.w("}")
         elif isinstance(item, ast.ModelDecl):
