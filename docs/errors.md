@@ -80,13 +80,15 @@ types.
 ```
 
 ```
-1:1: E211: function 'f' may exit without returning Int
+5:5: E211: function 'f' may exit without returning Int
   hint: every code path must end in 'return'
 ```
 
 The second form is the one newcomers hit most: a non-`Void` function
-must `return` on *every* path, including after `try`/`catch`. When in
-doubt, use a `var` accumulator and a single trailing `return`.
+must `return` on *every* path, including after `try`/`catch`. The error
+points at the leaking branch (not the function header) so you can see
+which path falls through. When in doubt, use a `var` accumulator and a
+single trailing `return`.
 
 **E213 — can't infer a lambda parameter:**
 

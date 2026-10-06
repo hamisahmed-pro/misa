@@ -650,7 +650,14 @@ class Parser:
             self.advance()
         if self.at("else"):
             self.advance()
-            els = self.parse_block()
+            # W-5: 'else if' desugars to 'else { if ... }' — the else
+            # branch holds the nested IfStmt as a single statement.
+            # All backends (interp/checker/emit) walk els as a generic
+            # statement list, so no AST or backend change is needed.
+            if self.at("if"):
+                els = [self.parse_if()]
+            else:
+                els = self.parse_block()
         self.maybe_semi()
         return ast.IfStmt(cond=cond, then=then, els=els,
                           line=t.line, col=t.col)
@@ -1001,6 +1008,11 @@ class Parser:
             self.advance()
             parts = self.parse_string_parts(t.value, t.line, t.col)
             return ast.StrLit(parts=parts, line=t.line, col=t.col)
+        if t.kind == "RAWSTRING":
+            # W-6: raw strings are literal — no interpolation parsing.
+            self.advance()
+            return ast.StrLit(parts=[t.value], raw=True,
+                              line=t.line, col=t.col)
         if t.kind == "DURATION":
             self.advance()
             return ast.DurationLit(ms=t.value, line=t.line, col=t.col)

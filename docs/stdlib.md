@@ -72,6 +72,7 @@ iOS ✅ (device run not yet verified), web ✅.
 | `str.trim` | `str.trim(s: Text) -> Text` — strips Unicode whitespace |
 | `str.ord` | `str.ord(c: Text) -> Int` — code point of first char; `E300` on empty |
 | `str.chr` | `str.chr(code: Int) -> Text` — `E300` on negatives, surrogates, `> 0x10FFFF` |
+| `str.chars` | `str.chars(s: Text) -> [Text]` — code points as single-char texts (what `for x in s` iterates) |
 
 ```misa
 print(str.slice("hello", 1, 4))      // ell

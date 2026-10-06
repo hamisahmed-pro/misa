@@ -1623,6 +1623,22 @@ MVal *misa_str_split(MVal *s, MVal *sep, int line, int col) {
     return out;
 }
 
+/* W-4: str.chars(s) -> [Text]: the code points of s as single-char
+ * texts. This is exactly what `for x in s` iterates; the explicit
+ * form is discoverable and composes (len, indexing, etc.). */
+MVal *misa_str_chars(MVal *s, int line, int col) {
+    if (s->tag != M_TAG_TEXT) {
+        misa_raise("E300", "str.chars(Text) needs a text arg",
+                   line, col);
+        return NULL;
+    }
+    MVal *out = misa_list_new();
+    int64_t n = (int64_t)misa_text_nchars(s);
+    for (int64_t i = 0; i < n; i++)
+        misa_list_push(out, misa_text_char_at(s, i, line, col));
+    return out;
+}
+
 MVal *misa_str_trim(MVal *s, int line, int col) {
     if (s->tag != M_TAG_TEXT) {
         misa_raise("E300", "str.trim(Text) needs a text arg", line, col);

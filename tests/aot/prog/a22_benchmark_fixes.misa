@@ -1,0 +1,35 @@
+// Solutions sprint: benchmark weaknesses W-4/W-5/W-6 parity.
+// W-5: else-if chains.
+fn classify(n: Int) -> Text {
+  if n < 0 {
+    return "negative"
+  } else if n == 0 {
+    return "zero"
+  } else if n < 10 {
+    return "small"
+  } else {
+    return "big"
+  }
+}
+print(classify(-3))
+print(classify(0))
+print(classify(7))
+print(classify(99))
+
+// W-6: raw strings — no interpolation, no escapes, byte-identical.
+let who = "Ada"
+print(r"hello {who}")
+print(r"C:\new\{who}")
+print(r"""{"a": 1, "b": "{who}"}""")
+
+// W-4: str.chars — explicit code-point list.
+let cs = str.chars("héllo")
+print(len(cs))
+print(cs[0])
+print(cs[1])
+// for-over-text iterates the same code points.
+var acc = ""
+for c in "ab" {
+  acc = acc + c
+}
+print(acc)

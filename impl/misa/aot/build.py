@@ -298,6 +298,16 @@ RT_SOURCES_BY_TARGET = {
 }
 RT_HEADERS = ("misa_rt.h", "misa_platform.h", "misa_ui.h", "jni_android.h")
 
+# W-2 (tree-shaking): compile every runtime TU with per-function/data
+# sections so the linker can garbage-collect unreferenced code
+# (-Wl,--gc-sections at link). The runtime cache key hashes cflags, so
+# adding these flags automatically invalidates stale objects.
+SECTION_CFLAGS = ["-ffunction-sections", "-fdata-sections"]
+# Linker flag that drops unreferenced sections. For shared-library
+# links (Android .so), JNI entry points are resolved dynamically by
+# the JVM and must be force-kept with -u (see build_apk.py).
+GC_LINK_FLAG = "-Wl,--gc-sections"
+
 EMSDK_DIR = (os.environ.get("EMSDK")              # set by emsdk_env.sh
              or os.environ.get("MISA_EMSDK_DIR")    # manual override
              or os.path.join(os.path.expanduser("~"), "workspace", "emsdk"))
@@ -403,7 +413,7 @@ def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
         # the web target uses the emscripten_fetch transport
         # (MISA_USE_FETCH) for both http.get and network model calls.
         defines.append("-DMISA_USE_FETCH")
-        return defines, cflags, libs
+        return defines, cflags + SECTION_CFLAGS, libs
     if target in ("aarch64-linux-android", "armv7-linux-androideabi",
                     "x86_64-linux-android"):
         # Phase 4 (M6): Boehm GC when the vendored bdwgc Android build
@@ -425,7 +435,7 @@ def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
             libs.append(os.path.join(gc_dir, "lib", "libgc.a"))
         defines.append("-DMISA_USE_JNI_HTTP")
         libs += ["-llog", "-landroid", "-lm"]  # misa_rt.c uses <math.h>
-        return defines, cflags, libs
+        return defines, cflags + SECTION_CFLAGS, libs
     if target == host_triple():
         vendored_gc_h = os.path.join(DEPS_INCLUDE, "gc.h")
         if _have_header(vendored_gc_h):
@@ -462,7 +472,7 @@ def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
                 libs.append(ort_lib)
             libs.append("-Wl,-rpath,$ORIGIN")
     libs.append("-lm")
-    return defines, cflags, libs
+    return defines, cflags + SECTION_CFLAGS, libs
 
 
 def _table_row(target: str) -> dict:
@@ -516,8 +526,9 @@ def _sqlite_cflags():
     if not d:
         return []
     # Self-contained: no pthread/dl dependency.
+    # W-2: section flags so --gc-sections can drop unused sqlite code.
     return ["-I" + d, "-DSQLITE_THREADSAFE=0",
-            "-DSQLITE_OMIT_LOAD_EXTENSION"]
+            "-DSQLITE_OMIT_LOAD_EXTENSION"] + SECTION_CFLAGS
 
 
 def ensure_runtime(target: str = "", with_ort: bool = False,
@@ -858,8 +869,11 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
         prog_o = os.path.join(td, "prog.o")
         with open(prog_o, "wb") as f:
             f.write(obj_bytes)
+        # W-2: --gc-sections drops unreferenced runtime code; -s strips
+        # the (large, -g-built) vendored libgc.a debug info. Neither is
+        # needed at runtime (no backtraces/dLaddr in the runtime).
         cmd = (["gcc", prog_o] + rt_objs +
-               ["-o", out_path] + libs)
+               ["-o", out_path, GC_LINK_FLAG, "-Wl,-s"] + libs)
         if verbose:
             print("link:", " ".join(cmd), file=sys.stderr)
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -910,6 +924,7 @@ EMCC_LINK_FLAGS = [
     "-s", "EXPORTED_RUNTIME_METHODS=ccall",
     "-s", "ALLOW_MEMORY_GROWTH=1",
     "-s", "FETCH=1",  # link libfetch.js (emscripten_fetch for http.get)
+    "-Wl,--gc-sections",  # W-2: drop unreferenced runtime sections
     "--js-library", os.path.join(RT_DIR, "dom_bridge.js"),
     "--pre-js", os.path.join(RT_DIR, "dom_bridge_pre.js"),
 ]

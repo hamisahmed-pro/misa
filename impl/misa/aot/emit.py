@@ -159,6 +159,7 @@ _RT_SIGS = {
     "misa_str_starts_with": (PTR, [PTR, PTR, I32, I32]),
     "misa_str_split": (PTR, [PTR, PTR, I32, I32]),
     "misa_str_trim": (PTR, [PTR, I32, I32]),
+    "misa_str_chars": (PTR, [PTR, I32, I32]),
     "misa_str_ord": (PTR, [PTR, I32, I32]),
     "misa_str_chr": (PTR, [PTR, I32, I32]),
     # Phase 5 (DB): SQLite bindings.
@@ -1360,6 +1361,9 @@ class Emitter:
         if name == "str.split":
             return self.call(ctx, "misa_str_split",
                              [arg(0), arg(1), line, col], e)
+        if name == "str.chars":
+            return self.call(ctx, "misa_str_chars",
+                             [arg(0), line, col], e)
         if name == "str.trim":
             return self.call(ctx, "misa_str_trim",
                              [arg(0), line, col], e)

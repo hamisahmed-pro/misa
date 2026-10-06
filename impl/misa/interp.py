@@ -829,6 +829,13 @@ class Interpreter:
             if args[1] == "":
                 raise RuntimeError_("str.split separator is empty")
             return args[0].split(args[1])
+        if name == "str.chars":
+            if not isinstance(args[0], str):
+                raise RuntimeError_(
+                    "str.chars(Text) needs a text arg")
+            # list(str) splits by code point — matches `for x in s`
+            # and the AOT misa_str_chars.
+            return list(args[0])
         if name == "str.trim":
             if not isinstance(args[0], str):
                 raise RuntimeError_("str.trim(Text) needs a text arg")

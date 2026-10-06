@@ -260,6 +260,7 @@ class FloatLit(Node):
 @dataclass
 class StrLit(Node):
     parts: List[Any] = field(default_factory=list)  # str | Expr
+    raw: bool = False  # W-6: from r"..." — fmt must preserve rawness
 
 
 @dataclass

@@ -44,6 +44,19 @@ print("hello {name}, you have {n + 1} messages")
 close an interpolation is just a literal character.) Interpolation cannot
 nest double-quoted strings: compute the value first, then interpolate it.
 
+### Raw strings
+
+Prefix with `r` to disable interpolation and escapes — braces and
+backslashes stay literal. Ideal for JSON templates, regexes, and
+Windows paths:
+
+```misa
+let name = "Ada"
+print(r"hello {name}")          // hello {name}
+print(r"""{"user": "{name}"}""")  // {"user": "{name}"}
+print(r"C:\new\folder")         // C:\new\folder
+```
+
 ## Functions
 
 ```misa
@@ -260,6 +273,8 @@ Field names and types are checked at compile time (E202 on mismatch).
 let n = 7
 if n % 2 == 0 {
     print("even")
+} else if n % 3 == 0 {
+    print("divisible by 3")
 } else {
     print("odd")
 }
@@ -272,6 +287,12 @@ while i < 3 {
 
 for c in ["a", "b", "c"] {
     print(c)
+}
+
+// `for x in <text>` iterates Unicode code points (like Python).
+// For an explicit list, use str.chars:
+for c in str.chars("héllo") {
+    print(c)  // h, é, l, l, o
 }
 ```
 

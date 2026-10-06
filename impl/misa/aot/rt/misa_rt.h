@@ -178,6 +178,8 @@ MVal *misa_str_slice(MVal *s, MVal *i, MVal *j, int line, int col);
 MVal *misa_str_starts_with(MVal *s, MVal *prefix, int line, int col);
 MVal *misa_str_split(MVal *s, MVal *sep, int line, int col);
 MVal *misa_str_trim(MVal *s, int line, int col);
+/* W-4: explicit code-point list; `for x in text` iterates the same. */
+MVal *misa_str_chars(MVal *s, int line, int col);
 MVal *misa_str_ord(MVal *c, int line, int col);
 MVal *misa_str_chr(MVal *code, int line, int col);
 

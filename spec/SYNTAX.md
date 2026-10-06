@@ -22,6 +22,9 @@ INT      := [0-9]+
 FLOAT    := [0-9]+.[0-9]+
 STRING   := '"' (ESC | INTERP | [^"\\])* '"'
 TRISTRING:= '"""' (ESC | INTERP | .)*? '"""'
+RAWSTRING:= 'r' '"' [^"\n]* '"' | 'r' '"""' .*? '"""'
+           // W-6: raw strings — no INTERP, no ESC; braces and
+           // backslashes are literal. For JSON templates etc.
 INTERP   := '{' expr '}'            // inside strings only; '{{' = literal brace
                                      // (M-1: there is NO '}}' escape — '}}'
                                      // is two literal chars, because only
@@ -123,7 +126,8 @@ throwStmt   := "throw" expr
 letStmt     := "let" IDENT (":" typeExpr)? "=" expr
 varStmt     := "var" IDENT (":" typeExpr)? "=" expr
 assignStmt  := (IDENT | fieldAccess | indexExpr) "=" expr
-ifStmt      := "if" expr "{" statement* "}" ("else" "{" statement* "}")?
+ifStmt      := "if" expr "{" statement* "}" ("else" ("if" expr "{" statement* "}")* ("{" statement* "}")?)?
+             // W-5: 'else if' chains desugar to nested ifs at parse time
 forStmt     := "for" IDENT "in" expr "{" statement* "}"
 whileStmt   := "while" expr "{" statement* "}"
 returnStmt  := "return" expr?
@@ -164,7 +168,7 @@ lambdaParam := IDENT (":" typeExpr)?
 // Phase 5a: typed params, e.g. |x: Int| x * 2
 callExpr    := IDENT "(" callArgs? ")" | expr "(" callArgs? ")"
 // Phase 5a: calling a call result, e.g. mk(9)(1)
-literal     := INT | FLOAT | STRING | TRISTRING | DURATION | MONEY
+literal     := INT | FLOAT | STRING | TRISTRING | RAWSTRING | DURATION | MONEY
              | "true" | "false" | "nil"
 ```
 

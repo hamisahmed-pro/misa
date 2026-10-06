@@ -2467,6 +2467,89 @@ def _():
     assert any(e["code"] == "E211" for e in errs), errs
 
 
+# ---------------------------------------------------------------- solutions sprint (benchmark W-1..W-6)
+
+@test("W-5: else-if chains")
+def _():
+    src = ('fn c(n: Int) -> Text {\n'
+           '  if n < 0 {\n    return "neg"\n'
+           '  } else if n == 0 {\n    return "zero"\n'
+           '  } else {\n    return "pos"\n'
+           '  }\n}\n'
+           'print(c(-1))\nprint(c(0))\nprint(c(5))\n')
+    eq(run_src(src), "neg\nzero\npos\n")
+
+
+@test("W-5: else-if without trailing else")
+def _():
+    src = ('let n = 5\n'
+           'if n < 0 {\n  print("neg")\n'
+           '} else if n > 10 {\n  print("big")\n'
+           '}\n'
+           'print("done")\n')
+    eq(run_src(src), "done\n")
+
+
+@test("W-6: raw strings disable interpolation and escapes")
+def _():
+    toks = Lexer('r"a{b}\\n"\n').tokens()
+    eq([t.kind for t in toks], ["RAWSTRING", "SEMI", "EOF"])
+    eq(toks[0].value, "a{b}\\n")
+    src = 'let who = "Ada"\nprint(r"hi {who} \\n")\n'
+    eq(run_src(src), "hi {who} \\n\n")
+
+
+@test("W-6: raw triple strings span lines literally")
+def _():
+    src = 'print(r"""\n{"a": 1}\n""")\n'
+    # content is '{"a": 1}\n' (leading newline stripped); print adds one
+    eq(run_src(src), '{"a": 1}\n\n')
+
+
+@test("W-6: 'r' still lexes as identifier when not followed by quote")
+def _():
+    eq(run_src('let r = 42\nprint(r)\n'), "42\n")
+
+
+@test("W-4: str.chars returns code points")
+def _():
+    eq(run_src('print(str.chars("héllo"))\n'), "[h, é, l, l, o]\n")
+    eq(run_src('print(len(str.chars("😀")))\n'), "1\n")
+
+
+@test("W-1a: E208 suggests omitting the annotation for 'any'")
+def _():
+    errs = check_source('let x: any = 5\n')
+    assert any(e["code"] == "E208" for e in errs), errs
+    msg = [e for e in errs if e["code"] == "E208"][0]["message"]
+    assert "omit the type" in msg, msg
+
+
+@test("W-6: formatter preserves raw strings")
+def _():
+    src = 'print(r"a{b}\\n")\n'
+    once = format_source(src, "f.misa")
+    assert ('r"a{b}\\n"' in once), once
+    eq(format_source(once, "f.misa"), once)
+    eq(run_src(src), run_src(once))
+
+
+@test("W-1c: E211 points at the leaking branch, not the fn header")
+def _():
+    src = ('fn f(n: Int) -> Int {\n'
+           '  if n > 0 {\n'
+           '    return 1\n'
+           '  } else {\n'
+           '    print("leak")\n'
+           '  }\n'
+           '}\n')
+    errs = check_source(src)
+    e211 = [e for e in errs if e["code"] == "E211"]
+    assert e211, errs
+    # 5:5 is the print inside the leaking else branch (1-based)
+    assert (e211[0]["line"], e211[0]["col"]) == (5, 5), e211[0]
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

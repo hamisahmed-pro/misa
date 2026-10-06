@@ -455,6 +455,14 @@ class Formatter:
         raise ValueError(f"cannot format {type(e).__name__}")
 
     def fmt_str(self, e: ast.StrLit) -> str:
+        if e.raw and len(e.parts) == 1 and isinstance(e.parts[0], str):
+            # W-6: preserve rawness — a raw string formats back to r"...".
+            # Content can't contain a newline (single-line) or '"' + the
+            # closing delimiter; fall back to r"""...""" when needed.
+            body = e.parts[0]
+            if "\n" in body or '"' in body:
+                return 'r"""\n' + body + '"""'
+            return 'r"' + body + '"'
         if len(e.parts) == 1 and isinstance(e.parts[0], str):
             return self.quote(e.parts[0])
         # multiline or interpolated -> triple-quoted

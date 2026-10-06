@@ -40,6 +40,7 @@ NS_BUILTINS = {
     "str.slice": (["Text", "Int", "Int"], "Text"),
     "str.starts_with": (["Text", "Text"], "Bool"),
     "str.split": (["Text", "Text"], "[Text]"),
+    "str.chars": (["Text"], "[Text]"),
     "str.trim": (["Text"], "Text"),
     "str.ord": (["Text"], "Int"),
     "str.chr": (["Int"], "Text"),
@@ -309,10 +310,14 @@ class Checker:
         scope = {pn: (self._tname(te), False) for pn, te in fn.params}
         self._check_block(fn.body, scope, fn_ret=ret_name)
         if ret_name != "Void" and not self._block_returns(fn.body):
+            # W-1(c): point at the leaking path, not the fn header.
+            leak = self._leak_node(fn.body)
+            eline, ecol = ((leak.line, leak.col) if leak is not None
+                           else (fn.line, fn.col))
             self.error("E211",
                        f"function '{fn.name}' may exit without "
                        f"returning {ret_name}",
-                       fn.line, fn.col,
+                       eline, ecol,
                        hint="every code path must end in 'return'")
         self._tparams = saved_tparams
 
@@ -326,6 +331,27 @@ class Checker:
                         Checker._block_returns(s.els):
                     return True
         return False
+
+    @staticmethod
+    def _leak_node(stmts: list):
+        """W-1(c): find a statement on a path that exits without
+        returning, so E211 can point at the offending path instead of
+        the function header. Only called when _block_returns is False.
+        Returns None when no specific statement can be blamed."""
+        for s in stmts:
+            if isinstance(s, ast.ReturnStmt):
+                continue  # this path returns; the leak is elsewhere
+            if isinstance(s, ast.IfStmt) and s.els:
+                if Checker._block_returns(s.then) and \
+                        Checker._block_returns(s.els):
+                    continue
+                # the leak is inside whichever branch doesn't return
+                if not Checker._block_returns(s.then):
+                    return Checker._leak_node(s.then) or s
+                return Checker._leak_node(s.els) or s
+            # any other statement: the path falls through here
+            return s
+        return None
 
     def _check_model(self, m: ast.ModelDecl):
         if m.provider not in self.providers:
@@ -1667,7 +1693,11 @@ class Checker:
             for a in te.type_args:
                 ok = self._check_te(a, line, col) and ok
             return ok
-        self.error("E208", f"unknown type '{self._tname(te)}'",
+        tname = self._tname(te)
+        hint = (" — 'any' is not a valid annotation: omit the type and "
+                "Misa will infer it"
+                if tname in ("any", "value", "unknown") else "")
+        self.error("E208", f"unknown type '{tname}'{hint}",
                    line, col)
         return False
 

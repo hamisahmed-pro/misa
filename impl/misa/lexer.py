@@ -25,7 +25,7 @@ KEYWORDS = {
 
 # token kinds that trigger implicit semicolon insertion at newline
 INSERT_AFTER = {
-    "IDENT", "INT", "FLOAT", "STRING", "DURATION", "MONEY",
+    "IDENT", "INT", "FLOAT", "STRING", "RAWSTRING", "DURATION", "MONEY",
     ")", "]", "}", "true", "false", "nil", "return",
 }
 
@@ -142,6 +142,13 @@ class Lexer:
             if self.peek(1) == '"' and self.peek(2) == '"':
                 return self._triple_string()
             return self._string()
+        # W-6: raw string literals r"..." / r"""...""" — no {...}
+        # interpolation, no escape processing. Must come before the
+        # ident branch so r"..." lexes as one token, not IDENT+STRING.
+        if ch == 'r' and self.peek(1) == '"':
+            if self.peek(2) == '"' and self.peek(3) == '"':
+                return self._raw_triple_string()
+            return self._raw_string()
         if ch == "$" and self.peek(1).isdigit():
             return self._money()
         if ch.isdigit():
@@ -254,6 +261,46 @@ class Lexer:
                 continue
             buf += self.advance()
         t = Token("STRING", buf, line, col, self.pending_comments)
+        self.pending_comments = []
+        return t
+
+    def _raw_string(self) -> Token:
+        # W-6: r"..." — literal content, no escapes, no interpolation.
+        line, col = self.line, self.col
+        self.advance(2)  # r"
+        buf = ""
+        while True:
+            if self.at_end():
+                raise LexError('unterminated raw string', line, col)
+            ch = self.peek()
+            if ch == '"':
+                self.advance()
+                break
+            if ch == "\n":
+                raise LexError('newline in raw string; use r""" """',
+                               self.line, self.col)
+            buf += self.advance()
+        t = Token("RAWSTRING", buf, line, col, self.pending_comments)
+        self.pending_comments = []
+        return t
+
+    def _raw_triple_string(self) -> Token:
+        # W-6: r"""...""" — literal content, may span lines.
+        line, col = self.line, self.col
+        self.advance(4)  # r"""
+        buf = ""
+        while True:
+            if self.at_end():
+                raise LexError('unterminated r""" string', line, col)
+            if self.peek() == '"' and self.peek(1) == '"' \
+                    and self.peek(2) == '"':
+                self.advance(3)
+                break
+            buf += self.advance()
+        # strip one leading newline, like triple strings
+        if buf.startswith("\n"):
+            buf = buf[1:]
+        t = Token("RAWSTRING", buf, line, col, self.pending_comments)
         self.pending_comments = []
         return t
 

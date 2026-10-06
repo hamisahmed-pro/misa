@@ -36,7 +36,22 @@ sys.path.insert(0, IMPL_DIR)
 from misa.aot.build import (  # noqa: E402
     build, canonical_target, ensure_runtime, runtime_flags,
     ondevice_asset_files, NDK_DIR, NDK_LLVM_BIN, _ndk_clang,
+    GC_LINK_FLAG,
 )
+
+# W-2: JNI entry points are resolved dynamically by the JVM, so
+# --gc-sections would strip them as "unreferenced". Force-keep each.
+_JNI_KEEP = [
+    "-Wl,-u,Java_com_misa_app_MisaNative_nativeBoot",
+    "-Wl,-u,Java_com_misa_app_MisaNative_nativeDispatch",
+    "-Wl,-u,Java_com_misa_app_MisaNative_nativePhotoResult",
+    "-Wl,-u,Java_com_misa_app_MisaNative_nativeSetConfig",
+]
+
+# W-3: the real MisaTflite.java (in android/java) imports
+# org.tensorflow.lite.*; the stub below has the same public API with
+# no TF dependency, for APKs whose program declares no .tflite model.
+_TFLITE_STUB_SRC = os.path.join(MISA_DIR, "android", "java-stub")
 
 HOME = os.path.expanduser("~")
 SDK_DIR = os.path.join(HOME, "workspace", "android-sdk")
@@ -200,8 +215,10 @@ def _build_native(workdir: str, abi_key: str):
     lib_dir = os.path.join(workdir, "lib", abi_dir)
     os.makedirs(lib_dir, exist_ok=True)
     lib_so = os.path.join(lib_dir, "libmisa.so")
+    # W-2: gc-sections (+ JNI keeps) and strip: the vendored deps
+    # carry -g debug info we don't need in the shipped .so.
     cmd = ([cc, "-shared", "-fPIC", "-O2", "-o", lib_so, prog_o]
-           + rt_objs + libs)
+           + rt_objs + [GC_LINK_FLAG, "-Wl,-s"] + _JNI_KEEP + libs)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         # M-11: a clean E600, not a raw NDK traceback. (A missing
@@ -213,11 +230,13 @@ def _build_native(workdir: str, abi_key: str):
     return lib_dir
 
 
-def _build_dex(workdir: str, tflite_classes: str) -> str:
+def _build_dex(workdir: str, tflite_classes: str | None) -> str:
     """javac the android/java sources, d8 to classes.dex.
 
     tflite_classes: extracted org/tensorflow/lite/**/*.class tree
-    (Phase 5, M4) — on the javac classpath and fed to d8.
+    (Phase 5, M4) — on the javac classpath and fed to d8. None when
+    the program declares no .tflite model (W-3): the TF-free stub
+    MisaTflite is compiled instead and no TF classes enter the dex.
     """
     javac = os.path.join(JAVA_HOME, "bin", "javac")
     src_dir = os.path.join(MISA_DIR, "android", "java")
@@ -227,11 +246,20 @@ def _build_dex(workdir: str, tflite_classes: str) -> str:
     for root, _dirs, files in os.walk(src_dir):
         for f in files:
             if f.endswith(".java"):
+                # W-3: without a .tflite model the real MisaTflite
+                # (org.tensorflow imports) is replaced by the stub.
+                if f == "MisaTflite.java" and tflite_classes is None:
+                    continue
                 sources.append(os.path.join(root, f))
+    if tflite_classes is None:
+        stub = os.path.join(_TFLITE_STUB_SRC, "com", "misa", "app",
+                            "MisaTflite.java")
+        sources.append(stub)
     env = dict(os.environ, JAVA_HOME=JAVA_HOME,
                PATH=os.path.join(JAVA_HOME, "bin") +
                os.pathsep + os.environ.get("PATH", ""))
-    cp = ANDROID_JAR + os.pathsep + tflite_classes
+    cp = ANDROID_JAR + (os.pathsep + tflite_classes
+                        if tflite_classes else "")
     _run([javac, "--release", "8", "-cp", cp,
           "-d", classes] + sources, env=env)
     dex_dir = os.path.join(workdir, "dex")
@@ -242,11 +270,13 @@ def _build_dex(workdir: str, tflite_classes: str) -> str:
         os.path.join(classes, "com", "misa", "app", "MisaTflite.class"),
         os.path.join(classes, "com", "misa", "app", "MisaNative.class"),
     ]
-    # Every TFLite class the AARs ship (interpreter, API, NNAPI).
-    for root, _dirs, files in os.walk(tflite_classes):
-        for f in files:
-            if f.endswith(".class"):
-                d8_inputs.append(os.path.join(root, f))
+    # Every TFLite class the AARs ship (interpreter, API, NNAPI) —
+    # only when bundled (W-3).
+    if tflite_classes:
+        for root, _dirs, files in os.walk(tflite_classes):
+            for f in files:
+                if f.endswith(".class"):
+                    d8_inputs.append(os.path.join(root, f))
     _run(["bash", _tool("d8"), "--lib", ANDROID_JAR,
           "--min-api", "24", "--output", dex_dir] + d8_inputs,
          env=env)
@@ -342,9 +372,22 @@ def main() -> int:
         return 1
 
 
+def _uses_tflite(misa_path: str) -> bool:
+    """Does the program declare a .tflite on-device model? (W-3)"""
+    return bool(ondevice_asset_files(misa_path,
+                                     target="aarch64-linux-android"))
+
+
 def _main_inner(workdir: str, abis: list) -> int:
     try:
-        tflite_classes, tflite_sos = _tflite_setup(workdir)
+        # W-3: bundle the TFLite runtime only when the program
+        # declares a .tflite model; otherwise the stub keeps the APK
+        # lean (~1MB+ saved) and the AARs aren't even required.
+        if _uses_tflite(args.misa):
+            tflite_classes, tflite_sos = _tflite_setup(workdir)
+        else:
+            print("  TFLite: not bundled (no .tflite model declared)")
+            tflite_classes, tflite_sos = None, {}
         lib_dirs = [_build_native(workdir, a) for a in abis]
         # TFLite JNI libs ride along in lib/<abi>/ (Phase 5, M4).
         for lib_dir in lib_dirs:

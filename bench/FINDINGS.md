@@ -108,6 +108,10 @@ shared module. The real Misa advantage is structural — ONE file vs
 3–5 files + Java bootstrap + manual assembly — which the percentage
 doesn't capture. Not a product weakness; a measurement weakness. Keep
 citing the file/project-structure difference, not just the %.
+**Addressed 2026-10-06 (solutions sprint): no code change — this stays
+as citation guidance. Future benchmark reports must lead with the
+structural comparison (file count, build commands, native vs embedded
+interpreter), with the % as a secondary figure.**
 
 ### CONTEXT (constrains citation, not product fixes)
 
