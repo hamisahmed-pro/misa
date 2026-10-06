@@ -1,7 +1,10 @@
 name: ios
 # Phase 7 (M7) verification on a real Apple toolchain — free via GitHub
 # Actions macOS runners. No MacBook required.
-on: [push, workflow_dispatch]
+# NOTE (2026-10-06): macOS minutes bill 10x against the 2,000 free monthly
+# minutes, so this workflow is MANUAL ONLY (workflow_dispatch). Do NOT put it
+# back on `push` without checking the billing quota first.
+on: [workflow_dispatch]
 jobs:
   ios:
     runs-on: macos-latest
