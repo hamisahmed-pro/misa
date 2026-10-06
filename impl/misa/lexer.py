@@ -21,6 +21,8 @@ KEYWORDS = {
     "table",
     # Phase 7: `extern` blocks for FFI (calling C libraries).
     "extern",
+    # Phase 7 (concurrency): `spawn { }` creates a concurrent task.
+    "spawn",
 }
 
 # token kinds that trigger implicit semicolon insertion at newline

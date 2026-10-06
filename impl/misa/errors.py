@@ -108,3 +108,10 @@ class FFIError(MisaError):
     """Phase 7: foreign-function interface failure — missing library,
     missing symbol, or marshalling failure. Code E226."""
     code = "E226"
+
+
+class ConcurrencyError(MisaError):
+    """Phase 7 (concurrency): task timeout ("task timed out after <ms>ms"),
+    task cancelled ("task cancelled"), or channel closed ("channel
+    closed"). Code E306. Catchable with try/catch."""
+    code = "E306"

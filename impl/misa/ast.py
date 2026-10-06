@@ -376,6 +376,19 @@ class UnOp(Node):
 @dataclass
 class Await(Node):
     operand: Optional[Node] = None
+    # Phase 7 (concurrency): `await t timeout <ms>` — optional timeout
+    # expression (Int milliseconds). On expiry the await raises E306.
+    timeout: Optional[Node] = None
+
+
+@dataclass
+class Spawn(Node):
+    """Phase 7 (concurrency): `spawn { ... }` — a concurrent task.
+
+    An expression evaluating to `Task<T>` where `T` is the block's
+    return type (a block with no `return` is `Task<Void>`).
+    """
+    body: List[Node] = field(default_factory=list)
 
 
 @dataclass

@@ -184,6 +184,22 @@ _RT_SIGS = {
     "misa_ui_get_text": (PTR, [PTR, I32]),
     "misa_ui_report_error": (ir.VoidType(), [PTR, PTR]),
     "misa_model_call_meta": (PTR, [PTR, PTR.as_pointer(), I32, I32, I32]),
+    # Phase 7 (concurrency): task fibers (misa_task.c). misa_task_spawn
+    # takes the compiled `misa_spawn_N(env)` address as a raw pointer.
+    "misa_task_init": (ir.VoidType(), []),
+    "misa_task_shutdown": (ir.VoidType(), []),
+    "misa_scope_enter": (ir.VoidType(), []),
+    "misa_scope_exit": (ir.VoidType(), []),
+    "misa_scope_detach": (ir.VoidType(), [PTR]),
+    "misa_task_spawn": (PTR, [PTR, PTR, I32, I32]),
+    "misa_task_await": (PTR, [PTR, I32, I32]),
+    "misa_task_await_timeout": (PTR, [PTR, I64, I32, I32]),
+    "misa_task_sleep": (PTR, [I64, I32, I32]),
+    "misa_chan_new": (PTR, [I32, I32]),
+    "misa_chan_send": (PTR, [PTR, PTR, I32, I32]),
+    "misa_chan_recv": (PTR, [PTR, I32, I32]),
+    "misa_chan_close": (PTR, [PTR, I32, I32]),
+    "misa_fetch_all": (PTR, [PTR, I32, I32]),
 }
 
 
@@ -205,6 +221,13 @@ class Emitter:
         # Phase 5a: first-class functions. Closure values are MVal*
         # records {__closure_fn: Int(fn ptr), __closure_env: record}.
         self.lambda_counter = 0
+        # Phase 7 (concurrency): spawn bodies become misa_spawn_N fns.
+        self.spawn_counter = 0
+        # Phase 7: names bound to Task values (for await validation —
+        # the emitter has no type info; the checker guarantees an
+        # await operand is Task or TokenStream via E205).
+        self._task_names = set()
+        self._taskret_fns = set()
         self.trampolines = {}  # fn name -> ir.Function (value wrapper)
         self.CLOSURE_FN = "__closure_fn"
         self.CLOSURE_ENV = "__closure_env"
@@ -387,6 +410,10 @@ class Emitter:
 
     def emit(self) -> ir.Module:
         self.declare_runtime()
+        # Phase 7: collect Task-bound names before validating awaits
+        # (check_no_streaming distinguishes Task-await from stream-await
+        # syntactically; see _collect_task_names).
+        self._collect_task_names()
         self.check_no_streaming(self.prog)
         # declare Misa functions first (recursion)
         # Phase 5c: generic fns are monomorphized lazily on first use.
@@ -423,16 +450,92 @@ class Emitter:
         self.emit_entry_main()
         return self.mod
 
+    def _collect_task_names(self):
+        """Collect names bound to Task values, for await validation.
+
+        The emitter carries no type info on nodes, so await-on-Task vs
+        await-on-TokenStream is decided syntactically: a name bound by
+        a `Task<...>` annotation or initialized from `spawn {...}`, a
+        Task-annotated parameter, or a call to a `-> Task<...>` fn.
+        Anything else awaiting (the checker already rejected
+        non-awaitables with E205) is a TokenStream -> E402.
+
+        Over-approximate and shadowing-blind by design: pathological
+        shadowing of a Task name by a non-Task may misclassify and fail
+        at runtime (E200) instead of at compile time (E402).
+        """
+        self._task_names = set()
+        self._taskret_fns = set()
+
+        def visit_fns(node):
+            if isinstance(node, A.FnDecl):
+                if node.ret is not None and \
+                        getattr(node.ret, "name", "") == "Task":
+                    self._taskret_fns.add(node.name)
+            for child in self.children(node):
+                visit_fns(child)
+
+        def is_task_call(value):
+            return isinstance(value, A.Call) and \
+                value.name in self._taskret_fns
+
+        def visit(node):
+            if isinstance(node, A.LetStmt):
+                ann = node.ann
+                if ann is not None and getattr(ann, "name", "") == "Task":
+                    self._task_names.add(node.name)
+                elif isinstance(node.value, A.Spawn) or \
+                        is_task_call(node.value):
+                    self._task_names.add(node.name)
+            elif isinstance(node, A.FnDecl):
+                for pn, pte in node.params:
+                    if pte is not None and \
+                            getattr(pte, "name", "") == "Task":
+                        self._task_names.add(pn)
+            for child in self.children(node):
+                visit(child)
+
+        visit_fns(self.prog)
+        visit(self.prog)
+
+    def _is_task_expr(self, node) -> bool:
+        """Syntactic Task check for an expression (see _collect_task_names)."""
+        if isinstance(node, A.Spawn):
+            return True
+        if isinstance(node, A.Ident):
+            return node.name in self._task_names
+        if isinstance(node, A.Call) and node.name in self._taskret_fns:
+            return True
+        return False
+
+    def _await_is_task(self, node: A.Await) -> bool:
+        """Syntactic Task check for an await operand (see above)."""
+        return self._is_task_expr(node.operand)
+
     def check_no_streaming(self, node):
-        """Reject stream/await/on anywhere (E402).
+        """Reject stream/await-on-stream/on anywhere (E402).
+
+        Phase 7: `await` on a Task<T> is compiled (fibers); await on
+        anything else is still E402 here (the checker enforced E205
+        upstream, so it can only be a TokenStream).
 
         Lambdas are allowed as component args (event handlers, printed
         as <handler>); anywhere else they are rejected at emit time.
         """
-        if isinstance(node, (A.StreamDecl, A.Await, A.OnStmt)):
+        if isinstance(node, A.StreamDecl):
             raise AOTError("E402",
                            "streaming is not supported in AOT v0.3 "
                            "(use `misa run`)",
+                           node.line, node.col)
+        if isinstance(node, A.OnStmt):
+            raise AOTError("E402",
+                           "streaming is not supported in AOT v0.3 "
+                           "(use `misa run`)",
+                           node.line, node.col)
+        if isinstance(node, A.Await) and not self._await_is_task(node):
+            raise AOTError("E402",
+                           "await on streams is not supported in AOT "
+                           "v0.3 (use `misa run`)",
                            node.line, node.col)
         if isinstance(node, A.Component):
             # lambdas as component args are fine; check the rest
@@ -472,8 +575,12 @@ class Emitter:
     # creation site (immutable vars by value, cell vars by shared cell).
 
     def _subtree_has_lambda(self, node) -> bool:
-        """True if any Lambda occurs anywhere under node."""
-        if isinstance(node, A.Lambda):
+        """True if any Lambda or Spawn occurs anywhere under node.
+
+        Spawn bodies capture like lambdas (see emit_spawn), so a `var`
+        captured by a task needs the same shared heap cell.
+        """
+        if isinstance(node, (A.Lambda, A.Spawn)):
             return True
         for child in self.children(node):
             if self._subtree_has_lambda(child):
@@ -502,7 +609,21 @@ class Emitter:
         ctx = FnCtx(self, b, fn)
         err = fn.append_basic_block("err")
         ctx.err_stack.append(err)
+        # Phase 7 (concurrency): every compiled function opens a task
+        # scope on entry; emit_ret() closes it on every return path so
+        # a returning scope cancels its still-running child tasks.
+        b.call(self.rt["misa_scope_enter"], [])
         return ctx
+
+    def emit_ret(self, ctx: FnCtx, v):
+        """Return from a Misa function: close the task scope, then ret.
+
+        Must be used for EVERY return out of a function created via
+        new_fn_ctx (normal returns, error epilogues, fallthroughs) so
+        scope_enter/scope_exit stay balanced.
+        """
+        ctx.builder.call(self.rt["misa_scope_exit"], [])
+        ctx.builder.ret(v)
 
     def finish_fn_ctx(self, ctx: FnCtx):
         b = ctx.builder
@@ -511,14 +632,14 @@ class Emitter:
             return
         err = ctx.err_stack[0]
         b.position_at_end(err)
-        b.ret(NULL_PTR)
+        self.emit_ret(ctx, NULL_PTR)
         # normal fallthrough: return nil
         b.position_at_end(ctx.fn.basic_blocks[0])
         # find the last non-terminated block to append fallthrough ret
         for blk in reversed(ctx.fn.blocks):
             if not blk.is_terminated:
                 b.position_at_end(blk)
-                b.ret(self.get_nil(ctx))
+                self.emit_ret(ctx, self.get_nil(ctx))
                 break
 
     def get_nil(self, ctx: FnCtx):
@@ -719,6 +840,9 @@ class Emitter:
         b.call(self.rt["misa_rt_init"], [])
         main = self.mod.get_global("misa_main")
         r = b.call(main, [], name="r")
+        # Phase 7: reap outstanding tasks (bounded), cancel stragglers,
+        # and report never-awaited task errors to stderr.
+        b.call(self.rt["misa_task_shutdown"], [])
         pe = b.call(self.rt["misa_pending"], [], name="pe")
         bad = b.icmp_unsigned("!=", pe, NULL_PTR, name="bad")
         fail = fn.append_basic_block("fail")
@@ -744,6 +868,8 @@ class Emitter:
         b.call(self.rt["misa_rt_init"], [])
         main = self.mod.get_global("misa_main")
         b.call(main, [], name="r")
+        # Phase 7: reap outstanding tasks (web: no-op beyond reporting).
+        b.call(self.rt["misa_task_shutdown"], [])
         pe = b.call(self.rt["misa_pending"], [], name="pe")
         bad = b.icmp_unsigned("!=", pe, NULL_PTR, name="bad")
         fail = fn.append_basic_block("fail")
@@ -834,9 +960,13 @@ class Emitter:
             if s.value is not None:
                 v = self.emit_expr(s.value, ctx)
                 self.check(ctx, s)
+                # Returning a Task transfers ownership to the caller:
+                # detach it from this scope so scope_exit doesn't cancel it.
+                if self._is_task_expr(s.value):
+                    ctx.builder.call(self.rt["misa_scope_detach"], [v])
             else:
                 v = self.get_nil(ctx)
-            b.ret(v)
+            self.emit_ret(ctx, v)
         elif isinstance(s, A.TryStmt):
             self.emit_try(s, ctx)
         elif isinstance(s, A.ThrowStmt):
@@ -1076,6 +1206,15 @@ class Emitter:
             # Phase 5a: first-class lambdas become closure values
             # (record {__closure_fn, __closure_env}).
             return self.emit_closure(e, ctx)
+        if isinstance(e, A.Spawn):
+            # Phase 7: `spawn { ... }` — the body is compiled to a
+            # separate misa_spawn_N(env) function; the runtime runs it
+            # on a fiber and returns a Task<T> handle.
+            return self.emit_spawn(e, ctx)
+        if isinstance(e, A.Await):
+            # Phase 7: `await t` / `await t timeout ms` on a Task<T>.
+            # (check_no_streaming already rejected stream awaits.)
+            return self.emit_await(e, ctx)
         if isinstance(e, A.Match):
             # Phase 5b: `match` expression over a sum value.
             return self.emit_match(e, ctx)
@@ -1306,6 +1445,26 @@ class Emitter:
         if name == "http.get":
             return self.call(ctx, "misa_http_get", [arg(0), line, col],
                              e)
+        # Phase 7 (concurrency): tasks, channels, sleep, fetch_all.
+        # `chan.send`/`chan.recv` are the checker's canonical rewrites
+        # of `ch.send(v)` / `ch.recv()`.
+        if name == "sleep":
+            ms = self.call(ctx, "misa_as_int", [arg(0)], e)
+            return self.call(ctx, "misa_task_sleep", [ms, line, col], e)
+        if name == "chan":
+            return self.call(ctx, "misa_chan_new", [line, col], e)
+        if name == "chan.send":
+            return self.call(ctx, "misa_chan_send",
+                             [arg(0), arg(1), line, col], e)
+        if name == "chan.recv":
+            return self.call(ctx, "misa_chan_recv", [arg(0), line, col],
+                             e)
+        if name == "close":
+            return self.call(ctx, "misa_chan_close",
+                             [arg(0), line, col], e)
+        if name == "fetch_all":
+            return self.call(ctx, "misa_fetch_all", [arg(0), line, col],
+                             e)
         # Phase 5 (stdlib2): JSON, HTTP POST, time, math.
         if name == "json.parse":
             return self.call(ctx, "misa_json_parse",
@@ -1440,7 +1599,7 @@ class Emitter:
                    [g, first, self.const_i32(nargs), line, col],
                    name="_misa_model_call_meta")
         self.check(ctx, decl)
-        b.ret(r)
+        self.emit_ret(ctx, r)
         self.finish_fn_ctx(ctx)
 
     # -- Phase 5a: first-class functions (closures) -----------------------
@@ -1504,7 +1663,7 @@ class Emitter:
         if lam.expr_body is not None:
             v = self.emit_expr(lam.expr_body, lctx)
             self.check(lctx, lam)
-            lb.ret(v)
+            self.emit_ret(lctx, v)
         else:
             self.emit_block(lam.body, lctx)
         self.finish_fn_ctx(lctx)
@@ -1524,6 +1683,77 @@ class Emitter:
                   [clos, self.cstr(self.CLOSURE_DISP), disp],
                   node, check=False)
         return clos
+
+    # -- Phase 7: concurrency ----------------------------------------
+
+    def emit_spawn(self, e: A.Spawn, ctx: FnCtx):
+        """Compile `spawn { ... }` to misa_spawn_N(env) and spawn it.
+
+        Capture mirrors emit_closure: the enclosing scope chain is
+        packed into an env record (heap cells shared, values copied),
+        rebound as locals in the new function. The body runs on a
+        fiber; `return` in the body completes the Task<T>.
+        """
+        b = ctx.builder
+        node = e
+        # 1. capture the scope chain: (name, is_cell), innermost first.
+        names = []
+        seen = set()
+        s = ctx.scope
+        while s is not None:
+            for name in s.names:
+                if name not in seen:
+                    seen.add(name)
+                    names.append((name, name in ctx.cell_vars))
+            s = s.parent
+        # 2. build the env record.
+        env = self.call(ctx, "misa_record_new", [], node, check=False)
+        for name, _ in names:
+            a = ctx.scope.lookup(name)
+            v = b.load(a, name=f"cap_{name}")
+            self.call(ctx, "misa_record_set_cstr",
+                      [env, self.cstr(name), v], node, check=False)
+        # 3. emit the body as misa_spawn_N(env).
+        fn = ir.Function(self.mod, ir.FunctionType(PTR, [PTR]),
+                         name=f"misa_spawn_{self.spawn_counter}")
+        self.spawn_counter += 1
+        sctx = self.new_fn_ctx(fn)  # scope_enter hook included
+        sb = sctx.builder
+        self.get_nil(sctx)
+        for name, is_cell in names:
+            if is_cell:
+                sctx.cell_vars.add(name)
+        senv = fn.args[0]
+        senv.name = "env"
+        line, col = self.loc(node)
+        for name, _ in names:
+            v = self.call(sctx, "misa_record_get",
+                          [senv, self.cstr(name), line, col],
+                          node, check=False)
+            a = self.alloca_var(sctx, f"cap_{name}")
+            sb.store(v, a)
+            sctx.scope.declare(name, a)
+        # a nested spawn inside this body shares `var`s the same way.
+        sctx.cell_vars |= self._cell_vars_for(e.body)
+        self.emit_block(e.body, sctx)
+        self.finish_fn_ctx(sctx)  # scope_exit on every path + nil default
+        # 4. spawn: the runtime takes the function address.
+        fn_ptr = b.bitcast(fn, PTR, name="spawn_fn")
+        return self.call(ctx, "misa_task_spawn",
+                         [fn_ptr, env, line, col], e)
+
+    def emit_await(self, e: A.Await, ctx: FnCtx):
+        """`await t` / `await t timeout ms` — yields to the scheduler."""
+        v = self.emit_expr(e.operand, ctx)
+        self.check(ctx, e)
+        line, col = self.loc(e)
+        if e.timeout is not None:
+            ms = self.emit_expr(e.timeout, ctx)
+            self.check(ctx, e)
+            ms_i64 = self.call(ctx, "misa_as_int", [ms], e)
+            return self.call(ctx, "misa_task_await_timeout",
+                             [v, ms_i64, line, col], e)
+        return self.call(ctx, "misa_task_await", [v, line, col], e)
 
     def emit_closure_call(self, e: A.Call, ctx: FnCtx, clos):
         """Call a closure MVal* value."""
@@ -1577,7 +1807,7 @@ class Emitter:
             call_args.append(v)
         r = self.call(ctx, f"misa_fn_{name}", call_args, decl,
                       check=True, direct=True)
-        b.ret(r)
+        self.emit_ret(ctx, r)
         self.finish_fn_ctx(ctx)
         self.trampolines[name] = fn
         return fn
@@ -1853,7 +2083,7 @@ class Emitter:
         for item in decl.body:
             self.emit_screen_item(item, ctx, name, id_slots)
         self.call(ctx, "misa_screen_end", [], decl, check=False)
-        b.ret(self.get_nil(ctx))
+        self.emit_ret(ctx, self.get_nil(ctx))
         self.finish_fn_ctx(ctx)
 
     def _screen_items_have_id(self, items) -> bool:
@@ -2002,7 +2232,7 @@ class Emitter:
         if lam.expr_body is not None:
             v = self.emit_expr(lam.expr_body, ctx)
             self.check(ctx, lam)
-            b.ret(v)
+            self.emit_ret(ctx, v)
         else:
             self.emit_block(lam.body, ctx)
         self.finish_fn_ctx(ctx)

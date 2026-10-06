@@ -37,6 +37,8 @@ enum {
     M_TAG_MEDIA  = 10,  /* Photo | Audio | Video | Document handle */
     M_TAG_ITER   = 11,  /* for-loop iterator (internal) */
     M_TAG_PTR    = 12,  /* Phase 7: opaque C pointer (FFI `Ptr`) */
+    M_TAG_TASK   = 13,  /* Phase 7: Task<T> handle (wraps MisaTask*) */
+    M_TAG_CHAN   = 14,  /* Phase 7: Chan<T> handle (wraps MisaChan*) */
 };
 
 /* Media kinds. */
@@ -55,6 +57,15 @@ MVal *misa_pending(void);          /* NULL or pending MVal error */
 MVal *misa_take_pending(void);     /* fetch + clear (for catch) */
 void  misa_do_throw(MVal *err, int line, int col); /* `throw` statement */
 void  misa_report_uncaught(MVal *err);             /* stderr + used by main */
+/* Phase 7: stderr report for a never-awaited task's captured error. */
+void  misa_report_task_error(MVal *err, int task_id, int line, int col);
+
+/* Phase 7 (concurrency): a pending-error slot. Fibers each own one so
+ * a raise in one fiber is invisible to the others; without fibers the
+ * single thread-local slot below is used. The task system installs the
+ * per-fiber slot via misa_set_pending_slot_fn() at init. */
+typedef struct { MVal *err; int line; int col; } MisaPending;
+void misa_set_pending_slot_fn(MisaPending *(*fn)(void));
 
 /* Build a catchable Error value (also used for pending errors). */
 MVal *misa_error_new(const char *code, const char *msg);
@@ -157,7 +168,16 @@ MVal *misa_builtin_media(int kind, MVal *path, int line, int col);
 /* -- io / net -------------------------------------------------------- */
 MVal *misa_fs_read(MVal *path, int line, int col);          /* E303 */
 MVal *misa_fs_write(MVal *path, MVal *text, int line, int col); /* E303 */
+/* Phase 7: the http.get builtin lives in misa_task.c (fiber-aware).
+ * Shared response validation (status + UTF-8, E304). */
 MVal *misa_http_get(MVal *url, int line, int col);           /* E304 */
+MVal *misa_http_validate(const char *url, const char *body, size_t len,
+                         long status, int line, int col);
+/* Phase 7: Task/Chan handle construction (struct MVal is private to
+ * misa_rt.c). */
+MVal *misa_val_new(uint8_t tag);
+void  misa_val_set_ptr(MVal *v, void *p);
+void *misa_val_get_ptr(MVal *v);
 /* Phase 5 (stdlib2): HTTP POST, JSON, time, math. */
 MVal *misa_http_post(MVal *url, MVal *body, const char *content_type,
                      int line, int col);                    /* E304 */
@@ -182,6 +202,27 @@ MVal *misa_str_trim(MVal *s, int line, int col);
 MVal *misa_str_chars(MVal *s, int line, int col);
 MVal *misa_str_ord(MVal *c, int line, int col);
 MVal *misa_str_chr(MVal *code, int line, int col);
+
+/* -- concurrency (Phase 7): cooperative fibers (misa_task.c) ------------ */
+/* Task body signature: the emitter compiles `spawn { ... }` to
+ * `MVal *misa_spawn_N(MVal *env)` and passes its address. */
+typedef MVal *(*MisaTaskFn)(MVal *env);
+void  misa_task_init(void);        /* called once from misa_rt_init() */
+void  misa_task_shutdown(void);    /* program end: reap tasks, report */
+/* Structured scopes: every compiled function calls enter on entry and
+ * exit on every return path; exit cancels the scope's live children. */
+void  misa_scope_enter(void);
+void  misa_scope_exit(void);
+void  misa_scope_detach(MVal *task);
+MVal *misa_task_spawn(MisaTaskFn fn, MVal *env, int line, int col);
+MVal *misa_task_await(MVal *task, int line, int col);
+MVal *misa_task_await_timeout(MVal *task, int64_t ms, int line, int col);
+MVal *misa_task_sleep(int64_t ms, int line, int col);   /* yields */
+MVal *misa_chan_new(int line, int col);
+MVal *misa_chan_send(MVal *ch, MVal *v, int line, int col);
+MVal *misa_chan_recv(MVal *ch, int line, int col);      /* yields */
+MVal *misa_chan_close(MVal *ch, int line, int col);
+MVal *misa_fetch_all(MVal *urls, int line, int col);    /* [Text] */
 
 /* -- db (Phase 5): SQLite bindings (misa_db.c) ------------------------ */
 MVal *misa_db_open(MVal *path, int line, int col);           /* E303 */

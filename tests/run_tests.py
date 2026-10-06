@@ -2550,6 +2550,238 @@ def _():
     assert (e211[0]["line"], e211[0]["col"]) == (5, 5), e211[0]
 
 
+# ---------------------------------------------------------------- Phase 7: concurrency
+
+@test("conc: spawn lexes as a keyword")
+def _():
+    toks = Lexer('spawn { }\n').tokens()
+    kinds = [t.kind for t in toks]
+    eq(kinds, ["spawn", "{", "}", "SEMI", "EOF"])
+
+
+@test("conc: spawn parses to ast.Spawn")
+def _():
+    prog = parse_source('let t = spawn { return 1 }\n')
+    stmt = prog.items[0]
+    assert isinstance(stmt.value, last.Spawn), type(stmt.value)
+    eq(len(stmt.value.body), 1)
+
+
+@test("conc: await timeout parses; timeout is contextual")
+def _():
+    prog = parse_source('let x = await t timeout 5000\n')
+    aw = prog.items[0].value
+    assert isinstance(aw, last.Await)
+    assert aw.timeout is not None
+    # a `timeout(...)` call on the next line is unaffected (SEMI intervenes)
+    prog2 = parse_source('let x = await t\ntimeout(5)\n')
+    aw2 = prog2.items[0].value
+    assert isinstance(aw2, last.Await) and aw2.timeout is None
+
+
+@test("conc: fmt round-trips spawn and await timeout")
+def _():
+    src = 'let t = spawn { return 1 }\nlet x = await t timeout 5000\n'
+    out = format_source(src)
+    assert "spawn { return 1 }" in out, out
+    assert "await t timeout 5000" in out, out
+    prog = parse_source(out)
+    assert isinstance(prog.items[0].value, last.Spawn)
+    assert prog.items[1].value.timeout is not None
+
+
+@test("conc: checker accepts a valid concurrency program")
+def _():
+    src = ('let t: Task<Text> = spawn { return "hi" }\n'
+           'let b: Text = await t\n'
+           'sleep(10)\n'
+           'let ch = chan<Int>()\n'
+           'ch.send(1)\n'
+           'let v: Int = ch.recv()\n'
+           'close(ch)\n'
+           'let ps: [Text] = fetch_all(["http://x"])\n')
+    eq(check_source(src), [])
+
+
+@test("conc: E205 await on non-task")
+def _():
+    errs = check_source('let x = await 42\n')
+    eq([e["code"] for e in errs], ["E205"])
+
+
+@test("conc: E211 await timeout must be Int")
+def _():
+    src = 'let t = spawn { return 1 }\nlet x = await t timeout "soon"\n'
+    eq([e["code"] for e in check_source(src)], ["E211"])
+
+
+@test("conc: E221 bare Task/Chan and bad chan type args")
+def _():
+    eq([e["code"] for e in check_source('let t: Task = spawn { return 1 }\n')],
+       ["E221"])
+    eq([e["code"] for e in check_source('let c = chan()\n')], ["E221"])
+    eq([e["code"] for e in check_source('let c = chan<Int, Text>()\n')],
+       ["E221"])
+
+
+@test("conc: E211 builtin argument types")
+def _():
+    eq([e["code"] for e in check_source('sleep("x")\n')], ["E211"])
+    eq([e["code"] for e in check_source('fetch_all("x")\n')], ["E211"])
+    eq([e["code"] for e in check_source('close(42)\n')], ["E211"])
+    eq([e["code"] for e in check_source('let ch = chan<Int>()\nch.send("x")\n')],
+       ["E211"])
+
+
+@test("conc: E200 spawn return type mismatch")
+def _():
+    src = 'let t: Task<Int> = spawn { return "oops" }\n'
+    eq([e["code"] for e in check_source(src)], ["E200"])
+
+
+@test("conc: E225 Task across the FFI boundary")
+def _():
+    src = ('extern "c" { fn strlen(s: Text) -> Int }\n'
+           'let t = spawn { return 1 }\n'
+           'strlen(t)\n')
+    eq([e["code"] for e in check_source(src)], ["E225"])
+
+
+@test("conc: interp spawn and await")
+def _():
+    src = 'let t = spawn { return 40 + 2 }\nprint(await t)\n'
+    eq(run_src(src).strip(), "42")
+
+
+@test("conc: interp sleep does not block other tasks")
+def _():
+    src = ('let ch = chan<Text>()\n'
+           'spawn { sleep(300)\nch.send("slow") }\n'
+           'spawn { ch.send("fast") }\n'
+           'print(ch.recv())\n'
+           'print(ch.recv())\n')
+    eq(run_src(src).strip().splitlines(), ["fast", "slow"])
+
+
+@test("conc: interp await timeout raises catchable E306")
+def _():
+    src = ('let t = spawn { sleep(500)\nreturn 1 }\n'
+           'try {\n  let x = await t timeout 100\n  print("no-timeout")\n'
+           '} catch e {\n  print(e.code)\n}\n'
+           'print(await t)\n')
+    eq(run_src(src).strip().splitlines(), ["E306", "1"])
+
+
+@test("conc: interp channel close drains then E306")
+def _():
+    src = ('let ch = chan<Int>()\n'
+           'ch.send(7)\n'
+           'close(ch)\n'
+           'print(ch.recv())\n'
+           'try {\n  ch.recv()\n} catch e {\n  print(e.code)\n}\n')
+    eq(run_src(src).strip().splitlines(), ["7", "E306"])
+
+
+@test("conc: interp scope cancellation raises E306 in the child")
+def _():
+    # NB: Misa functions cannot see globals — the channel goes in as a param.
+    src = ('let ch = chan<Text>()\n'
+           'fn worker(ch: Chan<Text>) {\n'
+           '  spawn {\n'
+           '    try {\n'
+           '      sleep(5000)\n'
+           '    } catch e {\n'
+           '      ch.send(e.code)\n'
+           '    }\n'
+           '  }\n'
+           '}\n'
+           'worker(ch)\n'
+           'print(ch.recv())\n')
+    eq(run_src(src).strip(), "E306")
+
+
+@test("conc: interp never-awaited task error goes to stderr")
+def _():
+    import contextlib
+    src = ('spawn { throw { code: "E999", message: "boom" } }\n'
+           'print("done")\n')
+    prog = parse_source(src)
+    assert not check_source(src)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stderr(err):
+        Interpreter(out=out).run(prog)
+    eq(out.getvalue().strip(), "done")
+    assert "E999" in err.getvalue() and "boom" in err.getvalue(), \
+        err.getvalue()
+
+
+@test("conc: interp fetch_all is parallel and order-preserving")
+def _():
+    import time as _time
+    from http.server import ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            _time.sleep(0.4)
+            body = self.path.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    # NB: ThreadingHTTPServer — the plain HTTPServer serializes requests,
+    # which would make even parallel clients look sequential.
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        urls = ", ".join(
+            f'"http://127.0.0.1:{port}/{c}"' for c in "abcd")
+        src = (f'let ps = fetch_all([{urls}])\n'
+               'print(ps[0])\nprint(ps[1])\nprint(ps[2])\nprint(ps[3])\n')
+        start = _time.time()
+        out = run_src(src).strip().splitlines()
+        wall = _time.time() - start
+        eq(out, ["/a", "/b", "/c", "/d"])
+        # sequential would take >= 1.6s; parallel should be well under
+        assert wall < 1.2, f"fetch_all not parallel: {wall:.2f}s"
+    finally:
+        srv.shutdown()
+
+
+@test("conc: interp fetch_all first error is catchable")
+def _():
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/bad":
+                self.send_response(500)
+                self.end_headers()
+                return
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        src = (f'try {{\n  fetch_all(["http://127.0.0.1:{port}/bad"])\n'
+               '} catch e {\n  print(e.code)\n}\n')
+        eq(run_src(src).strip(), "E304")
+    finally:
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

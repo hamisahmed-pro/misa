@@ -898,7 +898,18 @@ class Parser:
         if self.at("await"):
             t = self.advance()
             operand = self.parse_unary()
-            return ast.Await(operand=operand, line=t.line, col=t.col)
+            # Phase 7 (concurrency): `await t timeout <ms>` — `timeout`
+            # is a contextual keyword, consumed only when directly
+            # adjacent (a newline inserts SEMI first, so `await t`
+            # followed by a `timeout(...)` call on the next line is
+            # unaffected).
+            timeout = None
+            pk = self.peek()
+            if pk.kind == "IDENT" and pk.value == "timeout":
+                self.advance()
+                timeout = self.parse_unary()
+            return ast.Await(operand=operand, timeout=timeout,
+                             line=t.line, col=t.col)
         return self.parse_postfix()
 
     def parse_postfix(self) -> ast.Node:
@@ -932,6 +943,13 @@ class Parser:
             else:
                 break
         return node
+
+    def parse_spawn(self) -> ast.Spawn:
+        """Phase 7 (concurrency): `spawn { stmts }` — a concurrent task
+        expression evaluating to Task<T>."""
+        t = self.expect("spawn", "'spawn'")
+        body = self.parse_block()
+        return ast.Spawn(body=body, line=t.line, col=t.col)
 
     def parse_match(self) -> ast.Match:
         """Phase 5b: `match scrut { Type.Variant(binds) => expr, _ => expr }`."""
@@ -998,6 +1016,9 @@ class Parser:
         # Phase 5b: `match` expression over a sum-typed scrutinee.
         if t.kind == "match":
             return self.parse_match()
+        # Phase 7 (concurrency): `spawn { ... }` task expression.
+        if t.kind == "spawn":
+            return self.parse_spawn()
         if t.kind == "INT":
             self.advance()
             return ast.IntLit(value=t.value, line=t.line, col=t.col)

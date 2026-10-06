@@ -5,9 +5,11 @@ import math
 import os
 import sqlite3
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +18,7 @@ from .errors import (MisaError, RuntimeError_, UndefinedName,
                      ImmutableAssign, AssertFailed, EnvNotSet, ModelError,
                      SchemaValidationError, BudgetExceeded, ThrownError,
                      IOError_, HTTPError_, MapKeyError, ProviderConfigError,
-                     FFIError, TypeMismatch)
+                     FFIError, TypeMismatch, ConcurrencyError)
 from .providers import (Provider, Usage, make_provider, guess_mime,
                         estimate_cost_usd, OnDeviceProvider)
 
@@ -102,6 +104,63 @@ class TokenStreamHandle:
     started: bool = False
 
 
+# ---------------------------------------------------------------- Phase 7
+# (concurrency): one Python thread per task behind the cooperative
+# facade. The GIL limits CPU parallelism; I/O parallelizes fully.
+
+# Poll interval (seconds) for unbounded waits (`await` without timeout,
+# `recv`, `sleep`). Chunked waiting lets a task observe scope
+# cancellation promptly instead of sleeping through it.
+_YIELD_POLL_S = 0.05
+
+# Bound on how long run() waits for outstanding tasks at program end
+# before cancelling the stragglers. Documented, not derived: long enough
+# for normal I/O tails, short enough that a hung task cannot hang the
+# CLI forever. All task threads are daemonic, so even a thread stuck in
+# a C call (e.g. http.get) dies with the process.
+PROGRAM_END_WAIT_S = 10.0
+
+# Per-thread concurrency state: the current task handle (None on the
+# main thread) and the stack of function-scope ids on this thread.
+_tls = threading.local()
+
+
+def _scope_stack() -> list:
+    st = getattr(_tls, "scope_stack", None)
+    if st is None:
+        st = []
+        _tls.scope_stack = st
+    return st
+
+
+class TaskHandle:
+    """Phase 7 (concurrency): a spawned task (`spawn { }`)."""
+
+    def __init__(self, label: str = "task"):
+        self.label = label
+        self.thread: Optional[threading.Thread] = None
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: Optional[MisaError] = None  # captured MisaError
+        self.cancelled = False  # set by scope exit / program end
+        self.parent_scope = 0  # scope id on the spawning thread
+        self.awaited = False  # set by await (suppresses stderr report)
+
+
+class Channel:
+    """Phase 7 (concurrency): an unbounded FIFO channel (`chan<T>()`).
+
+    `send` never blocks. `recv` blocks until a value arrives; after
+    `close`, `recv` drains the remaining values then raises E306
+    "channel closed".
+    """
+
+    def __init__(self):
+        self.q: deque = deque()
+        self.cond = threading.Condition()
+        self.closed = False
+
+
 class MapValue:
     """A Misa Map. Distinct from a record (plain dict) so missing-key
     access can throw E305 instead of silently returning nil."""
@@ -166,6 +225,10 @@ def render_value(v: Any) -> str:
         return "<ptr>"
     if isinstance(v, TokenStreamHandle):
         return "<stream>"
+    if isinstance(v, TaskHandle):
+        return "<task>"
+    if isinstance(v, Channel):
+        return "<chan>"
     if isinstance(v, LambdaValue):
         return "<lambda>"
     if isinstance(v, FnValue):
@@ -208,6 +271,84 @@ class Interpreter:
         self.provider_cache: Dict[tuple, Provider] = {}
         self.global_env = Env()
         self.current_screen = None
+        # Phase 7 (concurrency): task registry + scope ids. Tasks share
+        # the interpreter (and memory — mutable sharing across tasks is
+        # the programmer's responsibility, like Go).
+        self._tasks: List[TaskHandle] = []
+        self._tasks_lock = threading.Lock()
+        self._scope_counter = 0
+
+    # -- Phase 7 (concurrency): scopes, cancellation, program end -----
+
+    def _new_scope(self) -> int:
+        with self._tasks_lock:
+            self._scope_counter += 1
+            return self._scope_counter
+
+    def _push_scope(self):
+        _scope_stack().append(self._new_scope())
+
+    def _current_scope(self) -> int:
+        st = _scope_stack()
+        return st[-1] if st else 0
+
+    def _pop_scope(self):
+        """Pop the current function scope, cancelling still-running
+        children spawned inside it (structured concurrency: no orphans,
+        no leaks)."""
+        st = _scope_stack()
+        if not st:
+            return
+        sid = st.pop()
+        with self._tasks_lock:
+            children = [t for t in self._tasks
+                        if t.parent_scope == sid and not t.done.is_set()]
+        for t in children:
+            t.cancelled = True
+
+    @staticmethod
+    def _current_task() -> Optional[TaskHandle]:
+        return getattr(_tls, "task_handle", None)
+
+    def _check_cancelled(self, node=None):
+        """Yield-point check: a cancelled task raises E306 "task
+        cancelled" at `await`, `recv`, `sleep` entry, and task start.
+        Threads blocked in C calls (e.g. http.get) finish naturally and
+        observe the flag at their next yield point."""
+        h = self._current_task()
+        if h is not None and h.cancelled:
+            kw = {"line": node.line, "col": node.col} \
+                if node is not None else {}
+            raise ConcurrencyError("task cancelled", **kw)
+
+    def _finish_tasks(self):
+        """Program end: wait for outstanding tasks bounded by
+        PROGRAM_END_WAIT_S, then cancel stragglers. Never-awaited tasks
+        whose error is set are reported to stderr (never silent)."""
+        st = _scope_stack()
+        if st:
+            st.pop()  # drop the program scope
+        deadline = time.monotonic() + PROGRAM_END_WAIT_S
+        pending: list = []
+        while True:
+            with self._tasks_lock:
+                pending = [t for t in self._tasks
+                           if not t.done.is_set()]
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        for t in pending:
+            t.cancelled = True
+        for t in pending:
+            # Bounded: a thread stuck in a C call keeps its daemon
+            # status and dies with the process; we never join forever.
+            t.thread.join(timeout=1.0)
+        for t in self._tasks:
+            if t.error is not None and not t.awaited:
+                print(f"Error: {t.error.code}: {t.error.message}",
+                      file=sys.stderr)
 
     # -- loading ------------------------------------------------------
 
@@ -319,26 +460,32 @@ class Interpreter:
 
     def run(self, prog: ast.Program):
         self.load(prog)
-        for item in prog.items:
-            if isinstance(item, (ast.AppDecl, ast.ProviderDecl,
-                                 ast.ModelsDecl, ast.TypeDecl,
-                                 ast.TableDecl,
-                                 ast.ModelDecl, ast.ScreenDecl,
-                                 ast.EvalDecl, ast.FnDecl,
-                                 ast.ExternDecl,
-                                 ast.ImportDecl)):
-                continue
-            try:
-                self.exec_stmt(item, self.global_env)
-            except _ReturnSignal:
-                break
-            except RecursionError:
-                # H-5: deep Misa recursion must surface as a clean E300,
-                # never a Python traceback.
-                raise RuntimeError_(
-                    "call stack overflow (recursion too deep)",
-                    line=getattr(item, "line", 0),
-                    col=getattr(item, "col", 0))
+        # Phase 7: the program scope owns top-level spawns; run() waits
+        # for outstanding tasks (bounded) when the program finishes.
+        self._push_scope()
+        try:
+            for item in prog.items:
+                if isinstance(item, (ast.AppDecl, ast.ProviderDecl,
+                                     ast.ModelsDecl, ast.TypeDecl,
+                                     ast.TableDecl,
+                                     ast.ModelDecl, ast.ScreenDecl,
+                                     ast.EvalDecl, ast.FnDecl,
+                                     ast.ExternDecl,
+                                     ast.ImportDecl)):
+                    continue
+                try:
+                    self.exec_stmt(item, self.global_env)
+                except _ReturnSignal:
+                    break
+                except RecursionError:
+                    # H-5: deep Misa recursion must surface as a clean E300,
+                    # never a Python traceback.
+                    raise RuntimeError_(
+                        "call stack overflow (recursion too deep)",
+                        line=getattr(item, "line", 0),
+                        col=getattr(item, "col", 0))
+        finally:
+            self._finish_tasks()
 
     # -- statements ---------------------------------------------------
 
@@ -565,10 +712,18 @@ class Interpreter:
                                     line=e.line, col=e.col)
         if isinstance(e, ast.Await):
             handle = self.eval_expr(e.operand, env)
+            if isinstance(handle, TaskHandle):
+                ms = self.eval_expr(e.timeout, env) \
+                    if e.timeout is not None else None
+                return self.await_task(handle, e, ms)
             if not isinstance(handle, TokenStreamHandle):
                 raise RuntimeError_("'await' needs a stream",
                                         line=e.line, col=e.col)
             return self.drain_stream(handle, env)
+        if isinstance(e, ast.Spawn):
+            # Phase 7 (concurrency): returns a TaskHandle immediately;
+            # the body runs on its own thread (see spawn_task).
+            return self.spawn_task(e.body, env, e)
         if isinstance(e, ast.StreamDecl):
             handle = self.make_stream(e.call, env, e)
             env.define(e.name, handle, False)
@@ -699,6 +854,21 @@ class Interpreter:
                     rv = None
                 if isinstance(rv, DbHandle):
                     name = "db." + field
+            elif field in ("send", "recv", "close") \
+                    and recv != "chan":
+                # Phase 7: `<ch>.send/.recv/.close(...)` where the
+                # variable holds a Channel (the checker rewrites the
+                # checked AST to the canonical chan.send/chan.recv/close
+                # names; this covers ASTs that bypass checking). The
+                # canonical names themselves pass through untouched.
+                try:
+                    rv = env.lookup(recv)[0]
+                except UndefinedName:
+                    rv = None
+                if isinstance(rv, Channel):
+                    name = {"send": "chan.send", "recv": "chan.recv",
+                            "close": "close"}[field]
+                    args = [rv] + args
         if name in self.models:
             return self.call_model(self.models[name], args, e)
         if name in self.screens:
@@ -857,6 +1027,20 @@ class Interpreter:
             return chr(cp)
         if name == "process.run":
             return self.process_run(args[0], e)
+        # -- Phase 7 (concurrency) ------------------------------------
+        if name == "sleep":
+            return self.task_sleep(args[0], e)
+        if name == "chan":
+            # type args are checking-time only (erasure), like generics
+            return Channel()
+        if name == "chan.send":
+            return self.chan_send(args[0], args[1], e)
+        if name == "chan.recv":
+            return self.chan_recv(args[0], e)
+        if name == "close":
+            return self.chan_close(args[0], e)
+        if name == "fetch_all":
+            return self.fetch_all(args[0], e)
         # Phase 5a: call through a variable holding a function value.
         if "." not in name:
             try:
@@ -901,14 +1085,191 @@ class Interpreter:
             raise IOError_(f"process.run failed: {ex}",
                            line=node.line, col=node.col)
 
+    # -- Phase 7 (concurrency) ------------------------------------------
+    # One Python thread per task behind the cooperative facade. The GIL
+    # limits CPU parallelism; I/O parallelizes fully. Tasks share memory
+    # (like Go) — no data-race detector in v1.
+
+    def spawn_task(self, body: list, env: Env, node: ast.Node) -> TaskHandle:
+        """`spawn { ... }`: create the handle, start a daemon thread
+        running the body in a CHILD ENV capturing the definition-site
+        env (like closures), and return the handle immediately."""
+        child = Env(env)
+        handle = TaskHandle(label="task")
+        handle.parent_scope = self._current_scope()
+
+        def _body():
+            try:
+                self.exec_block(body, child)
+            except _ReturnSignal as r:
+                return r.value
+            return None
+
+        self._start_task(handle, _body)
+        return handle
+
+    def _start_task(self, handle: TaskHandle, fn):
+        """Register the handle and run fn() on a daemon thread, capturing
+        any MisaError into handle.error (a throwing task never leaks a
+        traceback; `await` rethrows the captured error)."""
+        def _run():
+            _tls.task_handle = handle
+            _tls.scope_stack = []
+            try:
+                self._check_cancelled()
+                handle.result = fn()
+            except RecursionError:
+                handle.error = RuntimeError_(
+                    "call stack overflow (recursion too deep)")
+            except MisaError as e:
+                handle.error = e
+            except Exception as ex:  # never a raw traceback
+                handle.error = RuntimeError_(
+                    f"task internal error: {ex}")
+            finally:
+                handle.done.set()
+                _tls.task_handle = None
+
+        with self._tasks_lock:
+            self._tasks.append(handle)
+        t = threading.Thread(target=_run,
+                             name=f"misa-{handle.label}", daemon=True)
+        handle.thread = t
+        t.start()
+
+    def await_task(self, handle: TaskHandle, node: ast.Node,
+                   timeout_ms=None) -> Any:
+        """`await t` / `await t timeout ms`. On completion: re-raise the
+        captured error (catchable at the awaiter) or return the result.
+        With a timeout only the WAIT is aborted — the task keeps running.
+        Negative timeout raises E306 "timeout must be non-negative"."""
+        handle.awaited = True
+        self._check_cancelled(node)  # yield point for the awaiter
+        if timeout_ms is not None:
+            if isinstance(timeout_ms, bool) \
+                    or not isinstance(timeout_ms, (int, float)):
+                raise RuntimeError_("await timeout needs an Int",
+                                    line=node.line, col=node.col)
+            if timeout_ms < 0:
+                raise ConcurrencyError("timeout must be non-negative",
+                                       line=node.line, col=node.col)
+            if not handle.done.wait(timeout_ms / 1000.0):
+                raise ConcurrencyError(
+                    f"task timed out after {timeout_ms}ms",
+                    line=node.line, col=node.col)
+        else:
+            # Chunked wait so a cancelled awaiter is not stuck forever.
+            while not handle.done.wait(_YIELD_POLL_S):
+                self._check_cancelled(node)
+        if handle.error is not None:
+            raise handle.error
+        return handle.result
+
+    def task_sleep(self, ms, node: ast.Node) -> None:
+        """`sleep(ms)`: blocks only the calling task (chunked, so scope
+        cancellation interrupts it). Negative ms raises E306."""
+        if isinstance(ms, bool) or not isinstance(ms, (int, float)):
+            raise RuntimeError_("sleep(Int) needs an int arg",
+                                line=node.line, col=node.col)
+        if ms < 0:
+            raise ConcurrencyError("sleep: ms must be non-negative",
+                                   line=node.line, col=node.col)
+        self._check_cancelled(node)
+        deadline = time.monotonic() + ms / 1000.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(remaining, _YIELD_POLL_S))
+            self._check_cancelled(node)
+
+    @staticmethod
+    def _as_channel(v, op: str, node: ast.Node) -> Channel:
+        if not isinstance(v, Channel):
+            raise RuntimeError_(
+                f"{op} needs a channel from chan(), got "
+                f"{type(v).__name__}", line=node.line, col=node.col)
+        return v
+
+    def chan_send(self, chv, v, node: ast.Node) -> None:
+        """`send` never blocks (v1: unbounded FIFO). Sending on a closed
+        channel raises E306 "send on closed channel"."""
+        ch = self._as_channel(chv, "chan.send", node)
+        with ch.cond:
+            if ch.closed:
+                raise ConcurrencyError("send on closed channel",
+                                       line=node.line, col=node.col)
+            ch.q.append(v)
+            ch.cond.notify()
+        return None
+
+    def chan_recv(self, chv, node: ast.Node) -> Any:
+        """`recv` blocks until a value arrives. After `close`, it drains
+        remaining values then raises E306 "channel closed"."""
+        ch = self._as_channel(chv, "chan.recv", node)
+        self._check_cancelled(node)  # yield point
+        while True:
+            with ch.cond:
+                if ch.q:
+                    return ch.q.popleft()
+                if ch.closed:
+                    raise ConcurrencyError("channel closed",
+                                           line=node.line, col=node.col)
+                ch.cond.wait(_YIELD_POLL_S)
+            self._check_cancelled(node)
+
+    def chan_close(self, chv, node: ast.Node) -> None:
+        ch = self._as_channel(chv, "close", node)
+        with ch.cond:
+            ch.closed = True  # idempotent; recv drains then errors
+            ch.cond.notify_all()
+        return None
+
+    def fetch_all(self, urls, node: ast.Node) -> list:
+        """`fetch_all([urls])`: one task per URL running http.get,
+        awaited in order; results in order; the FIRST error is raised
+        (catchable). The threads genuinely parallelize the I/O."""
+        if not isinstance(urls, list) \
+                or not all(isinstance(u, str) for u in urls):
+            raise RuntimeError_("fetch_all([Text]) needs a text list",
+                                line=node.line, col=node.col)
+        tasks = []
+        for u in urls:
+            handle = TaskHandle(label="fetch_all")
+            handle.parent_scope = self._current_scope()
+
+            def _get(u=u):
+                return self.http_get(u, node)
+
+            self._start_task(handle, _get)
+            tasks.append(handle)
+        results = []
+        for i, t in enumerate(tasks):
+            t.awaited = True
+            try:
+                results.append(self.await_task(t, node))
+            except MisaError:
+                # First error wins; the rest are no longer anyone's
+                # result, so cancel + silence them (no stderr noise).
+                for rest in tasks[i + 1:]:
+                    rest.cancelled = True
+                    rest.awaited = True
+                raise
+        return results
+
     def call_fn(self, decl: ast.FnDecl, args: list, node: ast.Node) -> Any:
         local = Env(self.global_env)
         for (pn, _), v in zip(decl.params, args):
             local.define(pn, v, False)
+        # Phase 7: function entry pushes a scope; exit pops it and
+        # cancels still-running children spawned inside this call.
+        self._push_scope()
         try:
             self.exec_block(decl.body, local)
         except _ReturnSignal as r:
             return r.value
+        finally:
+            self._pop_scope()
         return None
 
     def http_get(self, url: str, node: ast.Node) -> str:
@@ -1667,13 +2028,19 @@ class Interpreter:
         inner = Env(lam.closure)
         for p, v in zip(lam.params, args):
             inner.define(p, v, False)
-        if lam.expr_body is not None:
-            return self.eval_expr(lam.expr_body, inner)
+        # Phase 7: like call_fn, a lambda call is a scope (spawns inside
+        # are children of this invocation).
+        self._push_scope()
         try:
-            self.exec_block(lam.body, inner)
-        except _ReturnSignal as r:
-            return r.value
-        return None
+            if lam.expr_body is not None:
+                return self.eval_expr(lam.expr_body, inner)
+            try:
+                self.exec_block(lam.body, inner)
+            except _ReturnSignal as r:
+                return r.value
+            return None
+        finally:
+            self._pop_scope()
 
 
 class _ReturnSignal(Exception):

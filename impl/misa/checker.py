@@ -16,6 +16,11 @@ PRIMITIVES = {"Text", "Int", "Float", "Bool", "Error", "Void",
               "Ptr"}
 MEDIA = {"Photo", "Audio", "Video", "Document"}
 SPECIAL = {"TokenStream", "Embedding", "Db"}
+# Phase 7 (concurrency): builtin generic type names, exactly 1 type
+# argument (like List<T>). `Task<Text>`, `Chan<Int>` are valid
+# annotations; bare `Task`/`Chan` is an error (E221, suggesting the
+# generic form).
+CONCURRENCY_GENERICS = {"Task", "Chan"}
 BUILTINS = {
     "print": (["Text"], "Text"),  # print accepts anything; modeled loosely
     "len": (["any"], "Int"),
@@ -1000,13 +1005,43 @@ class Checker:
         if isinstance(e, ast.UnOp):
             t = self._infer(e.operand, scope)
             return "Bool" if e.op == "not" else t
+        if isinstance(e, ast.Spawn):
+            # Phase 7 (concurrency): `spawn { ... }` — the block's
+            # return type is collected exactly like a lambda block
+            # body (all returns must agree); it becomes T in `Task<T>`.
+            # A block with no `return` is `Task<Void>`. The block may
+            # capture enclosing variables (like lambdas), so it shares
+            # the enclosing scope — no extra restriction.
+            ret_ts = []
+            self._check_block(e.body, dict(scope), fn_ret=None,
+                              _ret_collect=ret_ts)
+            if ret_ts:
+                rt = (ret_ts[0]
+                      if all(t == ret_ts[0] for t in ret_ts)
+                      else "unknown")
+            else:
+                rt = "Void"
+            return f"Task<{rt}>"
         if isinstance(e, ast.Await):
             t = self._infer(e.operand, scope)
-            if t != "TokenStream":
-                self.error("E205",
-                           f"'await' needs a TokenStream, found {t}",
-                           e.line, e.col)
-            return "unknown"  # model return type; resolved at runtime
+            # Phase 7 (concurrency): `await t timeout <ms>` — the
+            # timeout must be Int (a negative value is a runtime
+            # check, not a static one).
+            if e.timeout is not None:
+                tt = self._infer(e.timeout, scope)
+                if tt != "unknown" and tt != "Int":
+                    self.error("E211",
+                               f"'await' timeout wants Int, got {tt}",
+                               e.timeout.line, e.timeout.col)
+            if t == "TokenStream":
+                return "unknown"  # model return type; resolved at runtime
+            base, args = self._split_applied(t)
+            if base == "Task" and len(args) == 1:
+                return args[0]
+            self.error("E205",
+                       f"'await' needs a Task or TokenStream, found {t}",
+                       e.line, e.col)
+            return "unknown"
         if isinstance(e, ast.StreamDecl):
             return "TokenStream"
         self.error("E001", f"cannot infer {type(e).__name__}",
@@ -1094,6 +1129,23 @@ class Checker:
             if field in ("exec", "query", "close") and recv in scope \
                     and scope[recv][0] == "Db":
                 e.name = f"db.{field}"
+        # Phase 7 (concurrency): `<ch>.send(v)` / `<ch>.recv()` /
+        # `<ch>.close()` where the receiver variable's type starts with
+        # `Chan<` rewrites e.name in place to the canonical `chan.send`
+        # / `chan.recv` / `close` (propagating to the interpreter and
+        # the AOT emitter, which key off the same AST — same trick as
+        # M-4 above). The receiver is prepended as the first arg so the
+        # checked AST carries the canonical runtime signatures
+        # `chan.send(chan, value)` / `chan.recv(chan)` / `close(chan)`.
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if recv in scope and scope[recv][0].startswith("Chan<") \
+                    and field in ("send", "recv", "close"):
+                e.name = {"send": "chan.send", "recv": "chan.recv",
+                          "close": "close"}[field]
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
         # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
         if e.callee is not None:
             ct = self._infer(e.callee, scope)
@@ -1198,7 +1250,18 @@ class Checker:
             else:
                 for (pn, te), a, at in zip(fn.params, e.args, arg_ts):
                     want_t = self._tname(te)
-                    if at != "unknown" and not self._assignable(want_t, at):
+                    # Phase 7 (concurrency): Task/Chan values may not
+                    # cross the FFI boundary (E225), even as arguments.
+                    if at != "unknown" \
+                            and (at.startswith("Task<")
+                                 or at.startswith("Chan<")):
+                        self.error("E225",
+                                   f"cannot pass {at} to extern function "
+                                   f"'{e.name}': Task/Chan values cannot "
+                                   f"cross the FFI boundary",
+                                   a.line, a.col)
+                    elif at != "unknown" \
+                            and not self._assignable(want_t, at):
                         self.error("E211",
                                    f"argument '{pn}' wants {want_t}, "
                                    f"got {at}", a.line, a.col)
@@ -1227,6 +1290,101 @@ class Checker:
                                    f"argument wants {want_t}, got {at}",
                                    a.line, a.col)
             return fret
+        # Phase 7 (concurrency): `chan` / `sleep` / `fetch_all` /
+        # `close` / `chan.send` / `chan.recv`. Placed after user
+        # functions and variables so a user-defined `sleep` etc.
+        # shadows the builtin, like the other builtin families.
+        if e.name == "chan":
+            # `chan<T>()` — exactly 1 type argument (E221, matching
+            # the Call type_args arity reporting for generics), no
+            # value args, returns Chan<T>.
+            if len(e.type_args) != 1:
+                self.error("E221",
+                           f"'chan' takes 1 type argument(s), "
+                           f"got {len(e.type_args)}", e.line, e.col)
+                return "unknown"
+            ta = e.type_args[0]
+            self._check_te(ta, ta.line, ta.col)
+            if e.args:
+                self.error("E102",
+                           f"'chan' takes 0 args, got {len(e.args)}",
+                           e.line, e.col)
+            return f"Chan<{self._tname(ta)}>"
+        if e.name == "sleep":
+            if len(e.args) != 1:
+                self.error("E102",
+                           f"'sleep' takes 1 arg, got {len(e.args)}",
+                           e.line, e.col)
+            elif arg_ts[0] != "unknown" \
+                    and not self._assignable("Int", arg_ts[0]):
+                self.error("E211",
+                           f"'sleep' wants Int, got {arg_ts[0]}",
+                           e.args[0].line, e.args[0].col)
+            return "Void"
+        if e.name == "fetch_all":
+            if len(e.args) != 1:
+                self.error("E102",
+                           f"'fetch_all' takes 1 arg, got {len(e.args)}",
+                           e.line, e.col)
+            elif arg_ts[0] != "unknown" \
+                    and not self._assignable("[Text]", arg_ts[0]):
+                self.error("E211",
+                           f"'fetch_all' wants [Text], got {arg_ts[0]}",
+                           e.args[0].line, e.args[0].col)
+            return "[Text]"
+        if e.name == "close":
+            if len(e.args) != 1:
+                self.error("E102",
+                           f"'close' takes 1 arg, got {len(e.args)}",
+                           e.line, e.col)
+                return "Void"
+            ct = arg_ts[0]
+            cbase, cargs = self._split_applied(ct)
+            if ct != "unknown" \
+                    and not (cbase == "Chan" and len(cargs) == 1):
+                self.error("E211",
+                           f"'close' wants a Chan<T> channel, got {ct}",
+                           e.args[0].line, e.args[0].col)
+            return "Void"
+        if e.name == "chan.send":
+            # Canonical name for `ch.send(v)` (see the M-4-style
+            # rewrite at the top of _infer_call).
+            if len(e.args) != 2:
+                self.error("E102",
+                           f"'chan.send' takes 2 args, "
+                           f"got {len(e.args)}", e.line, e.col)
+                return "Void"
+            ct, vt = arg_ts
+            cbase, cargs = self._split_applied(ct)
+            if ct != "unknown" \
+                    and not (cbase == "Chan" and len(cargs) == 1):
+                self.error("E211",
+                           f"'chan.send' needs a Chan<T> channel, "
+                           f"got {ct}", e.args[0].line, e.args[0].col)
+                return "Void"
+            elem = cargs[0]
+            if vt != "unknown" and elem != "unknown" \
+                    and not self._assignable(elem, vt):
+                self.error("E211",
+                           f"'chan.send' wants {elem}, got {vt}",
+                           e.args[1].line, e.args[1].col)
+            return "Void"
+        if e.name == "chan.recv":
+            # Canonical name for `ch.recv()`.
+            if len(e.args) != 1:
+                self.error("E102",
+                           f"'chan.recv' takes 1 arg, "
+                           f"got {len(e.args)}", e.line, e.col)
+                return "unknown"
+            ct = arg_ts[0]
+            cbase, cargs = self._split_applied(ct)
+            if ct != "unknown" \
+                    and not (cbase == "Chan" and len(cargs) == 1):
+                self.error("E211",
+                           f"'chan.recv' needs a Chan<T> channel, "
+                           f"got {ct}", e.args[0].line, e.args[0].col)
+                return "unknown"
+            return cargs[0]
         if e.name in NS_BUILTINS:
             params, ret = NS_BUILTINS[e.name]
             lo, hi = NS_BUILTIN_ARITY.get(e.name, (len(params),
@@ -1632,6 +1790,12 @@ class Checker:
             return self._known_type(ast.TypeExpr(name=te.name))
         # Phase 5c: applied generic types `Box<Int>`.
         if te.type_args:
+            # Phase 7 (concurrency): builtin `Task<T>` / `Chan<T>`
+            # require exactly 1 type argument.
+            if te.name in CONCURRENCY_GENERICS:
+                return (len(te.type_args) == 1
+                        and all(self._known_type(a)
+                                for a in te.type_args))
             decl = self.types.get(te.name)
             if decl is None or not decl.type_params:
                 return False
@@ -1657,6 +1821,14 @@ class Checker:
             return True
         # Phase 5c: applied generic type with wrong arity.
         if te.type_args:
+            # Phase 7 (concurrency): `Task`/`Chan` take exactly 1.
+            if te.name in CONCURRENCY_GENERICS \
+                    and len(te.type_args) != 1:
+                self.error(
+                    "E221",
+                    f"'{te.name}' takes 1 type argument(s), "
+                    f"got {len(te.type_args)}", line, col)
+                return False
             decl = self.types.get(te.name)
             if decl is not None and decl.type_params \
                     and len(te.type_args) != len(decl.type_params):
@@ -1665,6 +1837,15 @@ class Checker:
                     f"'{te.name}' takes {len(decl.type_params)} type "
                     f"argument(s), got {len(te.type_args)}", line, col)
                 return False
+        # Phase 7 (concurrency): bare `Task`/`Chan` without a type
+        # argument is not a type — suggest the generic form.
+        if not te.is_list and not te.is_map and not te.is_func \
+                and not te.type_args and te.name in CONCURRENCY_GENERICS:
+            self.error("E221",
+                       f"'{te.name}' takes 1 type argument(s), got 0 "
+                       f"(write {te.name}<T>, e.g. {te.name}<Text>)",
+                       line, col)
+            return False
         # Phase 5c: bare unknown name inside a generic decl → unbound
         # type variable (E222); otherwise E208.
         if not te.is_list and not te.is_map and not te.is_func \

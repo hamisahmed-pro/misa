@@ -437,7 +437,17 @@ class Formatter:
             op = "not " if e.op == "not" else "-"
             return f"{op}{self.fmt_expr(e.operand, 7)}"
         if isinstance(e, ast.Await):
-            return f"await {self.fmt_expr(e.operand, 7)}"
+            s = f"await {self.fmt_expr(e.operand, 7)}"
+            # Phase 7 (concurrency): `await t timeout <ms>`.
+            if e.timeout is not None:
+                s += f" timeout {self.fmt_expr(e.timeout, 7)}"
+            return s
+        if isinstance(e, ast.Spawn):
+            # Phase 7 (concurrency): block lambda style.
+            inline = _Inline()
+            stmts = "; ".join(inline.format_stmt_inline(s)
+                              for s in e.body)
+            return f"spawn {{ {stmts} }}"
         if isinstance(e, ast.Match):
             # Phase 5b: `match` expression.
             arms = []

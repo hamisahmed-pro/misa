@@ -30,6 +30,35 @@ print(env("HOME"))    // e.g. /home/you
 
 All platforms ✅.
 
+## Concurrency
+
+Structured, typed, cooperative tasks. `Task<T>` and `Chan<T>` are
+builtin generic types.
+
+| Function | Signature | Notes |
+|---|---|---|
+| `spawn` | `spawn { stmts } -> Task<T>` | Starts a concurrent task; `T` from the block's return type (`Task<Void>` if no `return`). Keyword, not a call. |
+| `await` | `await t -> T` / `await t timeout ms -> T` | Waits for a `Task<T>`; rethrows task errors. `timeout` (Int ms) raises catchable **E306** on expiry. E205 on anything else. Keyword, not a call. |
+| `sleep` | `sleep(ms: Int)` | Yields the current task for at least `ms` ms. E306 on negative. |
+| `chan` | `chan<T>() -> Chan<T>` | Unbounded FIFO channel. |
+| `send` | `ch.send(v: T)` | Method on a `Chan<T>`; never blocks. E306 on a closed channel. |
+| `recv` | `ch.recv() -> T` | Method on a `Chan<T>`; yields until a value arrives. After `close`, drains then raises catchable **E306**. |
+| `close` | `close(ch)` | Closes a channel (idempotent). |
+| `fetch_all` | `fetch_all(urls: [Text]) -> [Text]` | Parallel HTTP GET, order-preserving; first error raised (catchable). |
+
+```misa
+let t = spawn { return http.get("https://a.example.com") }
+let ch = chan<Text>()
+spawn { ch.send(await t) }
+print(ch.recv())
+```
+
+A task spawned in a function is cancelled when the function returns
+(awaits inside it raise E306 `"task cancelled"`). Never-awaited task
+errors print to stderr at program end. `Task`/`Chan` across FFI is E225.
+
+All platforms ✅ except web: `spawn` raises E600 there.
+
 ## `fs` — files
 
 | Function | Signature |

@@ -180,6 +180,18 @@ non-2xx status.
 Indexing a map with an absent key throws. Check membership first or
 catch it.
 
+**E306 — concurrency** (catchable with try/catch):
+
+```
+E306: task timed out after 5000ms
+```
+
+Raised when an `await t timeout ms` budget expires, when a task is
+cancelled (its function returned first, or it was still running at
+program end), or when you `recv` on a closed, drained channel. The
+message names the cause. Fix: raise the timeout, `await` the task
+before returning, or stop receiving after `close`.
+
 ## Models and budgets (E4xx/E5xx) — catchable
 
 - **E400** — the model call failed (transport, bad JSON, schema

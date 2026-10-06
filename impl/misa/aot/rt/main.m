@@ -50,6 +50,7 @@ void misa_ui_set_root_view(MisaUI *ui, void *rootView);
     misa_rt_init();   /* once, before any Misa call */
     os_log(OS_LOG_DEFAULT, "misa: calling misa_main");
     misa_main();      /* builds the first screen through the driver */
+    misa_task_shutdown(); /* Phase 7: reap tasks, report unawaited errors */
     /* NSLog (unbuffered): proves misa_main returned even if os_log drops it. */
     NSLog(@"misa: misa_main returned, app alive");
     /* View census: proves the Misa screen attached real views rather

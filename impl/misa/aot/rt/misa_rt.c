@@ -90,19 +90,27 @@ void misa_rt_init(void) {
 #ifdef MISA_USE_GC
     GC_init();
 #endif
+    misa_task_init(); /* Phase 7: task system (idempotent) */
 }
 
 /* ------------------------------------------------------------------ */
 /* errors                                                             */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
-    MVal  *err;   /* T_ERROR value */
-    int    line;
-    int    col;
-} Pending;
+/* Phase 7: fiber-local pending errors. Each task fiber owns a
+ * MisaPending slot (see misa_task.c); the task system installs the
+ * accessor below. Until then (and on builds without fibers) the plain
+ * thread-local slot is used. */
+static _Thread_local MisaPending tl_pending = {0};
+static MisaPending *(*pending_slot_fn)(void) = NULL;
 
-static _Thread_local Pending tl_pending = {0};
+void misa_set_pending_slot_fn(MisaPending *(*fn)(void)) {
+    pending_slot_fn = fn;
+}
+
+static MisaPending *pend_slot(void) {
+    return pending_slot_fn ? pending_slot_fn() : &tl_pending;
+}
 
 MVal *misa_error_new(const char *code, const char *msg) {
     MVal *e = val_new(M_TAG_ERROR);
@@ -112,10 +120,11 @@ MVal *misa_error_new(const char *code, const char *msg) {
 }
 
 void misa_raise(const char *code, const char *msg, int line, int col) {
-    if (!tl_pending.err) {
-        tl_pending.err = misa_error_new(code, msg);
-        tl_pending.line = line;
-        tl_pending.col = col;
+    MisaPending *ps = pend_slot();
+    if (!ps->err) {
+        ps->err = misa_error_new(code, msg);
+        ps->line = line;
+        ps->col = col;
     }
 }
 
@@ -129,23 +138,25 @@ void misa_raise_fmt(const char *code, int line, int col,
     misa_raise(code, buf, line, col);
 }
 
-MVal *misa_pending(void) { return tl_pending.err; }
+MVal *misa_pending(void) { return pend_slot()->err; }
 
 MVal *misa_take_pending(void) {
-    MVal *e = tl_pending.err;
-    tl_pending.err = NULL;
-    tl_pending.line = 0;
-    tl_pending.col = 0;
+    MisaPending *ps = pend_slot();
+    MVal *e = ps->err;
+    ps->err = NULL;
+    ps->line = 0;
+    ps->col = 0;
     return e;
 }
 
 /* `throw e`: e must be an Error value (checked by generated code via
  * misa_do_throw_check); here we just install it as pending. */
 void misa_do_throw(MVal *err, int line, int col) {
-    if (!tl_pending.err) {
-        tl_pending.err = err;
-        tl_pending.line = line;
-        tl_pending.col = col;
+    MisaPending *ps = pend_slot();
+    if (!ps->err) {
+        ps->err = err;
+        ps->line = line;
+        ps->col = col;
     }
 }
 
@@ -195,9 +206,10 @@ void misa_report_uncaught(MVal *err) {
     }
     /* P1: piecewise writes — no truncation risk for long messages. */
     char head[64];
-    if (tl_pending.line > 0)
+    MisaPending *rps = pend_slot();
+    if (rps->line > 0)
         snprintf(head, sizeof head, "%d:%d: ",
-                 tl_pending.line, tl_pending.col);
+                 rps->line, rps->col);
     else
         snprintf(head, sizeof head, "<unknown>: ");
     misa_platform_log_err(head, strlen(head));
@@ -205,6 +217,31 @@ void misa_report_uncaught(MVal *err) {
     misa_platform_log_err(": ", 2);
     misa_platform_log_err(msg, strlen(msg));
     misa_platform_log_err("\n", 1);
+    misa_platform_flush();
+}
+
+/* Phase 7: stderr report for a never-awaited task's captured error.
+ * Same "<line>:<col>: <code>: <message>" shape as uncaught errors,
+ * with an [unawaited task #N] marker. */
+void misa_report_task_error(MVal *err, int task_id, int line, int col) {
+    const char *code = "?";
+    const char *msg = "?";
+    if (err && err->tag == M_TAG_ERROR) {
+        code = misa_text_z(err->u.error.code);
+        msg = misa_text_z(err->u.error.message);
+    }
+    char head[64];
+    if (line > 0)
+        snprintf(head, sizeof head, "%d:%d: ", line, col);
+    else
+        snprintf(head, sizeof head, "<unknown>: ");
+    misa_platform_log_err(head, strlen(head));
+    misa_platform_log_err(code, strlen(code));
+    misa_platform_log_err(": ", 2);
+    misa_platform_log_err(msg, strlen(msg));
+    char tail[64];
+    snprintf(tail, sizeof tail, " [unawaited task #%d]\n", task_id);
+    misa_platform_log_err(tail, strlen(tail));
     misa_platform_flush();
 }
 
@@ -372,6 +409,8 @@ int misa_truthy(MVal *v) {
     case M_TAG_LIST:  return v->u.list.len > 0;
     case M_TAG_MAP:   return v->u.map.len > 0;
     case M_TAG_RECORD:return v->u.record.len > 0;
+    case M_TAG_TASK:  return 1;
+    case M_TAG_CHAN:  return 1;
     default:          return 1;
     }
 }
@@ -585,6 +624,8 @@ static void render_into(Str *s, MVal *v) {
     }
     case M_TAG_ITER: str_puts(s, "<iter>"); break;
     case M_TAG_PTR: str_puts(s, "<ptr>"); break;
+    case M_TAG_TASK: str_puts(s, "<task>"); break;
+    case M_TAG_CHAN: str_puts(s, "<chan>"); break;
     default: str_puts(s, "<value>"); break;
     }
 }
@@ -1207,32 +1248,20 @@ MVal *misa_fs_write(MVal *path, MVal *text, int line, int col) {
 /* ---------------- http.get (platform transport) ------------------ */
 /* Phase 4 (M3): the transport moved behind misa_platform_http_get
  * (libcurl on Linux, emscripten_fetch on web). Error shapes are
- * unchanged (E304, interpreter parity). */
+ * unchanged (E304, interpreter parity).
+ * Phase 7: the builtin itself moved to misa_task.c (fiber-aware: async
+ * through the scheduler's curl_multi when available, blocking
+ * otherwise). The response validation below is shared. */
 
-MVal *misa_http_get(MVal *url, int line, int col) {
-    const char *u = misa_text_z(url);
-    if (strncmp(u, "http://", 7) != 0 && strncmp(u, "https://", 8) != 0) {
-        misa_raise_fmt("E304", line, col,
-                       "http.get needs an http(s) URL, got '%s'", u);
-        return NULL;
-    }
-    MisaHttpResp r;
-    memset(&r, 0, sizeof r);
-    if (!misa_platform_http_get(u, 30.0, &r)) {
-        misa_raise_fmt("E304", line, col, "http.get failed: %s", r.err);
-        misa_platform_http_free(&r);
-        return NULL;
-    }
-    long status = r.status;
+MVal *misa_http_validate(const char *u, const char *body, size_t len,
+                         long status, int line, int col) {
     if (status < 200 || status >= 300) {
         misa_raise_fmt("E304", line, col, "http.get %s -> HTTP %d", u,
                        (int)status);
-        misa_platform_http_free(&r);
         return NULL;
     }
     /* body must decode as UTF-8 (interpreter parity) */
-    const unsigned char *d = (const unsigned char *)(r.body ? r.body : "");
-    size_t len = r.len;
+    const unsigned char *d = (const unsigned char *)(body ? body : "");
     for (size_t i = 0; i < len;) {
         unsigned char c = d[i];
         size_t w = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
@@ -1240,15 +1269,18 @@ MVal *misa_http_get(MVal *url, int line, int col) {
         if (!w || i + w > len) {
             misa_raise_fmt("E304", line, col,
                            "http.get %s: body is not UTF-8 text", u);
-            misa_platform_http_free(&r);
             return NULL;
         }
         i += w;
     }
-    MVal *t = misa_text((const char *)d, len);
-    misa_platform_http_free(&r);
-    return t;
+    return misa_text((const char *)d, len);
 }
+
+/* Phase 7: allocate a zeroed MVal with the given tag (Task/Chan
+ * handles in misa_task.c; the struct stays private to this file). */
+MVal *misa_val_new(uint8_t tag) { return val_new(tag); }
+void misa_val_set_ptr(MVal *v, void *p) { v->u.ptr = p; }
+void *misa_val_get_ptr(MVal *v) { return v->u.ptr; }
 
 /* ---------------- http.post (platform transport) ------------------ */
 /* Phase 5 (stdlib2): POST with a caller-chosen Content-Type. Error

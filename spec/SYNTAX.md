@@ -142,11 +142,17 @@ cmpExpr     := addExpr (("<" | "<=" | ">" | ">=") addExpr)*
 addExpr     := mulExpr (("+" | "-") mulExpr)*
 mulExpr     := unary (("*" | "/" | "%") unary)*
 unary       := ("-" | "not") unary | awaitExpr | primary
-awaitExpr   := "await" unary
+awaitExpr   := "await" unary ("timeout" unary)?
+             // Phase 7 (concurrency): `await t`, `await t timeout 5000`.
+             // `timeout` is contextual — only special directly after
+             // an await operand.
+spawnExpr   := "spawn" "{" statement* "}"
+             // Phase 7 (concurrency): task expression, type Task<T>.
 primary     := literal | IDENT | callExpr | fieldAccess | indexExpr
              | listLit | recordLit | mapLit | lambda | "(" expr ")"
-             | "stream" IDENT "=" expr | matchExpr | sumCtor
+             | "stream" IDENT "=" expr | matchExpr | sumCtor | spawnExpr
              // Phase 5b: match expressions and sum constructors
+             // Phase 7: spawnExpr (concurrency)
 matchExpr   := "match" expr "{" matchArm* "}"
 matchArm    := (IDENT "." IDENT "(" (IDENT ("," IDENT)*)? ")" | IDENT | "_")
                "=>" (expr | "{" statement* "}") ","?

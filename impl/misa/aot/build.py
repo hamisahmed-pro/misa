@@ -280,21 +280,21 @@ TARGETS = {
 # text UI driver behind misa_ui.h. The web target (M3) swaps in the
 # Emscripten platform layer + DOM driver; the Android targets (M6)
 # swap in the Android platform layer + Views driver + JNI entry.
-RT_SOURCES = ("misa_rt.c", "misa_json.c", "misa_model.c", "platform_linux.c",
-              "ui_text.c")
+RT_SOURCES = ("misa_rt.c", "misa_task.c", "misa_json.c", "misa_model.c",
+              "platform_linux.c", "ui_text.c")
 RT_SOURCES_BY_TARGET = {
     "wasm32-unknown-emscripten":
-        ("misa_rt.c", "misa_json.c", "misa_model.c", "platform_emscripten.c",
-         "ui_dom.c"),
+        ("misa_rt.c", "misa_task.c", "misa_json.c", "misa_model.c",
+         "platform_emscripten.c", "ui_dom.c"),
     "aarch64-linux-android":
-        ("misa_rt.c", "misa_json.c", "misa_model.c", "platform_android.c",
-         "ui_android.c", "jni_android.c"),
+        ("misa_rt.c", "misa_task.c", "misa_json.c", "misa_model.c",
+         "platform_android.c", "ui_android.c", "jni_android.c"),
     "armv7-linux-androideabi":
-        ("misa_rt.c", "misa_json.c", "misa_model.c", "platform_android.c",
-         "ui_android.c", "jni_android.c"),
+        ("misa_rt.c", "misa_task.c", "misa_json.c", "misa_model.c",
+         "platform_android.c", "ui_android.c", "jni_android.c"),
     "x86_64-linux-android":
-        ("misa_rt.c", "misa_json.c", "misa_model.c", "platform_android.c",
-         "ui_android.c", "jni_android.c"),
+        ("misa_rt.c", "misa_task.c", "misa_json.c", "misa_model.c",
+         "platform_android.c", "ui_android.c", "jni_android.c"),
 }
 RT_HEADERS = ("misa_rt.h", "misa_platform.h", "misa_ui.h", "jni_android.h")
 

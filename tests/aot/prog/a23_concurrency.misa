@@ -1,0 +1,44 @@
+// AOT parity: Phase 7 concurrency — spawn/await/sleep/channels/timeout.
+// All ordering is channel-rendezvoused (deterministic across backends).
+// The only timing assumption is a generous margin (2s sleep vs 100ms budget).
+
+// 1. spawn + await values
+let t1 = spawn { return 40 + 2 }
+let t2: Task<Text> = spawn { return "hello" }
+print(await t1)
+print(await t2)
+
+// 2. sleep yields; channel rendezvous orders completion
+let ch = chan<Text>()
+spawn { sleep(100) ch.send("slow") }
+spawn { ch.send("fast") }
+print(ch.recv())
+print(ch.recv())
+
+// 3. close: recv drains, then E306
+let ch2 = chan<Int>()
+ch2.send(7)
+close(ch2)
+print(ch2.recv())
+try {
+  ch2.recv()
+} catch e {
+  print(e.code)
+}
+
+// 4. timeout budget: task sleeps far longer than the budget
+let slow = spawn { sleep(2000) return 1 }
+try {
+  let x = await slow timeout 100
+  print("no-timeout")
+} catch e {
+  print(e.code)
+}
+
+// 5. task errors rethrow at the awaiter, catchable
+let bad = spawn { throw { code: "E999", message: "boom" } return 0 }
+try {
+  await bad
+} catch e {
+  print(e.code)
+}

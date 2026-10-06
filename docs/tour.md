@@ -298,6 +298,75 @@ for c in str.chars("héllo") {
 
 `and` / `or` / `not` are the boolean operators.
 
+## Concurrency
+
+Misa's concurrency is **structured**: tasks can't leak, everything is
+typed, and timeouts are catchable errors. No OS threads — cooperative
+tasks that yield at `await`, channel receives, and `sleep`.
+
+```misa
+// spawn a concurrent task; T is inferred from the block's return type
+let t: Task<Text> = spawn {
+    return http.get("https://api.example.com/a")
+}
+
+// ... do other work here ...
+
+// wait for the result (yields until done)
+let body: Text = await t
+print(body)
+
+// wait with a timeout budget (milliseconds) — expiry is a catchable E306
+try {
+    let b2 = await t timeout 5000
+} catch e {
+    print(e.code)  // E306: "task timed out after 5000ms"
+}
+
+// sleep without blocking other tasks
+sleep(100)
+```
+
+**Typed channels** move values between tasks:
+
+```misa
+let ch = chan<Int>()
+spawn { ch.send(40 + 2) }
+let v: Int = ch.recv()   // yields until a value arrives
+print(v)                 // 42
+
+close(ch)                // after close, recv drains, then raises E306
+```
+
+**Parallel fetch** — the 90% use case in one line (order-preserving;
+the first error is raised, catchable):
+
+```misa
+let pages: [Text] = fetch_all([
+    "https://a.example.com",
+    "https://b.example.com",
+])
+```
+
+Rules that keep you out of trouble:
+
+- A task spawned inside a function is **cancelled when the function
+  returns** — its `await`s raise E306 `"task cancelled"`. No orphans.
+- A throwing task captures its error; `await` **rethrows it** at the
+  awaiter (catchable). A task that is never awaited reports its error
+  to stderr at program end — never silent.
+- `await` on anything that isn't a `Task` (or a model `TokenStream`)
+  is a compile-time E205.
+- Scheduling is cooperative round-robin: a task runs until it yields.
+  A task that never yields starves the others (same as JavaScript) —
+  and tasks share memory, so prefer channels and task results over
+  mutable sharing.
+- `Task`/`Chan` values can't cross the FFI boundary (E225).
+
+On the web target, `spawn` raises E600 (fibers aren't available there);
+everywhere else — interpreter, host binaries, Android, iOS — behaves
+identically.
+
 ## Modules
 
 Split code across files with `import` (path relative to the importing
