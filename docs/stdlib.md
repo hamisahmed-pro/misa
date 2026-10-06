@@ -19,6 +19,7 @@ host AOT (Linux/macOS binary), Android (APK), iOS, web (Emscripten).
 | `float` | `float(x: Text) -> Float` | Parses; `E300` on failure. |
 | `assert` | `assert(cond: Bool, msg: Text)` | Aborts with `E301` + msg if false. |
 | `env` | `env(name: Text) -> Text` | Env var; `E302` if unset. |
+| `state` | `state(initial: T) -> T` | **Screens only.** Declares ephemeral per-screen-instance state; must be bound with `let`/`var` (`let c = state(0)`). Assigning re-renders the screen. E211 outside a screen body, unbound, in a handler/`for` body, or on type mismatch. |
 
 ```misa
 print(str(42))        // 42

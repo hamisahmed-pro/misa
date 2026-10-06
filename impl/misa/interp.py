@@ -61,6 +61,15 @@ class LambdaValue:
 
 
 @dataclass
+class StateCell:
+    """Screen state (`let x = state(v)`): a heap cell holding the current
+    value plus a back-reference to the owning screen frame dict, so
+    writes mark the frame dirty and the driver re-renders."""
+    value: Any
+    frame: Optional[dict]  # the screen frame owning this cell
+
+
+@dataclass
 class FnValue:
     """Phase 5a: an `fn` declaration used as a first-class value."""
     decl: ast.FnDecl
@@ -195,6 +204,14 @@ class Env:
 
     def assign(self, name: str, value: Any):
         cell = self.lookup(name)
+        # Screen state: writing a StateCell mutates the cell (bypassing
+        # let-immutability) and marks the owning screen frame dirty so
+        # the driver re-renders after the handler returns.
+        if isinstance(cell[0], StateCell):
+            cell[0].value = value
+            if cell[0].frame is not None:
+                cell[0].frame["dirty"] = True
+            return
         if not cell[1]:
             raise ImmutableAssign(f"cannot assign to immutable '{name}'")
         cell[0] = value
@@ -265,6 +282,9 @@ class Interpreter:
         self.screens: Dict[str, ast.ScreenDecl] = {}
         self.evals: Dict[str, ast.EvalDecl] = {}
         self.fns: Dict[str, ast.FnDecl] = {}
+        # Screen state: the current screen frame (dict with name, args,
+        # states, dirty, handlers) or None outside a screen.
+        self._screen_frame: Optional[dict] = None
         # Phase 7: extern (FFI) functions: name -> (ctypes callable,
         # FnDecl signature). Loaded lazily on first load().
         self.extern_fns: Dict[str, tuple] = {}
@@ -636,7 +656,12 @@ class Interpreter:
             return e.usd
         if isinstance(e, ast.Ident):
             try:
-                return env.lookup(e.name)[0]
+                v = env.lookup(e.name)[0]
+                # Screen state: reading a StateCell yields its current
+                # value (writes go through Env.assign's cell path).
+                if isinstance(v, StateCell):
+                    return v.value
+                return v
             except UndefinedName:
                 # Phase 5a: an `fn` declaration used as a value.
                 if e.name in self.fns:
@@ -1551,6 +1576,21 @@ class Interpreter:
         return None
 
     def call_builtin(self, name: str, args: list, node: ast.Node) -> Any:
+        if name == "state":
+            # Screen state: get-or-create the cell for this slot. The
+            # checker stamps node.state_slot and guarantees screen
+            # context, so reaching here means a legal declaration.
+            frame = self._screen_frame
+            slot = getattr(node, "state_slot", None)
+            if frame is None or slot is None:
+                raise RuntimeError_("state() is only usable inside a "
+                                     "screen body")
+            states = frame["states"]
+            cell = states.get(slot)
+            if cell is None:
+                cell = StateCell(value=args[0], frame=frame)
+                states[slot] = cell
+            return cell
         if name == "print":
             self.out.write(render_value(args[0]) + "\n")
             return render_value(args[0])
@@ -1612,6 +1652,20 @@ class Interpreter:
         scope = {}
         for (pn, _), v in zip(decl.params, arg_values):
             scope[pn] = v
+        # Screen state: set up the current frame. On a fresh navigation
+        # the frame is reset (state starts over); a re-render keeps the
+        # existing cells (self._rerendering guards that path).
+        if not getattr(self, "_rerendering", False):
+            self._screen_frame = {
+                "name": decl.name,
+                "args": list(arg_values),
+                "states": {},
+                "dirty": False,
+                "handlers": [],
+            }
+        else:
+            frame = self._screen_frame
+            frame["handlers"] = []
         self.out.write(f"--- screen {decl.name} ---\n")
         for item in decl.body:
             self.print_screen_item(item, scope, 0, {})
@@ -1638,6 +1692,15 @@ class Interpreter:
                 for y in node.body:
                     self.print_screen_item(y, inner, depth, ids)
             return
+        if isinstance(node, ast.LetStmt):
+            # Screen state: `let x = state(v)` creates the cell on first
+            # render and reuses it on re-renders (get-or-create).
+            env = Env()
+            for k, v in scope.items():
+                env.define(k, v, False)
+            val = self.eval_expr(node.value, env)
+            scope[node.name] = val
+            return
         self.print_component(node, scope, depth, ids)
 
     def print_component(self, comp: ast.Component, scope: dict,
@@ -1653,6 +1716,11 @@ class Interpreter:
                 scope[val.name] = {"__component__": comp.name}
                 continue
             if isinstance(val, ast.Lambda):
+                # Screen state: collect the handler closure so tests can
+                # fire it (handlers print as <handler>, as before).
+                lam = self.eval_expr(val, env)
+                if self._screen_frame is not None:
+                    self._screen_frame["handlers"].append(lam)
                 parts.append(f"{an}=<handler>")
             else:
                 parts.append(f"{an}={render_value(self.eval_expr(val, env))}")
@@ -1660,6 +1728,26 @@ class Interpreter:
                        (f"({', '.join(parts)})" if parts else "") + "\n")
         for child in comp.children:
             self.print_screen_item(child, dict(scope), depth + 1, ids)
+
+    def test_fire_handler(self, i: int):
+        """Test-only hook: fire the i-th collected handler (in render
+        order), then re-render the screen if state was mutated —
+        mirroring what the AOT drivers do via
+        misa_screen_after_handler()."""
+        frame = self._screen_frame
+        if frame is None:
+            raise RuntimeError_("no screen is currently rendered")
+        lam = frame["handlers"][i]
+        nargs = len(lam.params)
+        self.invoke_lambda_value(lam, [None] * nargs, None)
+        if frame["dirty"]:
+            frame["dirty"] = False
+            self._rerendering = True
+            try:
+                decl = self.screens[frame["name"]]
+                self.print_screen(decl, frame["args"])
+            finally:
+                self._rerendering = False
 
     # -- model calls --------------------------------------------------
 

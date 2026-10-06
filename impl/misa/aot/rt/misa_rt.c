@@ -16,6 +16,7 @@
 #endif
 #include "misa_rt.h"
 #include "misa_platform.h" /* P1-P4: logging, fatal, env, fs root */
+#include "misa_ui.h"       /* misa_ui_active/report_error (drivers) */
 
 #include <ctype.h>
 #include <errno.h>
@@ -1736,3 +1737,123 @@ MVal *misa_str_chr(MVal *code, int line, int col) {
 /* The 7 misa_screen_* functions now live in ui_text.c: they are thin
  * shims over the text UI driver (rt/misa_ui.h), selected at link
  * time. See that file for the implementation. */
+
+/* ---------------- screen state ------------------ */
+/* Ephemeral per-screen-instance state for the `state()` primitive.
+ * One current frame (v1: navigate() replaces it — state is per
+ * navigation, like React unmounting on navigation away). Cells are
+ * 1-element lists (heap-allocated, GC-managed — the same trick as
+ * Phase 5a closure cells). The states/args arrays use misa_alloc so the
+ * collector (GC builds) scans them without explicit root
+ * registration. */
+
+typedef MVal *(*sframe_rerender_t)(void);
+
+typedef struct {
+    char *name;
+    sframe_rerender_t rerender;  /* per-screen thunk (emitter-generated) */
+    MVal **args;                 /* stashed screen args for re-render */
+    int32_t nargs;
+    MVal **states;               /* NULL = slot not yet created */
+    int32_t capstates;
+    int32_t dirty;               /* set by misa_state_set */
+} ScreenFrame;
+
+static ScreenFrame g_sframe = {0};
+
+void misa_screen_frame_push(const char *name, void *rerender_thunk,
+                            int32_t nargs, MVal **args) {
+    ScreenFrame *f = &g_sframe;
+    free(f->name);
+    f->name = name ? strdup(name) : NULL;
+    if (name && !f->name) misa_platform_fatal("E300", "out of memory");
+    f->rerender = (sframe_rerender_t)rerender_thunk;
+    f->nargs = nargs;
+    if (nargs > 0 && args) {
+        f->args = (MVal **)misa_alloc(sizeof(MVal *) * (size_t)nargs);
+        memcpy(f->args, args, sizeof(MVal *) * (size_t)nargs);
+    } else {
+        f->args = NULL;
+    }
+    /* Fresh navigation: drop all state cells (GC reclaims them). */
+    f->states = NULL;
+    f->capstates = 0;
+    f->dirty = 0;
+}
+
+MVal **misa_screen_frame_argv(void) {
+    return g_sframe.args;
+}
+
+static void sframe_grow_states(ScreenFrame *f, int32_t slot) {
+    if (slot < f->capstates) return;
+    int32_t ncap = f->capstates ? f->capstates * 2 : 8;
+    while (ncap <= slot) ncap *= 2;
+    MVal **ns = (MVal **)misa_alloc(sizeof(MVal *) * (size_t)ncap);
+    for (int32_t i = 0; i < f->capstates; i++) ns[i] = f->states[i];
+    for (int32_t i = f->capstates; i < ncap; i++) ns[i] = NULL;
+    f->states = ns;
+    f->capstates = ncap;
+}
+
+MVal *misa_screen_state_cell(int32_t slot, MVal *initial) {
+    ScreenFrame *f = &g_sframe;
+    if (slot < 0) misa_platform_fatal("E300", "bad state slot");
+    sframe_grow_states(f, slot);
+    if (!f->states[slot]) {
+        /* get-or-create: the initial value is used only the first
+         * time this slot is visited (re-renders keep the cell). */
+        MVal *cell = misa_list_new();
+        misa_list_push(cell, initial);
+        f->states[slot] = cell;
+    }
+    return f->states[slot];
+}
+
+MVal *misa_state_get(MVal *cell) {
+    return misa_list_get(cell, 0);
+}
+
+void misa_state_set(MVal *cell, MVal *v) {
+    /* The cell is always a 1-element list created above. */
+    cell->u.list.items[0] = v;
+    /* Mark the current screen dirty so the driver re-renders after
+     * the current event handler returns. */
+    g_sframe.dirty = 1;
+}
+
+MVal *misa_screen_state_read_slot(int32_t slot) {
+    ScreenFrame *f = &g_sframe;
+    if (slot < 0 || slot >= f->capstates || !f->states[slot])
+        return misa_null();  /* branch never taken this instance */
+    return misa_state_get(f->states[slot]);
+}
+
+void misa_screen_state_write_slot(int32_t slot, MVal *v) {
+    ScreenFrame *f = &g_sframe;
+    if (slot < 0) misa_platform_fatal("E300", "bad state slot");
+    sframe_grow_states(f, slot);
+    if (!f->states[slot]) {
+        MVal *cell = misa_list_new();
+        misa_list_push(cell, v);
+        f->states[slot] = cell;
+    } else {
+        misa_state_set(f->states[slot], v);
+        return;
+    }
+    f->dirty = 1;
+}
+
+void misa_screen_after_handler(void) {
+    ScreenFrame *f = &g_sframe;
+    if (f->dirty && f->rerender) {
+        f->dirty = 0;
+        f->rerender();
+        if (misa_pending()) {
+            /* A failed re-render must not kill the app: surface it
+             * through the standard handler-boundary error channel. */
+            MVal *err = misa_take_pending();
+            misa_ui_report_error(misa_ui_active(), err);
+        }
+    }
+}

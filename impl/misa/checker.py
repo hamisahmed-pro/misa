@@ -134,6 +134,13 @@ class Checker:
         # Phase 4 (M4): id: name -> component kind for the screen whose
         # handler body is currently being checked (None elsewhere).
         self._cur_id_kinds: Optional[Dict[str, str]] = None
+        # Screen state (`state()`): True while checking a screen body;
+        # True while checking an event-handler body; slot counter and
+        # name -> slot for the current screen.
+        self._in_screen = False
+        self._in_handler = False
+        self._state_slot = 0
+        self._cur_state_slots: Dict[str, int] = {}
         # Phase 5c: type parameters in scope while checking a generic
         # fn or type decl (e.g. `T` in `fn first<T>(...)`).
         self._tparams: List[str] = []
@@ -415,9 +422,19 @@ class Checker:
         # (no static slot; AOT rejects those with E600).
         bindings: List[tuple] = []
         id_kinds: Dict[str, str] = {}
-        for item in s.body:
-            self._check_screen_item(item, scope, seen_ids, bindings,
-                                    id_kinds, False)
+        # Screen state: slot counter + name -> slot for this screen.
+        prev_in_screen, prev_slot = self._in_screen, self._state_slot
+        prev_state_slots = self._cur_state_slots
+        self._in_screen, self._state_slot = True, 0
+        self._cur_state_slots = {}
+        try:
+            for item in s.body:
+                self._check_screen_item(item, scope, seen_ids, bindings,
+                                        id_kinds, False)
+        finally:
+            self._in_screen, self._state_slot = prev_in_screen, prev_slot
+            s.state_bindings = dict(self._cur_state_slots)
+            self._cur_state_slots = prev_state_slots
         s.id_bindings = bindings
 
     def _check_screen_item(self, item: ast.Node, scope: dict,
@@ -428,11 +445,16 @@ class Checker:
                                   id_kinds, in_for)
         elif isinstance(item, ast.ScreenIf):
             self._infer(item.cond, scope)
+            # One shared scope per branch so `let`s are visible to
+            # later siblings (slots stay source-ordered; a slot in an
+            # untaken branch is simply never visited).
+            then_scope = dict(scope)
             for x in item.then:
-                self._check_screen_item(x, dict(scope), seen_ids,
+                self._check_screen_item(x, then_scope, seen_ids,
                                         bindings, id_kinds, in_for)
+            els_scope = dict(scope)
             for x in item.els:
-                self._check_screen_item(x, dict(scope), seen_ids,
+                self._check_screen_item(x, els_scope, seen_ids,
                                         bindings, id_kinds, in_for)
         elif isinstance(item, ast.ScreenFor):
             self._infer(item.iter, scope)
@@ -441,6 +463,43 @@ class Checker:
             for x in item.body:
                 self._check_screen_item(x, inner, seen_ids, bindings,
                                         id_kinds, True)
+        elif isinstance(item, ast.LetStmt):
+            self._check_screen_let(item, scope)
+
+    def _check_screen_let(self, s: ast.LetStmt, scope: dict):
+        """`let`/`var` in a screen body. `let x = state(v)` declares
+        ephemeral per-screen-instance state: validated here, stamped
+        with a source-order slot (React-hooks-like), and registered in
+        scope as a cell-mutable binding of the initial value's type."""
+        if s.name in scope:
+            self.error("E210", f"redefinition of '{s.name}'",
+                       s.line, s.col)
+            return
+        if isinstance(s.value, ast.Call) and s.value.name == "state":
+            e = s.value
+            if len(e.args) != 1:
+                self.error("E211",
+                           "state() takes exactly 1 argument (the "
+                           f"initial value), got {len(e.args)}",
+                           e.line, e.col)
+                t = "unknown"
+            else:
+                t = self._infer(e.args[0], scope)
+            if s.ann:
+                want = self._tname(s.ann)
+                if t != "unknown" and not self._assignable(want, t):
+                    self.error("E200",
+                               f"cannot assign {t} to '{s.name}: {want}'",
+                               s.line, s.col)
+                t = want
+            e.state_slot = self._state_slot
+            self._state_slot += 1
+            self._cur_state_slots[s.name] = e.state_slot
+            # Cell-mutable: assignment writes the cell (and re-renders).
+            scope[s.name] = (t, True)
+            return
+        # Ordinary let/var: the usual statement rules apply.
+        self._check_stmt(s, scope)
 
     def _check_component(self, c: ast.Component, scope: dict,
                          seen_ids: set, bindings: list, id_kinds: dict,
@@ -500,6 +559,11 @@ class Checker:
             hscope[pn] = ("unknown", False)
         prev = self._cur_id_kinds
         self._cur_id_kinds = id_kinds
+        # Screen state: handlers may read/write the screen's state()
+        # bindings (resolved via the runtime frame); `state()` cannot be
+        # *declared* in a handler.
+        prev_handler = self._in_handler
+        self._in_handler = True
         try:
             if lam.expr_body is not None:
                 self._infer(lam.expr_body, hscope)
@@ -507,6 +571,7 @@ class Checker:
                 self._check_block(lam.body, hscope)
         finally:
             self._cur_id_kinds = prev
+            self._in_handler = prev_handler
 
     def _check_eval(self, e: ast.EvalDecl):
         m = self.models.get(e.model_name)
@@ -578,10 +643,23 @@ class Checker:
             elif name not in scope:
                 self.error("E101", f"undefined name '{name}'",
                            s.line, s.col)
+            elif name in self._cur_state_slots:
+                # Screen state: writes go through the cell (and
+                # re-render); the value must match the declared type.
+                want = scope[name][0]
+                vt = self._infer(s.value, scope)
+                if (want != "unknown" and vt != "unknown"
+                        and not self._assignable(want, vt)):
+                    self.error("E211",
+                               f"cannot assign {vt} to state "
+                               f"'{name}: {want}'",
+                               s.value.line, s.value.col)
             elif not scope[name][1]:
                 self.error("E201", f"cannot assign to immutable '{name}'",
                            s.line, s.col)
-            self._infer(s.value, scope)
+                self._infer(s.value, scope)
+            else:
+                self._infer(s.value, scope)
         elif isinstance(s, ast.IfStmt):
             self._infer(s.cond, scope)
             self._check_block(s.then, dict(scope), fn_ret,
@@ -1118,6 +1196,24 @@ class Checker:
 
     def _infer_call(self, e: ast.Call, scope: dict,
                     expected: Optional[str] = None) -> str:
+        # Screen state: `state(...)` is a declaration form, not an
+        # expression — it must appear as a screen-body `let`/`var`
+        # initializer. Any other occurrence is E211. (The let path in
+        # _check_screen_let handles the legal form directly and never
+        # reaches this branch.)
+        if e.callee is None and e.name == "state":
+            if self._in_handler:
+                self.error("E211", "state() cannot be declared inside an "
+                                   "event handler (declare it in the "
+                                   "screen body)", e.line, e.col)
+            elif not self._in_screen:
+                self.error("E211", "state() is only usable inside a "
+                                   "screen body", e.line, e.col)
+            else:
+                self.error("E211", "state() must be bound with let or var "
+                                   "(e.g. `let count = state(0)`)",
+                           e.line, e.col)
+            return "unknown"
         # M-4: `<handle>.exec/query/close(...)` where the handle variable
         # has type Db resolves to the `db.*` builtin regardless of the
         # variable's name (the handle is still passed explicitly as the

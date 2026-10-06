@@ -389,6 +389,42 @@ Lookup is flat — `shout(...)`, not `utils.shout(...)`. Packages
 (`import "my-pkg"`) work the same way; see `misa pkg --help` and
 `docs/stdlib.md` for the bundled `std/` packages.
 
+## Screens and ephemeral state
+
+A `screen` is a component tree. `navigate(Home())` shows it:
+
+```misa
+screen Home(title: Text) {
+    Text(text: "hello {title}")
+    Button(label: "go", on_press: || { print("tap") })
+}
+
+navigate(Home("world"))
+```
+
+For ephemeral UI state — the kind React solves with `useState` — use
+`state()`:
+
+```misa
+screen Counter() {
+    let count = state(0)   // per-screen-instance, typed Int
+    Text(text: "count: {count}")
+    Button(label: "inc", on_press: || { count = count + 1 })
+}
+```
+
+Assigning to a state binding re-renders the screen on every target
+(CLI text, Android, iOS, web). Handlers can freely read and write the
+screen's `state()` bindings. A few rules:
+
+- `state()` must be bound with `let`/`var` in the screen body (not in
+  component args, handlers, or `for` bodies).
+- State is typed: `count = "x"` is a compile error (E211).
+- `navigate()` resets state — it is ephemeral. For durable state, use
+  SQLite (`db.*`).
+- Like React hooks, state slots are source-ordered: don't conditionally
+  reorder `state()` declarations between renders.
+
 ## What's next
 
 - `docs/stdlib.md` — the full library reference

@@ -212,6 +212,8 @@ int32_t misa_dispatch_handler(int32_t handler_id, MVal *event) {
         misa_ui_report_error(misa_ui_active(), err);
         return 1;
     }
+    /* Screen state: re-render if a state cell was mutated. */
+    misa_screen_after_handler();
     return 0;
 }
 

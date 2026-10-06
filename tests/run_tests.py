@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "impl"))
 
 from misa.lexer import Lexer
 from misa.parser import parse_source, ParseError
-from misa.checker import check_source, check_file
+from misa.checker import check_source, check_file, Checker
 from misa.fmt import format_source
 from misa.interp import Interpreter
 from misa import ast as last
@@ -237,6 +237,51 @@ def _():
     assert any(e["code"] == "E207" for e in errs), errs
 
 
+@test("checker: state() outside screen E211")
+def _():
+    errs = check_source("fn f() -> Int {\n  let x = state(0)\n  return x\n}\n")
+    assert any(e["code"] == "E211" and "screen body" in e["message"]
+               for e in errs), errs
+
+
+@test("checker: state() must be bound E211")
+def _():
+    errs = check_source("screen S { Text(text: \"{state(0)}\") }\n")
+    assert any(e["code"] == "E211" and "bound with let" in e["message"]
+               for e in errs), errs
+
+
+@test("checker: state() in handler E211")
+def _():
+    src = ("screen S { let c = state(0)\n"
+           "  Button(label: \"x\", on_press: || { let y = state(1) }) }\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E211" and "handler" in e["message"]
+               for e in errs), errs
+
+
+@test("checker: state() wrong type on write E211")
+def _():
+    src = ("screen S { let c = state(0)\n"
+           "  Button(label: \"x\", on_press: || { c = \"no\" }) }\n")
+    errs = check_source(src)
+    assert any(e["code"] == "E211" and "cannot assign Text" in e["message"]
+               for e in errs), errs
+
+
+@test("checker: state() annotation mismatch E200")
+def _():
+    errs = check_source("screen S { let c: Text = state(0) }\n")
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("checker: state() arity E211")
+def _():
+    errs = check_source("screen S { let c = state() }\n")
+    assert any(e["code"] == "E211" and "exactly 1 argument" in e["message"]
+               for e in errs), errs
+
+
 @test("checker: unknown provider kind E209")
 def _():
     src = ("provider wat { key: env(\"K\") }\nmodels { m: wat(\"x\") }\n"
@@ -298,6 +343,79 @@ def _():
     assert "Hello from Misa!" in out
     assert "spider has 8 legs" in out
     assert "tour complete" in out
+
+
+def run_src_checked(src):
+    """Parse + check + run on the SAME ast (the checker stamps screen
+    state slots onto it)."""
+    prog = parse_source(src)
+    errs = Checker().check(prog)
+    assert not errs, errs
+    buf = io.StringIO()
+    ip = Interpreter(out=buf)
+    ip.run(prog)
+    return ip, buf
+
+
+@test("interp: screen state init + handler re-render")
+def _():
+    src = ("screen Counter() {\n"
+           "  let count = state(0)\n"
+           "  Text(text: \"count: {count}\")\n"
+           "  Button(label: \"inc\", on_press: || { count = count + 1 })\n"
+           "}\n"
+           "navigate(Counter())\n")
+    ip, buf = run_src_checked(src)
+    assert "count: 0" in buf.getvalue(), buf.getvalue()
+    assert len(ip._screen_frame["handlers"]) == 1
+    buf.truncate(0)
+    buf.seek(0)
+    ip.test_fire_handler(0)
+    assert "count: 1" in buf.getvalue(), buf.getvalue()
+    buf.truncate(0)
+    buf.seek(0)
+    ip.test_fire_handler(0)
+    assert "count: 2" in buf.getvalue(), buf.getvalue()
+
+
+@test("interp: screen state multiple cells are independent")
+def _():
+    src = ("screen M() {\n"
+           "  let a = state(0)\n"
+           "  let b = state(\"x\")\n"
+           "  Text(text: \"{a} {b}\")\n"
+           "  Button(label: \"a\", on_press: || { a = a + 1 })\n"
+           "  Button(label: \"b\", on_press: || { b = \"y\" })\n"
+           "}\n"
+           "navigate(M())\n")
+    ip, buf = run_src_checked(src)
+    assert "0 x" in buf.getvalue()
+    buf.truncate(0)
+    buf.seek(0)
+    ip.test_fire_handler(1)  # only b changes
+    out = buf.getvalue()
+    assert "0 y" in out, out
+
+
+@test("interp: screen state resets on navigate")
+def _():
+    src = ("screen C() {\n"
+           "  let n = state(0)\n"
+           "  Text(text: \"{n}\")\n"
+           "  Button(label: \"i\", on_press: || { n = n + 1 })\n"
+           "}\n"
+           "navigate(C())\n")
+    prog = parse_source(src)
+    assert not Checker().check(prog)
+    buf = io.StringIO()
+    ip = Interpreter(out=buf)
+    ip.run(prog)
+    ip.test_fire_handler(0)
+    assert "Text(text=1)" in buf.getvalue(), buf.getvalue()
+    buf.truncate(0)
+    buf.seek(0)
+    ip.run(prog)  # navigate again: state resets
+    assert "Text(text=0)" in buf.getvalue(), buf.getvalue()
 
 
 @test("interp: model call returns typed record")

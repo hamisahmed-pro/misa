@@ -1,0 +1,24 @@
+// a24: screen state (`state()`). Initial render must be byte-identical
+// between the interpreter and AOT. (Handler firing + re-render is
+// exercised by the interpreter suite via test_fire_handler and by the
+// C harness; the text driver has no interactive UI.)
+screen Counter() {
+    let count = state(0)
+    let label: Text = state("taps")
+    Text(text: "count: {count} {label}")
+    Button(label: "inc", on_press: || { count = count + 1 })
+    Button(label: "ren", on_press: || { label = "tapped" })
+}
+
+screen Greet(name: Text) {
+    let n = state(3)
+    Text(text: "hi {name}, n={n}")
+    if n > 0 {
+        let note = state("pos")
+        Text(text: "{note}")
+    }
+    Button(label: "dec", on_press: || { n = n - 1 })
+}
+
+navigate(Counter())
+navigate(Greet("hamis"))

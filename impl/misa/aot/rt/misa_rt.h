@@ -245,6 +245,24 @@ void  misa_screen_comp_head_end(int has_args);
 void  misa_screen_comp_end(void);
 void  misa_screen_end(void);
 
+/* -- screen state (ephemeral per-screen-instance `state()` cells) ---- */
+/* One current frame (v1: navigate() replaces it). Cells are 1-element
+ * lists (heap-allocated, GC-managed — same trick as Phase 5a closure
+ * cells). The states/args arrays use misa_alloc so they work in both
+ * GC and malloc builds. */
+typedef MVal *(*MisaRerenderThunk)(void);
+void  misa_screen_frame_push(const char *name, void *rerender_thunk,
+                             int32_t nargs, MVal **args);
+MVal **misa_screen_frame_argv(void);
+MVal *misa_screen_state_cell(int32_t slot, MVal *initial);
+MVal *misa_state_get(MVal *cell);
+void  misa_state_set(MVal *cell, MVal *v);
+MVal *misa_screen_state_read_slot(int32_t slot);
+void  misa_screen_state_write_slot(int32_t slot, MVal *v);
+/* Called by each driver's misa_dispatch_handler after the handler ran:
+ * re-renders the current screen if state was mutated. */
+void  misa_screen_after_handler(void);
+
 /* -- models (blocking calls; see misa_model.c) ------------------------ */
 
 typedef struct MModelParam {

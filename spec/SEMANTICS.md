@@ -233,6 +233,35 @@ bound components expose typed props (`text` for `TextInput`,
 shipped in Phase 4 (Android Views driver, UIKit driver, DOM driver);
 the printed tree is exactly what native targets render.
 
+### 10.1 Ephemeral screen state (`state()`)
+
+`let x = state(initial)` in a screen body declares ephemeral,
+per-screen-instance state (the `useState` answer):
+
+```misa
+screen Counter() {
+    let count = state(0)              // Int state, initially 0
+    Text(text: "count: {count}")
+    Button(label: "inc", on_press: || { count = count + 1 })
+}
+```
+
+- The state value is typed from the initial value (or an explicit
+  annotation: `let c: Text = state("x")`). Writes must match (E211).
+- Reading `count` yields the current value; assigning re-renders the
+  screen on every target (interpreter text driver, Android Views,
+  UIKit, DOM).
+- Event handlers may read and write the screen's `state()` bindings —
+  they resolve via the screen frame, not the (gone) stack frame.
+  Capturing any other screen-local is still E600 in AOT.
+- `state()` must be bound with `let`/`var` at screen-body level (E211
+  elsewhere: component args, conditions, handlers, `for` bodies, and
+  outside screens).
+- State slots are source-ordered (React-hooks-like): do not
+  conditionally reorder `state()` declarations between renders.
+- `navigate()` resets state (fresh instance). State is ephemeral —
+  for durable state, use SQLite (`db.*`).
+
 ## 11. Uncaught errors
 
 Any error not caught by `try`/`catch` aborts the program with a

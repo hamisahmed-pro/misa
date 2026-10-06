@@ -296,6 +296,8 @@ int32_t misa_dispatch_handler(int32_t handler_id, MVal *event) {
         } else {
             rc = 0;
         }
+        /* Screen state: re-render if a state cell was mutated. */
+        misa_screen_after_handler();
     }
     pthread_mutex_unlock(&g_dispatch_mu);
     return rc;

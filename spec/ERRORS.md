@@ -44,7 +44,7 @@ Every Misa diagnostic carries a code. Ranges:
 | E208 | Unknown type name in an annotation. |
 | E209 | Unknown provider / model alias / on-device model problem at check time. |
 | E210 | Duplicate definition in one file (`duplicate function 'f'`, `redefinition of 'x'`). |
-| E211 | Argument/return type mismatch (`argument 'x' wants Int, got Text`). |
+| E211 | Argument/return type mismatch (`argument 'x' wants Int, got Text`). Also: screen `state()` misuse — `state()` outside a screen body, unbound `state()` (not under `let`/`var`), `state()` declared in an event handler or `for` body, wrong arity, or assigning a mistyped value to a state binding (`cannot assign Text to state 'count: Int'`). |
 | E212 | `throw` of a non-`Error` value. Accepts a `{ code: Text, message: Text }` record *literal* or a caught error — a plain record cannot be assigned to the nominal `Error` type (E200). |
 | E213 | **(Phase 5a)** Cannot infer a lambda parameter's type — annotate it (`\|x: Int\|`) or use the lambda where a function type is expected. |
 | E214 | **(Phase 5a)** A builtin (`print`, `str`, `fs.read`, …) used as a value. Builtins are not first-class. **(M-7)** Also fires for an `extern` (FFI) function used as a value — extern functions are not first-class either. |

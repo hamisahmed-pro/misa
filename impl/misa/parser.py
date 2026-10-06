@@ -457,6 +457,11 @@ class Parser:
             return self.parse_screen_if()
         if self.at("for"):
             return self.parse_screen_for()
+        # Screen state: `let`/`var` in a screen body (e.g.
+        # `let count = state(0)` for ephemeral per-screen state).
+        k = self.peek().kind
+        if k in ("let", "var"):
+            return self.parse_let(k == "var")
         return self.parse_component()
 
     def parse_screen_if(self) -> ast.ScreenIf:

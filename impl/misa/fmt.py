@@ -243,6 +243,11 @@ class Formatter:
                 self.format_screen_item(x)
             self.ind -= 1
             self.w("}")
+        elif isinstance(node, ast.LetStmt):
+            kw = "var" if node.mutable else "let"
+            ann = f": {self.fmt_type(node.ann)}" if node.ann else ""
+            self.w(f"{kw} {node.name}{ann} = "
+                   f"{self.fmt_expr(node.value)}")
         else:
             raise ValueError(f"cannot format {type(node).__name__}")
 

@@ -586,8 +586,11 @@ static void task_add_child(MisaTask *self, MisaTask *t) {
     self->child_head = t;
 }
 
-/* Forward: HTTP layer tears down in-flight requests on cancel. */
+/* Forward: HTTP layer tears down in-flight requests on cancel.
+ * (curl path only; the no-curl stub was dead code.) */
+#ifdef MISA_USE_CURL
 static void http_req_cancel(MisaHttpReq *r);
+#endif
 static void fetch_batch_cancel(FetchBatch *b);
 
 /* Detach a WAITING task from whatever it is parked on. */
@@ -1248,7 +1251,6 @@ static MVal *http_req_result(MisaHttpReq *rq, int line, int col) {
 static void pump_net(void) {}
 
 /* Cancellation paths: no requests can exist without curl. */
-static void http_req_cancel(MisaHttpReq *rq) { (void)rq; }
 static void fetch_batch_cancel(FetchBatch *b) { (void)b; }
 
 #endif /* MISA_USE_CURL */

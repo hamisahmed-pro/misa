@@ -73,6 +73,11 @@ class FnCtx:
         # compiled event handler (restricted scope).
         self.id_slots = None
         self.in_handler = False
+        # Screen state (`state()`): name -> slot for the screen body
+        # being emitted; screen_state_vars is the same map, visible to
+        # compiled event handlers (resolved via the runtime frame).
+        self.state_vars: dict = {}
+        self.screen_state_vars: dict = {}
 
 
 # ---------------------------------------------------------------------
@@ -178,6 +183,16 @@ _RT_SIGS = {
     "misa_screen_comp_head_end": (ir.VoidType(), [I32]),
     "misa_screen_comp_end": (ir.VoidType(), []),
     "misa_screen_end": (ir.VoidType(), []),
+    # Screen state (`state()`): per-screen-instance ephemeral cells.
+    "misa_screen_frame_push": (ir.VoidType(),
+                               [PTR, PTR, I32, PTR.as_pointer()]),
+    "misa_screen_frame_argv": (PTR.as_pointer(), []),
+    "misa_screen_state_cell": (PTR, [I32, PTR]),
+    "misa_state_get": (PTR, [PTR]),
+    "misa_state_set": (ir.VoidType(), [PTR, PTR]),
+    "misa_screen_state_read_slot": (PTR, [I32]),
+    "misa_screen_state_write_slot": (ir.VoidType(), [I32, PTR]),
+    "misa_screen_after_handler": (ir.VoidType(), []),
     # Phase 4 (M4): driver interface used by compiled handlers.
     "misa_ui_active": (PTR, []),
     "misa_ui_find_bound": (I32, [PTR, I32]),
@@ -217,6 +232,8 @@ class Emitter:
         self.fns = {}       # misa fn name -> ir.Function
         self.models = {}    # model name -> (ir.Function, meta_global)
         self.screens = {}   # screen name -> ir.Function
+        self.screen_bodies = {}  # screen name -> _body ir.Function
+        self.screen_rerenders = {}  # screen name -> rerender thunk
         self.handlers = []  # Phase 4 (M4): handler fns, dispatch order
         # Phase 5a: first-class functions. Closure values are MVal*
         # records {__closure_fn: Int(fn ptr), __closure_env: record}.
@@ -429,6 +446,14 @@ class Emitter:
             fty = ir.FunctionType(PTR, [PTR] * len(decl.params))
             self.screens[name] = ir.Function(
                 self.mod, fty, name=f"misa_screen_{name}")
+            # Screen state: the public fn pushes a fresh frame; the
+            # _body fn renders; the rerender thunk re-runs _body with
+            # the frame's stashed args (state preserved).
+            self.screen_bodies[name] = ir.Function(
+                self.mod, fty, name=f"misa_screen_{name}_body")
+            self.screen_rerenders[name] = ir.Function(
+                self.mod, ir.FunctionType(PTR, []),
+                name=f"misa_rerender_{name}")
         # Phase 7: declare extern (FFI) functions with raw C types.
         # The linker resolves them against the shared libraries
         # (build.py adds -l<lib>).
@@ -922,17 +947,30 @@ class Emitter:
             self.check(ctx, s)
             tgt = s.target
             if isinstance(tgt, A.Ident):
-                a = ctx.scope.lookup(tgt.name)
-                if tgt.name in ctx.cell_vars:
-                    # Phase 5a: store through the shared cell.
-                    cell = b.load(a, name=f"cell_{tgt.name}")
-                    line, col = self.loc(s)
-                    zero = self.call(ctx, "misa_int",
-                                     [self.const_i64(0)], s, check=False)
-                    self.call(ctx, "misa_index_set",
-                              [cell, zero, v, line, col], s)
+                # Screen state: write through the cell (marks dirty).
+                # In handlers the cell is resolved via the frame slot.
+                if ctx.in_handler and tgt.name in ctx.screen_state_vars:
+                    self.call(ctx, "misa_screen_state_write_slot",
+                              [self.const_i32(
+                                  ctx.screen_state_vars[tgt.name]), v],
+                              s, check=False)
+                elif tgt.name in ctx.state_vars:
+                    a = ctx.scope.lookup(tgt.name)
+                    cell = b.load(a, name=f"statecell_{tgt.name}")
+                    self.call(ctx, "misa_state_set", [cell, v], s,
+                              check=False)
                 else:
-                    b.store(v, a)
+                    a = ctx.scope.lookup(tgt.name)
+                    if tgt.name in ctx.cell_vars:
+                        # Phase 5a: store through the shared cell.
+                        cell = b.load(a, name=f"cell_{tgt.name}")
+                        line, col = self.loc(s)
+                        zero = self.call(ctx, "misa_int",
+                                         [self.const_i64(0)], s, check=False)
+                        self.call(ctx, "misa_index_set",
+                                  [cell, zero, v, line, col], s)
+                    else:
+                        b.store(v, a)
             elif isinstance(tgt, A.Field):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
@@ -1101,9 +1139,11 @@ class Emitter:
             return self.emit_str(e, ctx)
         if isinstance(e, A.Ident):
             # Phase 4 (M4): handler scope. A bare component id is not
-            # a value (checker rejects with E201 first); anything that
-            # is neither a lambda param nor an id: binding is a
-            # closure over locals, which handlers do not support.
+            # a value (checker rejects with E201 first); screen state()
+            # bindings resolve via the runtime screen frame; anything
+            # that is neither a lambda param, an id: binding, nor a
+            # state binding is a closure over locals, which handlers do
+            # not support (their stack frame is gone when they run).
             if ctx.in_handler:
                 if ctx.id_slots and e.name in ctx.id_slots:
                     raise AOTError(
@@ -1111,16 +1151,29 @@ class Emitter:
                         f"component id '{e.name}' cannot be used as a "
                         f"value (use '{e.name}.text' to read a TextInput)",
                         e.line, e.col)
+                if e.name in ctx.screen_state_vars:
+                    slot = ctx.screen_state_vars[e.name]
+                    return self.call(
+                        ctx, "misa_screen_state_read_slot",
+                        [self.const_i32(slot)], e, check=False)
                 try:
                     a = ctx.scope.lookup(e.name)
                 except AOTError:
                     raise AOTError(
                         "E600",
                         f"handler cannot capture '{e.name}': event "
-                        f"handlers see only their params and screen "
-                        f"id: bindings",
+                        f"handlers see only their params, screen "
+                        f"id: bindings, and screen state() bindings "
+                        f"(use 'let {e.name} = state(...)' for mutable "
+                        f"screen state)",
                         e.line, e.col)
                 return b.load(a, name=f"l_{e.name}")
+            # Screen state: the alloca holds the cell; read through it.
+            if e.name in ctx.state_vars:
+                a = ctx.scope.lookup(e.name)
+                cell = b.load(a, name=f"statecell_{e.name}")
+                return self.call(ctx, "misa_state_get", [cell], e,
+                                 check=False)
             try:
                 a = ctx.scope.lookup(e.name)
             except AOTError:
@@ -1313,6 +1366,19 @@ class Emitter:
             self.check(ctx, e)
             return self.emit_closure_call(e, ctx, clos)
         name = e.name
+        # Screen state: `state(initial)` allocates a per-screen cell.
+        # The checker stamps the slot and guarantees screen context.
+        if name == "state":
+            slot = getattr(e, "state_slot", None)
+            if slot is None:
+                raise AOTError(
+                    "E600", "state() is only usable in a screen body",
+                    e.line, e.col)
+            init = self.emit_expr(e.args[0], ctx)
+            self.check(ctx, e)
+            return self.call(ctx, "misa_screen_state_cell",
+                             [self.const_i32(slot), init], e,
+                             check=False)
         # Phase 5c: generic fns go through monomorphization.
         if name in self.fn_decls and self.fn_decls[name].type_params:
             return self.emit_mono_call(name, self.fn_decls[name], e,
@@ -2068,23 +2134,77 @@ class Emitter:
     # -- screens (Phase 4, M4: compiled handlers + id: registry) --------
 
     def emit_screen_body(self, name: str, decl: A.ScreenDecl):
+        # Screen state: three generated functions per screen.
+        #   misa_screen_<name>(params...) — public entry: pushes a FRESH
+        #       state frame (navigate() semantics: state resets), then
+        #       renders the body.
+        #   misa_screen_<name>_body(params...) — the render itself.
+        #   misa_rerender_<name>() — re-runs the body with the frame's
+        #       stashed args (state preserved); called by the runtime
+        #       after a state-mutating event handler.
+        state_map = dict(getattr(decl, "state_bindings", {}) or {})
+
+        # --- wrapper: fresh frame + render
         fn = self.screens[name]
         ctx = self.new_fn_ctx(fn)
         b = ctx.builder
         self.get_nil(ctx)
-        for (pn, _), arg in zip(decl.params, fn.args):
-            a = self.alloca_var(ctx, pn)
-            b.store(arg, a)
-            ctx.scope.declare(pn, a)
+        nargs = len(decl.params)
+        arrty = ir.ArrayType(PTR, max(nargs, 1))
+        arr = b.alloca(arrty, name="sargv")
+        for i, arg in enumerate(fn.args):
+            p = b.gep(arr, [self.const_i32(0), self.const_i32(i)],
+                      name=f"sargv{i}")
+            b.store(arg, p)
+        argv = b.gep(arr, [self.const_i32(0), self.const_i32(0)],
+                     name="sargv0") if nargs else b.bitcast(
+                         NULL_PTR, PTR.as_pointer(), name="sargv_null")
+        thunk = b.bitcast(self.screen_rerenders[name], PTR,
+                          name="rerender_thunk")
+        self.call(ctx, "misa_screen_frame_push",
+                  [self.cstr(name), thunk, self.const_i32(nargs), argv],
+                  decl, check=False)
+        body_fn = self.screen_bodies[name]
+        r = b.call(body_fn, list(fn.args), name="body_ret")
+        self.check(ctx, decl)
+        self.emit_ret(ctx, r)
+        self.finish_fn_ctx(ctx)
+
+        # --- body: the render itself
+        bfn = self.screen_bodies[name]
+        bctx = self.new_fn_ctx(bfn)
+        bctx.state_vars = {}
+        bb = bctx.builder
+        self.get_nil(bctx)
+        for (pn, _), arg in zip(decl.params, bfn.args):
+            a = self.alloca_var(bctx, pn)
+            bb.store(arg, a)
+            bctx.scope.declare(pn, a)
         # id: name -> slot (recorded by the checker, M4)
         id_slots = {n: i for i, (n, _k) in enumerate(decl.id_bindings)}
-        self.call(ctx, "misa_screen_begin", [self.cstr(name)], decl,
+        self.call(bctx, "misa_screen_begin", [self.cstr(name)], decl,
                   check=False)
         for item in decl.body:
-            self.emit_screen_item(item, ctx, name, id_slots)
-        self.call(ctx, "misa_screen_end", [], decl, check=False)
-        self.emit_ret(ctx, self.get_nil(ctx))
-        self.finish_fn_ctx(ctx)
+            self.emit_screen_item(item, bctx, name, id_slots, state_map)
+        self.call(bctx, "misa_screen_end", [], decl, check=False)
+        self.emit_ret(bctx, self.get_nil(bctx))
+        self.finish_fn_ctx(bctx)
+
+        # --- rerender thunk: body with stashed args, state preserved
+        tfn = self.screen_rerenders[name]
+        tctx = self.new_fn_ctx(tfn)
+        tb = tctx.builder
+        self.get_nil(tctx)
+        targv = self.call(tctx, "misa_screen_frame_argv", [], decl,
+                          check=False)
+        targs = []
+        for i in range(nargs):
+            p = tb.gep(targv, [self.const_i32(i)], name=f"targ{i}")
+            targs.append(tb.load(p, name=f"targv{i}"))
+        tr = tb.call(body_fn, targs, name="rerender_ret")
+        self.check(tctx, decl)
+        self.emit_ret(tctx, tr)
+        self.finish_fn_ctx(tctx)
 
     def _screen_items_have_id(self, items) -> bool:
         """True if any Component under items has an id: arg (recursive)."""
@@ -2105,7 +2225,7 @@ class Emitter:
         return False
 
     def emit_screen_item(self, node, ctx: FnCtx, screen_name: str,
-                         id_slots: dict):
+                         id_slots: dict, state_map: dict):
         b = ctx.builder
         if isinstance(node, A.ScreenIf):
             c = self.emit_expr(node.cond, ctx)
@@ -2118,12 +2238,14 @@ class Emitter:
             b.cbranch(cond, then_b, else_b)
             b.position_at_end(then_b)
             for x in node.then:
-                self.emit_screen_item(x, ctx, screen_name, id_slots)
+                self.emit_screen_item(x, ctx, screen_name, id_slots,
+                                      state_map)
             if not b.block.is_terminated:
                 b.branch(end_b)
             b.position_at_end(else_b)
             for x in node.els:
-                self.emit_screen_item(x, ctx, screen_name, id_slots)
+                self.emit_screen_item(x, ctx, screen_name, id_slots,
+                                      state_map)
             if not b.block.is_terminated:
                 b.branch(end_b)
             b.position_at_end(end_b)
@@ -2136,6 +2258,15 @@ class Emitter:
                     "E600",
                     "id: inside ScreenFor is not supported in AOT "
                     "(dynamic replication needs a keyed registry)",
+                    node.line, node.col)
+            # Screen state: `state()` inside a for-body would share one
+            # cell across iterations (one slot per call site). Forbid
+            # with a clean error rather than surprising aliasing.
+            if self._screen_items_have_state(node.body):
+                raise AOTError(
+                    "E211",
+                    "state() is not supported inside a for-body "
+                    "(one call site = one cell; hoist it above the loop)",
                     node.line, node.col)
             v = self.emit_expr(node.iter, ctx)
             self.check(ctx, node)
@@ -2157,16 +2288,53 @@ class Emitter:
             ctx.scope = child
             child.declare(node.var, var)
             for y in node.body:
-                self.emit_screen_item(y, ctx, screen_name, id_slots)
+                self.emit_screen_item(y, ctx, screen_name, id_slots,
+                                      state_map)
             ctx.scope = old
             if not b.block.is_terminated:
                 b.branch(loop_b)
             b.position_at_end(end_b)
             return
-        self.emit_component(node, ctx, screen_name, id_slots)
+        if isinstance(node, A.LetStmt):
+            self.emit_screen_let(node, ctx, state_map)
+            return
+        self.emit_component(node, ctx, screen_name, id_slots, state_map)
+
+    def _screen_items_have_state(self, items) -> bool:
+        """True if any `state()` call appears under items (recursive,
+        not descending into lambdas — those are rejected separately)."""
+        for it in items:
+            if isinstance(it, A.LetStmt) and isinstance(it.value, A.Call) \
+                    and it.value.name == "state":
+                return True
+            if isinstance(it, A.ScreenIf):
+                if self._screen_items_have_state(it.then) \
+                        or self._screen_items_have_state(it.els):
+                    return True
+            if isinstance(it, A.ScreenFor):
+                if self._screen_items_have_state(it.body):
+                    return True
+            if isinstance(it, A.Component):
+                if self._screen_items_have_state(it.children):
+                    return True
+        return False
+
+    def emit_screen_let(self, s: A.LetStmt, ctx: FnCtx, state_map: dict):
+        """`let`/`var` inside a screen body. A `state(...)` initializer
+        allocates a screen state cell (slot stamped by the checker);
+        emit_expr already returns the cell, so just record the name."""
+        b = ctx.builder
+        v = self.emit_expr(s.value, ctx)
+        self.check(ctx, s)
+        a = self.alloca_var(ctx, s.name)
+        b.store(v, a)
+        slot = getattr(s.value, "state_slot", None)
+        if slot is not None:
+            ctx.state_vars[s.name] = slot
+        ctx.scope.declare(s.name, a)
 
     def emit_component(self, comp: A.Component, ctx: FnCtx,
-                       screen_name: str, id_slots: dict):
+                       screen_name: str, id_slots: dict, state_map: dict):
         # filter `id` args (not rendered, interpreter parity)
         args = [(an, av) for an, av in comp.args
                 if not (an == "id" and isinstance(av, A.Ident))]
@@ -2186,7 +2354,8 @@ class Emitter:
         for i, (an, av) in enumerate(args):
             first = self.const_i32(1 if i == 0 else 0)
             if isinstance(av, A.Lambda):
-                hid = self.emit_handler(screen_name, av, id_slots)
+                hid = self.emit_handler(screen_name, av, id_slots,
+                                        state_map)
                 self.call(ctx, "misa_screen_comp_arg_handler",
                           [self.cstr(an), first, self.const_i32(hid)],
                           comp, check=False)
@@ -2198,19 +2367,21 @@ class Emitter:
         self.call(ctx, "misa_screen_comp_head_end",
                   [self.const_i32(has_args)], comp, check=False)
         for child in comp.children:
-            self.emit_screen_item(child, ctx, screen_name, id_slots)
+            self.emit_screen_item(child, ctx, screen_name, id_slots,
+                                  state_map)
         self.call(ctx, "misa_screen_comp_end", [], comp, check=False)
 
     def emit_handler(self, screen_name: str, lam: A.Lambda,
-                     id_slots: dict) -> int:
+                     id_slots: dict, state_map: dict) -> int:
         """Compile an event-handler lambda to a real function.
 
         Returns the handler id (index into misa_handler_table[]).
         Emitted as misa_handler_<screen>_<n>(MVal *event_arg) -> MVal*
         with the standard FnCtx (check() after every fallible call,
         error epilogue). Scope is the lambda params (bound to the
-        event arg) plus the screen's id: bindings; anything else is a
-        closure over locals and is rejected (E600).
+        event arg) plus the screen's id: bindings plus the screen's
+        state() bindings (resolved via the runtime screen frame);
+        anything else is a closure over locals and is rejected (E600).
         """
         hid = len(self.handlers)
         fn = ir.Function(self.mod, ir.FunctionType(PTR, [PTR]),
@@ -2219,6 +2390,7 @@ class Emitter:
         ctx = self.new_fn_ctx(fn)
         ctx.in_handler = True
         ctx.id_slots = dict(id_slots)
+        ctx.screen_state_vars = dict(state_map)
         b = ctx.builder
         self.get_nil(ctx)
         if len(lam.params) > 1:

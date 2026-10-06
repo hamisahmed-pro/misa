@@ -106,7 +106,11 @@ budgetField := ("tokens" ":" INT
               | "cost" ":" MONEY) ","?
 promptClause:= "prompt" "v" INT TRISTRING
 
-screenDecl  := "screen" IDENT "(" params? ")" "{" component* "}"
+screenDecl  := "screen" IDENT "(" params? ")" "{" screenItem* "}"
+screenItem  := component | screenIf | screenFor | letDecl
+screenIf    := "if" expr "{" screenItem* "}" ("else" "{" screenItem* "}")?
+screenFor   := "for" IDENT "in" expr "{" screenItem* "}"
+letDecl     := ("let" | "var") IDENT (":" typeExpr)? "=" expr
 component   := IDENT "(" compArgs? ")" ("{" component* "}")?
 compArgs    := compArg ("," compArg)*
 compArg     := IDENT ":" expr
