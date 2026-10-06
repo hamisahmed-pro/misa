@@ -1,0 +1,41 @@
+// a20_critical_fixes.misa — AOT parity for audit critical fixes (C-1, C-5, C-7).
+// C-6 is checker-only (E211 at check time); C-8 needs missing onnxruntime.
+
+// C-1: 64-bit wrapping, identical on both backends.
+print(9223372036854775807 + 1)
+print(-9223372036854775808 - 1)
+print(9223372036854775807 * 2)
+print(int("99999999999999999999999"))
+print(int("-9223372036854775809"))
+// C-1: out-of-range literals wrap identically too.
+print(18446744073709551615)
+print(-9223372036854775809)
+
+// C-5: division by zero is catchable E300.
+try {
+  print(1 / 0)
+} catch e {
+  print("caught " + e.code)
+}
+try {
+  print(1 % 0)
+} catch e {
+  print("caught " + e.code)
+}
+
+// C-7: json.parse rejects lone surrogates.
+let j = str.chr(34) + str.chr(92) + "ud800" + str.chr(34)
+try {
+  let x = json.parse(j)
+  print("accepted (BAD)")
+} catch e {
+  print("rejected " + e.code)
+}
+
+// C-6: dynamic ordering-comparison mismatch is E200 on both backends.
+let dyn = json.parse("1")
+try {
+  print(dyn < "a")
+} catch e {
+  print("cmp rejected " + e.code)
+}

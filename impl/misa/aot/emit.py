@@ -1290,6 +1290,15 @@ class Emitter:
             return self.call(ctx, "misa_builtin_env", [z, line, col], e)
         if name == "fs.read":
             return self.call(ctx, "misa_fs_read", [arg(0), line, col], e)
+        # Bonus (audit): process.run has no AOT lowering — subprocess in
+        # compiled binaries is out of scope; the self-hosted build driver
+        # runs on the interpreter. E600 (not E101) is the contract for
+        # unsupported-on-target.
+        if name == "process.run":
+            raise AOTError("E600",
+                           "process.run is not supported in AOT-compiled "
+                           "binaries (use the interpreter)",
+                           e.line, e.col)
         if name == "fs.write":
             return self.call(ctx, "misa_fs_write",
                              [arg(0), arg(1), line, col], e)

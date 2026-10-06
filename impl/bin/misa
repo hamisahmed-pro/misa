@@ -177,6 +177,7 @@ def cmd_test(path, mock_path, as_json):
 
 def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
     from misa.aot.build import build, canonical_target, host_triple
+    from misa.aot.emit import AOTError
     if not out:
         base = os.path.basename(path)
         stem = base[:-5] if base.endswith(".misa") else base
@@ -195,6 +196,9 @@ def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
         ok, errors = build(path, out, emit_llvm=emit_llvm or "",
                            target=target or "",
                            preload_files=preload_files)
+    except AOTError as e:
+        # C-2: surface the E-code (was a raw die() string).
+        die(f"{e.code}: {e.message}")
     except RuntimeError as e:
         die(str(e))
     if not ok:

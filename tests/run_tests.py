@@ -2013,6 +2013,178 @@ def _():
     assert format_source(out) == out
 
 
+# ---------------------------------------------------------------- C-1..C-8
+# Critical gap fixes (audit 2026-10-06). Each test pins the fixed behavior.
+
+@test("c1: int arithmetic wraps to 64-bit two's complement")
+def _():
+    out = run_src('''
+print(9223372036854775807 + 1)
+print(-9223372036854775808 - 1)
+print(9223372036854775807 * 2)
+print(-(-9223372036854775808))
+''')
+    eq(out, "-9223372036854775808\n9223372036854775807\n-2\n"
+            "-9223372036854775808\n")
+
+
+@test("c1: int() parsing wraps instead of clamping")
+def _():
+    out = run_src('''
+print(int("99999999999999999999999"))
+print(int("-9223372036854775809"))
+print(int("  42  "))
+''')
+    # 99999999999999999999999 mod 2^64, as signed
+    eq(out, "200376420520689663\n9223372036854775807\n42\n")
+
+
+@test("c1: int() on out-of-range float is E300")
+def _():
+    raises_code(lambda: run_src('print(int(math.pow(10.0, 30.0)))'), "E300")
+
+
+@test("c5: division by zero is E300 and catchable")
+def _():
+    out = run_src('''
+try {
+  print(1 / 0)
+} catch e {
+  print("caught " + e.code)
+}
+try {
+  print(1 % 0)
+} catch e {
+  print("caught " + e.code)
+}
+try {
+  print(1.0 / 0.0)
+} catch e {
+  print("caught " + e.code)
+}
+''')
+    eq(out, "caught E300\ncaught E300\ncaught E300\n")
+
+
+@test("c6: binop type errors fail misa check with E211")
+def _():
+    errs = check_source('print(1 - "a")')
+    assert errs and errs[0]["code"] == "E211", errs
+    errs = check_source('print("a" * 2)')
+    assert errs and errs[0]["code"] == "E211", errs
+    errs = check_source('print([1] - [2])')
+    assert errs and errs[0]["code"] == "E211", errs
+
+
+@test("c6: valid binops still check clean")
+def _():
+    assert not check_source('print(1 + 2 * 3)')
+    assert not check_source('print("a" + "b")')
+    assert not check_source('print([1] + [2])')
+    assert not check_source('print(1.5 + 2)')
+    assert not check_source('print(1 < 2)')
+    assert not check_source('print("a" < "b")')
+    assert not check_source('print(1 == "a")')
+
+
+@test("c6: ordering-comparison type errors fail misa check with E211")
+def _():
+    for src in ('print(1 < "a")', 'print("a" >= 2)',
+                'print(true < false)', 'print([1] <= [2])'):
+        errs = check_source(src)
+        assert errs and errs[0]["code"] == "E211", (src, errs)
+
+
+@test("c6: dynamic comparison mismatch is E200 at runtime, not a traceback")
+def _():
+    src = ('let x = json.parse("1")\n'
+           'try {\n'
+           '  print(x < "a")\n'
+           '} catch e {\n'
+           '  print("caught " + e.code)\n'
+           '}\n')
+    out = run_src(src)
+    eq(out, "caught E200\n")
+
+
+@test("c7: json.parse rejects lone surrogates with E300")
+def _():
+    src = ('let j = str.chr(34) + str.chr(92) + "ud800" + str.chr(34)\n'
+           'let x = json.parse(j)\n'
+           'print(x)\n')
+    raises_code(lambda: run_src(src), "E300")
+
+
+@test("c8: missing onnxruntime raises E503 not ModuleNotFoundError")
+def _():
+    import builtins
+    from misa import providers
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("No module named 'onnxruntime'")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = fake_import
+    try:
+        try:
+            providers._ort_session("/tmp/fake.onnx")
+            raise AssertionError("expected E503")
+        except Lerr.MisaError as e:
+            assert e.code == "E503", f"expected E503, got {e.code}"
+    finally:
+        builtins.__import__ = real_import
+
+
+@test("c1: out-of-range integer literals wrap (interp matches AOT)")
+def _():
+    out = run_src('''
+print(18446744073709551615)
+print(99999999999999999999999999999)
+print(-9223372036854775809)
+''')
+    eq(out, "-1\n7886392056514347007\n9223372036854775807\n")
+
+
+@test("c2: web-target toolchain failure carries E600, not a traceback")
+def _():
+    # Simulate a broken/missing emsdk: the emcc step raises RuntimeError.
+    # build() must convert it to an E600 error dict (the contract for
+    # unsupported/failing targets), never let it escape as a traceback.
+    from misa.aot import build as bmod
+    real_ensure = bmod.ensure_runtime
+
+    def boom(target="", **kw):
+        raise RuntimeError("emcc not found: simulated missing SDK")
+
+    bmod.ensure_runtime = boom
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "t.misa")
+            with open(src, "w") as f:
+                f.write('print("hi")\n')
+            ok, errors = bmod.build(src, os.path.join(td, "t.js"),
+                                    target="wasm32-unknown-emscripten")
+    finally:
+        bmod.ensure_runtime = real_ensure
+    assert not ok, "expected the web build to fail"
+    assert errors and errors[0]["code"] == "E600", errors
+
+
+@test("bonus: process.run is E600 (not E101) for AOT targets")
+def _():
+    from misa.aot import build as bmod
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "t.misa")
+        with open(src, "w") as f:
+            f.write('let r = process.run(["echo", "hi"])\nprint(r.code)\n')
+        ok, errors = bmod.build(src, os.path.join(td, "t.bin"))
+    assert not ok, "expected the build to fail"
+    assert errors and errors[0]["code"] == "E600", errors
+    assert "process.run" in errors[0]["message"], errors
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

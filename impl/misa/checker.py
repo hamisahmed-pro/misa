@@ -910,10 +910,39 @@ class Checker:
             rt = self._infer(e.right, scope)
             if e.op in ("and", "or"):
                 return "Bool"
-            if e.op in ("==", "!=", "<", "<=", ">", ">="):
+            if e.op in ("==", "!="):
+                # Universal equality: allowed on any operand types
+                # (both backends agree).
                 return "Bool"
-            if e.op == "+" and (lt == "Text" or rt == "Text"):
-                return "Text"
+            if e.op in ("<", "<=", ">", ">="):
+                # C-6: ordering comparisons need both-numeric or
+                # both-Text operands (matches AOT val_cmp); "unknown"
+                # (dynamic) passes through to the runtime guard.
+                if lt != "unknown" and rt != "unknown":
+                    numeric = ("Int", "Float")
+                    both_numeric = lt in numeric and rt in numeric
+                    both_text = lt == "Text" and rt == "Text"
+                    if not both_numeric and not both_text:
+                        self.error(
+                            "E211",
+                            f"operator '{e.op}' cannot be applied to "
+                            f"{lt} and {rt}", e.line, e.col)
+                        return "unknown"
+                return "Bool"
+            # C-6: validate arithmetic operand types. Known-incompatible
+            # types are E211; "unknown" (dynamic) is allowed through.
+            if e.op == "+":
+                if lt == "Text" or rt == "Text":
+                    return "Text"
+                if lt.startswith("[") and rt.startswith("["):
+                    return lt if lt == rt else "unknown"
+            if e.op in ("+", "-", "*", "/", "%"):
+                numeric = ("Int", "Float", "unknown")
+                if lt not in numeric or rt not in numeric:
+                    self.error("E211",
+                               f"operator '{e.op}' cannot be applied to "
+                               f"{lt} and {rt}", e.line, e.col)
+                    return "unknown"
             if lt in ("Int", "Float") and rt in ("Int", "Float"):
                 return "Float" if "Float" in (lt, rt) else "Int"
             return "unknown"

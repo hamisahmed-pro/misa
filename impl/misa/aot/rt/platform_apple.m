@@ -156,7 +156,7 @@ static int misa_http_run(NSURLRequest *req, double timeout_s,
     return 1;
 }
 
-int misa_platform_http_post(const char *url,
+int misa_platform_http_post(const char *url, const char *content_type,
                             const char *const *headers, int nheaders,
                             const char *body, double timeout_s,
                             MisaHttpResp *out) {
@@ -164,7 +164,11 @@ int misa_platform_http_post(const char *url,
         requestWithURL:[NSURL URLWithString:
             [NSString stringWithUTF8String:url]]];
     req.HTTPMethod = @"POST";
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    /* C-4: use the caller's content_type (was hardcoded to
+     * application/json, and the param was missing entirely -> ABI
+     * mismatch with misa_platform.h's 7-param declaration). */
+    [req setValue:[NSString stringWithUTF8String:content_type]
+        forHTTPHeaderField:@"Content-Type"];
     [req setValue:@"misa/0.3" forHTTPHeaderField:@"User-Agent"];
     for (int i = 0; i < nheaders; i++) {
         NSString *h = [NSString stringWithUTF8String:headers[i]];

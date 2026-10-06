@@ -89,7 +89,14 @@ fn load(path: Text) -> Text {
 | Misa type | Runtime representation |
 |---|---|
 | `Text` | Unicode string |
-| `Int` | Arbitrary-precision integer |
+| `Int` | 64-bit two's-complement integer (wrapping on overflow) |
+
+**`Int` overflow semantics (C-1 decision, 2026-10-06):** every
+int-producing operation wraps modulo 2^64 — arithmetic (`+`, `-`, `*`,
+unary `-`), integer literals (so `18446744073709551615` is `-1`), and
+`int()` parsing of strings. Out-of-range `Float` → `Int` conversions
+(`int()`, `math.floor`/`ceil`/`round`) raise `E300` instead. The
+interpreter and AOT backends are byte-identical on all of these.
 | `Float` | Double |
 | `Bool` | Boolean |
 | `Void` | No value; only as a `fn` return type |

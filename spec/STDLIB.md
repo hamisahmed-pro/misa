@@ -54,7 +54,7 @@ surrogates (`0xD800`–`0xDFFF`), and values above `0x10FFFF` with `E300`.
 
 | Function | Signature | Description |
 |---|---|---|
-| `process.run` | `process.run(cmd: [Text]) -> record` | Run a command; returns `{code: Int, stdout: Text, stderr: Text}`. Throws `Error{code: "E303"}` when the command cannot be started or times out (5 minutes). **Security note:** a Misa program with `process.run` can execute arbitrary commands — treat it with the same care as `fs.write`. |
+| `process.run` | `process.run(cmd: [Text]) -> record` | Run a command; returns `{code: Int, stdout: Text, stderr: Text}`. Throws `Error{code: "E303"}` when the command cannot be started or times out (5 minutes). **AOT: not supported** — `misa build` rejects it with `E600` (subprocess in compiled binaries is out of scope; the self-hosted build driver runs on the interpreter). **Security note:** a Misa program with `process.run` can execute arbitrary commands — treat it with the same care as `fs.write`. |
 
 ## 3e. JSON (`json` namespace) — Phase 5
 

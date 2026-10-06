@@ -5,6 +5,15 @@
  * otherwise. Boehm is conservative: all MVal* held in generated-code
  * allocas, the C stack, and registers are visible roots.
  */
+/* C-3: expose strptime()/timegm() declarations. Without these, gcc emits
+ * implicit-declaration warnings and the truncated pointer returns can
+ * segfault at runtime. Must precede ALL system includes. */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
 #include "misa_rt.h"
 #include "misa_platform.h" /* P1-P4: logging, fatal, env, fs root */
 
@@ -982,15 +991,22 @@ MVal *misa_builtin_int(MVal *v, int line, int col) {
     }
     if (v->tag == M_TAG_TEXT) {
         const char *s = v->u.text.data;
-        char *end = NULL;
-        /* Python int(str) strips whitespace and needs the full string */
+        /* Python int(str) strips whitespace and needs the full string.
+           C-1: 64-bit wrapping — parse with wraparound, never clamp. */
         while (*s && isspace((unsigned char)*s)) s++;
         if (!*s) goto bad;
-        long long r = strtoll(s, &end, 10);
-        while (*end && isspace((unsigned char)*end)) end++;
-        if (*end) goto bad;
-        (void)r;
-        return misa_int((int64_t)r);
+        int neg = 0;
+        if (*s == '+' || *s == '-') { neg = (*s == '-'); s++; }
+        if (!isdigit((unsigned char)*s)) goto bad;
+        uint64_t acc = 0;
+        while (isdigit((unsigned char)*s)) {
+            acc = acc * 10 + (uint64_t)(*s - '0'); /* wraps mod 2^64 */
+            s++;
+        }
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (*s) goto bad;
+        int64_t r = neg ? (int64_t)(0u - acc) : (int64_t)acc;
+        return misa_int(r);
     bad:
         misa_raise_fmt("E300", line, col, "cannot parse int from '%s'",
                        v->u.text.data);
@@ -1293,14 +1309,15 @@ MVal *misa_time_parse(MVal *s, MVal *fmt, int line, int col) {
         return NULL;
     }
     /* timegm: days since epoch in UTC. Not in strict C99; provide a
-     * portable fallback via mktime + timezone correction. */
+     * portable fallback via the civil-days formula. */
+    time_t t;
 #if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-    time_t t = timegm(&tmv);
+    t = timegm(&tmv);
 #else
     {
-        /* Portable: interpret as UTC by round-tripping through mktime
-         * in a forced-UTC environment is racy; instead compute the
-         * civil-days formula directly. */
+        /* Portable: compute days since epoch directly (Howard Hinnant's
+         * civil-days algorithm). Used for Emscripten and other targets
+         * without timegm. */
         int y = tmv.tm_year + 1900, m = tmv.tm_mon + 1, d = tmv.tm_mday;
         y -= m <= 2;
         int era = (y >= 0 ? y : y - 399) / 400;
@@ -1309,9 +1326,8 @@ MVal *misa_time_parse(MVal *s, MVal *fmt, int line, int col) {
             (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + (unsigned)(d - 1);
         unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
         int64_t days = (int64_t)era * 146097 + (int64_t)doe - 719468;
-        time_t t2 = (time_t)(days * 86400 + tmv.tm_hour * 3600 +
-                             tmv.tm_min * 60 + tmv.tm_sec);
-        return misa_int((int64_t)t2);
+        t = (time_t)(days * 86400 + tmv.tm_hour * 3600 +
+                     tmv.tm_min * 60 + tmv.tm_sec);
     }
 #endif
     if (t == (time_t)-1) {

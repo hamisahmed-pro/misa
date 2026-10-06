@@ -274,11 +274,20 @@ def cmd_serve(args):
 
     sys.path.insert(0, IMPL_DIR)
     from misa.aot.build import build as aot_build
+    from misa.aot.emit import AOTError
 
     webdir = tempfile.mkdtemp(prefix="misa-serve-")
     js_out = os.path.join(webdir, "app.js")
     sys.stderr.write(f"misa serve: building {src} ...\n")
-    ok, errors = aot_build(src, js_out, target="wasm32-unknown-emscripten")
+    try:
+        ok, errors = aot_build(src, js_out, target="wasm32-unknown-emscripten")
+    except AOTError as e:
+        # C-2: clean E-code, not an unhandled traceback.
+        sys.stderr.write(f"misa serve: {e.code}: {e.message}\n")
+        return 1
+    except RuntimeError as e:
+        sys.stderr.write(f"misa serve: build failed: {e}\n")
+        return 1
     if not ok:
         for e in errors:
             sys.stderr.write(f"  {e}\n")

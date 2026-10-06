@@ -318,7 +318,13 @@ _ONNX_SESSIONS: dict = {}
 
 
 def _ort_session(model_path: str):
-    import onnxruntime as ort
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        # C-8: clean E503, not a ModuleNotFoundError traceback.
+        raise OnDeviceRuntimeUnavailable(
+            "ONNX models need the 'onnxruntime' package "
+            "(pip install onnxruntime)")
     if model_path not in _ONNX_SESSIONS:
         _ONNX_SESSIONS[model_path] = ort.InferenceSession(
             model_path, providers=["CPUExecutionProvider"])

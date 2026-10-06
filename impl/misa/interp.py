@@ -16,9 +16,23 @@ from .errors import (MisaError, RuntimeError_, UndefinedName,
                      ImmutableAssign, AssertFailed, ModelError,
                      SchemaValidationError, BudgetExceeded, ThrownError,
                      IOError_, HTTPError_, MapKeyError, ProviderConfigError,
-                     FFIError)
+                     FFIError, TypeMismatch)
 from .providers import (Provider, Usage, make_provider, guess_mime,
                         estimate_cost_usd, OnDeviceProvider)
+
+
+# ---------------------------------------------------------------- integers
+# Misa Int is 64-bit two's-complement wrapping (C-1 decision, 2026-10-06).
+# Python ints are arbitrary precision, so every int-producing operation
+# wraps explicitly to match the AOT backend.
+
+_I64_MASK = 0xFFFFFFFFFFFFFFFF
+_I64_HIGH = 0x8000000000000000
+
+
+def wrap_i64(n: int) -> int:
+    n &= _I64_MASK
+    return n - 0x10000000000000000 if n >= _I64_HIGH else n
 
 
 # ---------------------------------------------------------------- values
@@ -436,7 +450,10 @@ class Interpreter:
 
     def eval_expr(self, e: ast.Node, env: Env) -> Any:
         if isinstance(e, ast.IntLit):
-            return e.value
+            # C-1: literals wrap like every other int-producing operation
+            # (matches AOT, where llvmlite folds out-of-range i64
+            # constants to two's complement).
+            return wrap_i64(e.value)
         if isinstance(e, ast.FloatLit):
             return e.value
         if isinstance(e, ast.StrLit):
@@ -517,7 +534,7 @@ class Interpreter:
             if e.op == "not":
                 return not self.truthy(v)
             if e.op == "-":
-                return -v
+                return wrap_i64(-v) if isinstance(v, int) else -v
             raise RuntimeError_(f"unknown unary {e.op}")
         if isinstance(e, ast.Await):
             handle = self.eval_expr(e.operand, env)
@@ -540,29 +557,72 @@ class Interpreter:
             return lv if self.truthy(lv) else self.eval_expr(e.right, env)
         l = self.eval_expr(e.left, env)
         r = self.eval_expr(e.right, env)
+        # C-6: runtime type guards (match AOT's E200); the checker catches
+        # static cases, this catches dynamic values.
         if op == "+":
             if isinstance(l, str) or isinstance(r, str):
                 return render_value(l) + render_value(r)
-            return l + r
+            if isinstance(l, list) and isinstance(r, list):
+                return l + r
+            if isinstance(l, int) and isinstance(r, int):
+                return wrap_i64(l + r)
+            if isinstance(l, (int, float)) and isinstance(r, (int, float)):
+                # bool is int subclass; exclude to match checker strictness
+                if isinstance(l, bool) or isinstance(r, bool):
+                    raise TypeMismatch(
+                        f"operator '+' cannot be applied to "
+                        f"{type(l).__name__} and {type(r).__name__}")
+                return l + r
+            raise TypeMismatch(
+                f"operator '+' cannot be applied to "
+                f"{type(l).__name__} and {type(r).__name__}")
+        if op in ("-", "*", "/", "%"):
+            if not isinstance(l, (int, float)) or not isinstance(r, (int, float)) \
+                    or isinstance(l, bool) or isinstance(r, bool):
+                raise TypeMismatch(
+                    f"operator '{op}' cannot be applied to "
+                    f"{type(l).__name__} and {type(r).__name__}")
         if op == "-":
+            if isinstance(l, int) and isinstance(r, int):
+                return wrap_i64(l - r)
             return l - r
         if op == "*":
+            if isinstance(l, int) and isinstance(r, int):
+                return wrap_i64(l * r)
             return l * r
         if op == "/":
-            return l / r
+            # C-5: clean E300, never a Python traceback (and catchable).
+            try:
+                return l / r
+            except ZeroDivisionError:
+                raise RuntimeError_("division by zero")
         if op == "%":
-            return l % r
+            try:
+                return l % r
+            except ZeroDivisionError:
+                raise RuntimeError_("integer modulo by zero")
         if op == "==":
             return l == r
         if op == "!=":
             return l != r
-        if op == "<":
-            return l < r
-        if op == "<=":
-            return l <= r
-        if op == ">":
-            return l > r
-        if op == ">=":
+        if op in ("<", "<=", ">", ">="):
+            # C-6: runtime guard matching AOT's val_cmp (E200): both
+            # numeric or both Text; the checker catches static cases,
+            # this catches dynamic values. Never a TypeError traceback.
+            def _num(x):
+                return isinstance(x, (int, float)) \
+                    and not isinstance(x, bool)
+            if not ((_num(l) and _num(r))
+                    or (isinstance(l, str) and isinstance(r, str))):
+                raise TypeMismatch(
+                    f"operator '{op}' cannot be applied to "
+                    f"{type(l).__name__} and {type(r).__name__}")
+            if op == "<":
+                return l < r
+            if op == "<=":
+                return l <= r
+            if op == ">":
+                return l > r
             return l >= r
         raise RuntimeError_(f"unknown operator '{op}'")
 
@@ -855,7 +915,17 @@ class Interpreter:
         return self._json_to_misa(v, node)
 
     def _json_to_misa(self, v: Any, node: ast.Node) -> Any:
-        if v is None or isinstance(v, (str, bool)):
+        if v is None or isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            # C-7: reject lone surrogates (AOT does; printing one would
+            # traceback-crash). Match str.chr's E300 behavior.
+            for ch in v:
+                cp = ord(ch)
+                if 0xD800 <= cp <= 0xDFFF:
+                    raise RuntimeError_(
+                        f"json.parse: invalid JSON: lone surrogate",
+                        line=node.line, col=node.col)
             return v
         if isinstance(v, int):
             if v > 2**63 - 1 or v < -(2**63):
@@ -1051,10 +1121,21 @@ class Interpreter:
         if name == "str":
             return render_value(args[0])
         if name == "int":
+            a = args[0]
+            # C-1: 64-bit wrapping semantics, matching the AOT backend.
+            if isinstance(a, float):
+                # Match AOT: out-of-range floats are E300, not wrapped.
+                if not (-9.223372036854776e18 < a < 9.223372036854776e18):
+                    raise RuntimeError_("float out of Int range")
+                try:
+                    return wrap_i64(int(a))
+                except OverflowError:
+                    raise RuntimeError_(f"cannot parse int from {a!r}")
             try:
-                return int(args[0])
-            except (ValueError, TypeError):
-                raise RuntimeError_(f"cannot parse int from {args[0]!r}")
+                v = int(a)
+            except (ValueError, TypeError, OverflowError):
+                raise RuntimeError_(f"cannot parse int from {a!r}")
+            return wrap_i64(v) if isinstance(v, int) else v
         if name == "float":
             try:
                 return float(args[0])

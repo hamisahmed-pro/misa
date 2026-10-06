@@ -814,8 +814,15 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
             f"db.* is not supported for target '{eff_target}' in v1 "
             f"(host and Android only)")
     if eff_target == "wasm32-unknown-emscripten":
-        return _link_emcc(obj_bytes, out_path, eff_target,
-                          preload_files, verbose)
+        try:
+            return _link_emcc(obj_bytes, out_path, eff_target,
+                              preload_files, verbose)
+        except RuntimeError as e:
+            # C-2: emcc/toolchain failures (missing emsdk, C compile
+            # failure, link failure) carry E600, never a raw traceback
+            # or a bare die() string. (AOTError is not a RuntimeError,
+            # so compile-time rejections still propagate with their code.)
+            return False, _err("E600", str(e))
 
     # --- cross target: object only (M1) -------------------------------
     if eff_target != host_triple():
