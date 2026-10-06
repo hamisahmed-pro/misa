@@ -1,0 +1,2257 @@
+// Misa self-hosted parser (Phase 6a, second component).
+//
+// Mirrors impl/misa/parser.py exactly: recursive descent producing
+// tagged-record AST nodes (see selfhost/AST.md for the format contract).
+//
+// Differences from the Python implementation (all documented):
+// - The Misa lexer stores RAW lexeme text for numbers; INT/FLOAT/
+//   DURATION/MONEY are converted here (int()/float()/parse_duration_ms/
+//   /parse_money), mirroring the Python lexer's value computation.
+// - `throw` only accepts {code, message}; source positions are encoded
+//   into the message as "line:col\n" by err_msg().
+// - Parser state is threaded explicitly as Px (functions cannot see
+//   module-level vars).
+// - leading_comments are not tracked (the Misa lexer does not produce
+//   them).
+// - Interpolated-string parts use StrPart nodes for literal text
+//   (Python uses raw strings); both serialize identically.
+//
+// Entry point: parse(toks) -> Node  (a "Program" node)
+
+import "lexer.misa"
+
+// ---------------- cursor ----------------
+
+// ---- generated: AST node types ----
+
+type FieldPair {
+    name: Text,
+    value: Node
+}
+
+type StrTriple {
+    a: Text,
+    b: Text,
+    c: Text
+}
+
+type Node {
+    node: Text,
+    line: Int,
+    col: Int,
+    name: Text,
+    sval: Text,
+    op: Text,
+    ival: Int,
+    fval: Float,
+    bval: Bool,
+    is_list: Bool,
+    is_map: Bool,
+    optional: Bool,
+    has_tokens: Bool,
+    tokens: Int,
+    has_latency: Bool,
+    latency_ms: Int,
+    has_cost: Bool,
+    cost_usd: Float,
+    key_env: Text,
+    model_file: Text,
+    prov: Text,
+    alias: Text,
+    model_name: Text,
+    event: Text,
+    left: [Node],
+    right: [Node],
+    operand: [Node],
+    obj: [Node],
+    idx: [Node],
+    target: [Node],
+    value: [Node],
+    ann: [Node],
+    ret: [Node],
+    budg: [Node],
+    cond: [Node],
+    iter: [Node],
+    stm: [Node],
+    handler: [Node],
+    expr_body: [Node],
+    call: [Node],
+    expected: [Node],
+    map_key: [Node],
+    map_val: [Node],
+    items: [Node],
+    items2: [Node],
+    pairs: [FieldPair],
+    triples: [StrTriple],
+    slist: [Text]
+}
+
+type Px {
+    toks: [Tok],
+    pos: Int
+}
+
+type PRes {
+    node: Node,
+    st: Px
+}
+
+type TRes {
+    tok: Tok,
+    st: Px
+}
+
+type PairsRes {
+    pairs: [FieldPair],
+    st: Px
+}
+
+type NodesRes {
+    nodes: [Node],
+    st: Px
+}
+
+fn field_pair(name: Text, value: Node) -> FieldPair {
+    let p: FieldPair = { name: name, value: value }
+    return p
+}
+
+fn str_triple(a: Text, b: Text, c: Text) -> StrTriple {
+    let t: StrTriple = { a: a, b: b, c: c }
+    return t
+}
+
+// ---- generated: node constructors ----
+
+fn make_program(items: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "Program", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: items, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_app_decl(name: Text, fields: [FieldPair], line: Int, col: Int) -> Node {
+    let n: Node = { node: "AppDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: fields, triples: [], slist: [] }
+    return n
+}
+
+fn make_provider_decl(name: Text, key_env: Text, model_file: Text, line: Int, col: Int) -> Node {
+    let n: Node = { node: "ProviderDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: key_env, model_file: model_file, prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_models_decl(entries: [StrTriple], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ModelsDecl", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: entries, slist: [] }
+    return n
+}
+
+fn make_type_decl(name: Text, fields: [FieldPair], line: Int, col: Int) -> Node {
+    let n: Node = { node: "TypeDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: fields, triples: [], slist: [] }
+    return n
+}
+
+fn make_type_expr(tname: Text, is_list: Bool, is_map: Bool, optional: Bool, map_key: [Node], map_val: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "TypeExpr", line: line, col: col, name: tname, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: is_list, is_map: is_map, optional: optional, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: map_key, map_val: map_val, items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_budget(has_tokens: Bool, tokens: Int, has_latency: Bool, latency_ms: Int, has_cost: Bool, cost_usd: Float, line: Int, col: Int) -> Node {
+    let n: Node = { node: "Budget", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: has_tokens, tokens: tokens, has_latency: has_latency, latency_ms: latency_ms, has_cost: has_cost, cost_usd: cost_usd, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_model_decl(name: Text, params: [FieldPair], ret: [Node], prov: Text, alias: Text, budg: [Node], prompt_ver: Int, prompt_parts: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ModelDecl", line: line, col: col, name: name, sval: "", op: "", ival: prompt_ver, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: prov, alias: alias, model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: ret, budg: budg, cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: prompt_parts, items2: [], pairs: params, triples: [], slist: [] }
+    return n
+}
+
+fn make_component(name: Text, args: [FieldPair], children: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "Component", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: children, items2: [], pairs: args, triples: [], slist: [] }
+    return n
+}
+
+fn make_screen_decl(name: Text, params: [FieldPair], body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ScreenDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: params, triples: [], slist: [] }
+    return n
+}
+
+fn make_screen_if(cond: [Node], then_body: [Node], else_body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ScreenIf", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: cond, iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: then_body, items2: else_body, pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_screen_for(loop_var: Text, iter: [Node], body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ScreenFor", line: line, col: col, name: loop_var, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: iter, stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_eval_decl(name: Text, model_name: Text, given_fields: [FieldPair], expected: [Node], runs_n: Int, line: Int, col: Int) -> Node {
+    let n: Node = { node: "EvalDecl", line: line, col: col, name: name, sval: "", op: "", ival: runs_n, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: model_name, event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: expected, map_key: [], map_val: [], items: [], items2: [], pairs: given_fields, triples: [], slist: [] }
+    return n
+}
+
+fn make_fn_decl(name: Text, params: [FieldPair], ret: [Node], body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "FnDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: ret, budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: params, triples: [], slist: [] }
+    return n
+}
+
+fn make_import_decl(path: Text, line: Int, col: Int) -> Node {
+    let n: Node = { node: "ImportDecl", line: line, col: col, name: "", sval: path, op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_stream_decl(name: Text, call: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "StreamDecl", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: call, expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_let_stmt(name: Text, ann: [Node], value: [Node], mutable: Bool, line: Int, col: Int) -> Node {
+    let n: Node = { node: "LetStmt", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: mutable, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: value, ann: ann, ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_assign_stmt(target: [Node], value: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "AssignStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: target, value: value, ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_if_stmt(cond: [Node], then_body: [Node], else_body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "IfStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: cond, iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: then_body, items2: else_body, pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_for_stmt(loop_var: Text, iter: [Node], body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ForStmt", line: line, col: col, name: loop_var, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: iter, stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_while_stmt(cond: [Node], body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "WhileStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: cond, iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_return_stmt(value: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ReturnStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: value, ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_try_stmt(body: [Node], catch_var: Text, catch_body: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "TryStmt", line: line, col: col, name: catch_var, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: body, items2: catch_body, pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_throw_stmt(value: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ThrowStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: value, ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_on_stmt(stm: [Node], event: Text, handler: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "OnStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: event, left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: stm, handler: handler, expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_expr_stmt(value: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ExprStmt", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: value, ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_int_lit(v: Int, line: Int, col: Int) -> Node {
+    let n: Node = { node: "IntLit", line: line, col: col, name: "", sval: "", op: "", ival: v, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_float_lit(v: Float, line: Int, col: Int) -> Node {
+    let n: Node = { node: "FloatLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: v, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_str_lit(parts: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "StrLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: parts, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_str_part(text: Text, line: Int, col: Int) -> Node {
+    let n: Node = { node: "StrPart", line: line, col: col, name: "", sval: text, op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_bool_lit(v: Bool, line: Int, col: Int) -> Node {
+    let n: Node = { node: "BoolLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: v, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_nil_lit(line: Int, col: Int) -> Node {
+    let n: Node = { node: "NilLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_duration_lit(ms: Int, line: Int, col: Int) -> Node {
+    let n: Node = { node: "DurationLit", line: line, col: col, name: "", sval: "", op: "", ival: ms, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_money_lit(amount: Float, line: Int, col: Int) -> Node {
+    let n: Node = { node: "MoneyLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: amount, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_ident(name: Text, line: Int, col: Int) -> Node {
+    let n: Node = { node: "Ident", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_call(name: Text, args: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "Call", line: line, col: col, name: name, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: args, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_field(obj: [Node], field: Text, line: Int, col: Int) -> Node {
+    let n: Node = { node: "Field", line: line, col: col, name: field, sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: obj, idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_index(obj: [Node], idx: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "Index", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: obj, idx: idx, target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_list_lit(items: [Node], line: Int, col: Int) -> Node {
+    let n: Node = { node: "ListLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: items, items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_record_lit(fields: [FieldPair], line: Int, col: Int) -> Node {
+    let n: Node = { node: "RecordLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: fields, triples: [], slist: [] }
+    return n
+}
+
+fn make_map_lit(entries: [FieldPair], line: Int, col: Int) -> Node {
+    let n: Node = { node: "MapLit", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: entries, triples: [], slist: [] }
+    return n
+}
+
+fn make_lambda(params: [Text], body: [Node], expr_body: [Node], has_block: Bool, line: Int, col: Int) -> Node {
+    let n: Node = { node: "Lambda", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: has_block, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: expr_body, call: [], expected: [], map_key: [], map_val: [], items: body, items2: [], pairs: [], triples: [], slist: params }
+    return n
+}
+
+fn make_binop(op: Text, l: Node, r: Node, line: Int, col: Int) -> Node {
+    let n: Node = { node: "BinOp", line: line, col: col, name: "", sval: "", op: op, ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [] + [l], right: [] + [r], operand: [], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_unop(op: Text, e: Node, line: Int, col: Int) -> Node {
+    let n: Node = { node: "UnOp", line: line, col: col, name: "", sval: "", op: op, ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [] + [e], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+fn make_await(e: Node, line: Int, col: Int) -> Node {
+    let n: Node = { node: "Await", line: line, col: col, name: "", sval: "", op: "", ival: 0, fval: 0.0, bval: false, is_list: false, is_map: false, optional: false, has_tokens: false, tokens: 0, has_latency: false, latency_ms: 0, has_cost: false, cost_usd: 0.0, key_env: "", model_file: "", prov: "", alias: "", model_name: "", event: "", left: [], right: [], operand: [] + [e], obj: [], idx: [], target: [], value: [], ann: [], ret: [], budg: [], cond: [], iter: [], stm: [], handler: [], expr_body: [], call: [], expected: [], map_key: [], map_val: [], items: [], items2: [], pairs: [], triples: [], slist: [] }
+    return n
+}
+
+// ---- generated: line shifting (mirrors Python _shift_lines) ----
+
+fn shift_lines(n: Node, d: Int) -> Node {
+    if d == 0 {
+        return n
+    }
+    let r: Node = { node: n.node, line: n.line + d, col: n.col, name: n.name, sval: n.sval, op: n.op, ival: n.ival, fval: n.fval, bval: n.bval, is_list: n.is_list, is_map: n.is_map, optional: n.optional, has_tokens: n.has_tokens, tokens: n.tokens, has_latency: n.has_latency, latency_ms: n.latency_ms, has_cost: n.has_cost, cost_usd: n.cost_usd, key_env: n.key_env, model_file: n.model_file, prov: n.prov, alias: n.alias, model_name: n.model_name, event: n.event, left: shift_list(n.left, d), right: shift_list(n.right, d), operand: shift_list(n.operand, d), obj: shift_list(n.obj, d), idx: shift_list(n.idx, d), target: shift_list(n.target, d), value: shift_list(n.value, d), ann: shift_list(n.ann, d), ret: shift_list(n.ret, d), budg: shift_list(n.budg, d), cond: shift_list(n.cond, d), iter: shift_list(n.iter, d), stm: shift_list(n.stm, d), handler: shift_list(n.handler, d), expr_body: shift_list(n.expr_body, d), call: shift_list(n.call, d), expected: shift_list(n.expected, d), map_key: shift_list(n.map_key, d), map_val: shift_list(n.map_val, d), items: shift_list(n.items, d), items2: shift_list(n.items2, d), pairs: shift_pairs(n.pairs, d), triples: n.triples, slist: n.slist }
+    return r
+}
+
+fn shift_list(ns: [Node], d: Int) -> [Node] {
+    var out: [Node] = []
+    for x in ns {
+        out = out + [shift_lines(x, d)]
+    }
+    return out
+}
+
+fn shift_pairs(ps: [FieldPair], d: Int) -> [FieldPair] {
+    var out: [FieldPair] = []
+    for p in ps {
+        out = out + [field_pair(p.name, shift_lines(p.value, d))]
+    }
+    return out
+}
+fn px_peek(st: Px, n: Int) -> Tok {
+    let j = st.pos + n
+    if j < len(st.toks) {
+        return st.toks[j]
+    }
+    return st.toks[len(st.toks) - 1]
+}
+
+fn px_at(st: Px, kind: Text) -> Bool {
+    return px_peek(st, 0).kind == kind
+}
+
+fn px_atn(st: Px, kind: Text, n: Int) -> Bool {
+    return px_peek(st, n).kind == kind
+}
+
+fn px_advance(st: Px) -> Px {
+    let t = px_peek(st, 0)
+    var p = st.pos
+    if t.kind != "EOF" {
+        p = p + 1
+    }
+    let ns: Px = { toks: st.toks, pos: p }
+    return ns
+}
+
+fn px_skip_semis(st: Px) -> Px {
+    var s = st
+    while px_at(s, "SEMI") {
+        s = px_advance(s)
+    }
+    return s
+}
+
+fn px_maybe_semi(st: Px) -> Px {
+    if px_at(st, "SEMI") {
+        return px_advance(st)
+    }
+    return st
+}
+
+// ---------------- errors ----------------
+
+// throw only accepts {code, message}, so the source position rides
+// inside the message as "line:col\n". The test driver splits it back.
+fn err_msg(msg: Text, line: Int, col: Int) -> Text {
+    return str(line) + ":" + str(col) + "\n" + msg
+}
+
+fn tok_val_repr(t: Tok) -> Text {
+    // mirrors Python's {t.value!r} in expect() errors
+    if t.kind == "INT" {
+        return str(int(t.text))
+    }
+    if t.kind == "FLOAT" {
+        return str(float(t.text))
+    }
+    if t.kind == "DURATION" {
+        return str(parse_duration_ms(t.text))
+    }
+    if t.kind == "MONEY" {
+        return str(parse_money(t.text))
+    }
+    if t.kind == "EOF" {
+        return "None"
+    }
+    return "'" + t.text + "'"
+}
+
+fn px_expect(st: Px, kind: Text, what: Text) -> TRes {
+    let t = px_peek(st, 0)
+    if t.kind == kind {
+        let r: TRes = { tok: t, st: px_advance(st) }
+        return r
+    }
+    throw {code: "E001", message: err_msg("expected " + what + ", found " + t.kind + " (" + tok_val_repr(t) + ")", t.line, t.col)}
+    let d: TRes = { tok: t, st: st }
+    return d
+}
+
+fn px_expect_ident(st: Px, what: Text) -> TRes {
+    return px_expect(st, "IDENT", what)
+}
+
+// Consume a '>' closing a Map<...> type. Splits a lexed '>='
+// (as in `Map<K,V>=...`) back into '>' and '='.
+fn px_expect_gt(st: Px) -> Px {
+    let t = px_peek(st, 0)
+    if t.kind == ">" {
+        return px_advance(st)
+    }
+    if t.kind == ">=" {
+        let s2 = px_advance(st)
+        let eq: Tok = { kind: "=", text: "=", line: t.line, col: t.col }
+        var nt: [Tok] = []
+        var i = 0
+        while i < s2.pos {
+            nt = nt + [s2.toks[i]]
+            i = i + 1
+        }
+        nt = nt + [eq]
+        while i < len(s2.toks) {
+            nt = nt + [s2.toks[i]]
+            i = i + 1
+        }
+        let ns: Px = { toks: nt, pos: s2.pos }
+        return ns
+    }
+    throw {code: "E001", message: err_msg("expected '>', found " + t.kind + " (" + tok_val_repr(t) + ")", t.line, t.col)}
+    return st
+}
+
+// ---------------- numbers ----------------
+
+// Truncate a float toward zero (mirrors Python int(x)).
+// Only used for non-negative durations.
+fn ftrunc(f: Float) -> Int {
+    let s = str(f)
+    var epos = -1
+    var i = 0
+    while i < len(s) {
+        if s[i] == "e" {
+            epos = i
+        }
+        i = i + 1
+    }
+    if epos >= 0 {
+        return ftrunc_sci(s, epos)
+    }
+    var dot = -1
+    i = 0
+    while i < len(s) {
+        if s[i] == "." {
+            dot = i
+        }
+        i = i + 1
+    }
+    if dot < 0 {
+        return int(s)
+    }
+    return int(str.slice(s, 0, dot))
+}
+
+fn ftrunc_sci(s: Text, epos: Int) -> Int {
+    // s looks like "1e+20" or "2.5e-07" (matches Python repr format)
+    let mant = str.slice(s, 0, epos)
+    let expart = str.slice(s, epos + 1, len(s))
+    var dot = -1
+    var i = 0
+    while i < len(mant) {
+        if mant[i] == "." {
+            dot = i
+        }
+        i = i + 1
+    }
+    var digits = mant
+    var frac_len = 0
+    if dot >= 0 {
+        digits = str.slice(mant, 0, dot) + str.slice(mant, dot + 1, len(mant))
+        frac_len = len(mant) - dot - 1
+    }
+    var esign = 1
+    var eabs_text = expart
+    if str.slice(expart, 0, 1) == "-" {
+        esign = 0 - 1
+        eabs_text = str.slice(expart, 1, len(expart))
+    } else {
+        if str.slice(expart, 0, 1) == "+" {
+            eabs_text = str.slice(expart, 1, len(expart))
+        }
+    }
+    let eabs = int(eabs_text)
+    if esign < 0 {
+        return 0
+    }
+    let shift = eabs - frac_len
+    if shift >= 0 {
+        var zeros = ""
+        var k = 0
+        while k < shift {
+            zeros = zeros + "0"
+            k = k + 1
+        }
+        return int(digits + zeros)
+    }
+    let cut = len(digits) + shift
+    if cut <= 0 {
+        return 0
+    }
+    return int(str.slice(digits, 0, cut))
+}
+
+// Mirrors the Python lexer's DURATION value: ms for "ms",
+// int(float * 1000) for "s".
+fn parse_duration_ms(text: Text) -> Int {
+    let n = len(text)
+    if n >= 2 and str.slice(text, n - 2, n) == "ms" {
+        return ftrunc(float(str.slice(text, 0, n - 2)))
+    }
+    return ftrunc(float(str.slice(text, 0, n - 1)) * 1000.0)
+}
+
+fn parse_money(text: Text) -> Float {
+    return float(str.slice(text, 1, len(text)))
+}
+
+fn is_all_digits(w: Text) -> Bool {
+    if len(w) == 0 {
+        return false
+    }
+    var i = 0
+    while i < len(w) {
+        let c = w[i]
+        if not (c >= "0" and c <= "9") {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// prompt version: `v3` -> 3 (mirrors re.fullmatch(r"v(\d+)"))
+fn parse_version(vt: Tok) -> Int {
+    let w = vt.text
+    if len(w) > 1 and str.slice(w, 0, 1) == "v" and is_all_digits(str.slice(w, 1, len(w))) {
+        return int(str.slice(w, 1, len(w)))
+    }
+    throw {code: "E001", message: err_msg("expected version like v3, found '" + w + "'", vt.line, vt.col)}
+    return 0
+}
+
+fn count_char(s: Text, ch: Text) -> Int {
+    var n = 0
+    for c in s {
+        if c == ch {
+            n = n + 1
+        }
+    }
+    return n
+}
+
+// ---------------- entry ----------------
+
+fn parse(toks: [Tok]) -> Node {
+    var s: Px = { toks: toks, pos: 0 }
+    s = px_skip_semis(s)
+    var items: [Node] = []
+    while not px_at(s, "EOF") {
+        let r = parse_item(s)
+        items = items + [r.node]
+        s = px_skip_semis(r.st)
+    }
+    // Python: ast.Program() carries line=0, col=0
+    return make_program(items, 0, 0)
+}
+
+fn parse_item(st: Px) -> PRes {
+    let k = px_peek(st, 0).kind
+    if k == "app" {
+        return parse_app(st)
+    }
+    if k == "provider" {
+        return parse_provider(st)
+    }
+    if k == "models" {
+        return parse_models(st)
+    }
+    if k == "type" {
+        return parse_type_decl(st)
+    }
+    if k == "model" {
+        return parse_model_decl(st)
+    }
+    if k == "screen" {
+        return parse_screen(st)
+    }
+    if k == "eval" {
+        return parse_eval(st)
+    }
+    if k == "fn" {
+        return parse_fn_decl(st)
+    }
+    if k == "import" {
+        return parse_import_decl(st)
+    }
+    return parse_statement(st)
+}
+
+// ---------------- declarations ----------------
+
+fn parse_app(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "app", "'app'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "app name")
+    let name = r.tok.text
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var fields: [FieldPair] = []
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        r = px_expect_ident(s, "field name")
+        let fk = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        let lr = parse_literal(s)
+        s = lr.st
+        fields = fields + [field_pair(fk, lr.node)]
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PRes = { node: make_app_decl(name, fields, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_provider(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "provider", "'provider'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "provider name")
+    let name = r.tok.text
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var key_env = ""
+    var model_file = ""
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        let fk_tok = px_peek(s, 0)
+        var fname = ""
+        if fk_tok.kind == "IDENT" {
+            fname = fk_tok.text
+            s = px_advance(s)
+        } else {
+            if fk_tok.kind == "model" {
+                fname = "model"
+                s = px_advance(s)
+            } else {
+                throw {code: "E001", message: err_msg("expected field name, found " + fk_tok.kind + " (" + tok_val_repr(fk_tok) + ")", fk_tok.line, fk_tok.col)}
+            }
+        }
+        let fk_line = fk_tok.line
+        let fk_col = fk_tok.col
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        if fname == "key" {
+            r = px_expect(s, "env", "'env'")
+            s = r.st
+            r = px_expect(s, "(", "'('")
+            s = r.st
+            r = px_expect(s, "STRING", "string")
+            key_env = r.tok.text
+            s = r.st
+            r = px_expect(s, ")", "')'")
+            s = r.st
+        } else {
+            if fname == "model" {
+                r = px_expect(s, "IDENT", "'file'")
+                let ftok = r.tok
+                s = r.st
+                if ftok.text != "file" {
+                    throw {code: "E001", message: err_msg("expected 'file', found '" + ftok.text + "'", ftok.line, ftok.col)}
+                }
+                r = px_expect(s, "(", "'('")
+                s = r.st
+                r = px_expect(s, "STRING", "string")
+                model_file = r.tok.text
+                s = r.st
+                r = px_expect(s, ")", "')'")
+                s = r.st
+            } else {
+                throw {code: "E001", message: err_msg("unknown provider field '" + fname + "'", fk_line, fk_col)}
+            }
+        }
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PRes = { node: make_provider_decl(name, key_env, model_file, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_models(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "models", "'models'")
+    let t = r.tok
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var entries: [StrTriple] = []
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        r = px_expect_ident(s, "model alias")
+        let alias = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        r = px_expect_ident(s, "provider name")
+        let prov = r.tok.text
+        s = r.st
+        r = px_expect(s, "(", "'('")
+        s = r.st
+        r = px_expect(s, "STRING", "model id string")
+        let mid = r.tok.text
+        s = r.st
+        r = px_expect(s, ")", "')'")
+        s = r.st
+        entries = entries + [str_triple(alias, prov, mid)]
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PRes = { node: make_models_decl(entries, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_type_decl(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "type", "'type'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "type name")
+    let name = r.tok.text
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var fields: [FieldPair] = []
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        r = px_expect_ident(s, "field name")
+        let fk = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        let tr = parse_type_expr(s)
+        s = tr.st
+        fields = fields + [field_pair(fk, tr.node)]
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PRes = { node: make_type_decl(name, fields, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_type_expr(st: Px) -> PRes {
+    let t = px_peek(st, 0)
+    if px_at(st, "[") {
+        var s = px_advance(st)
+        let ir = parse_type_expr(s)
+        s = ir.st
+        var r = px_expect(s, "]", "']'")
+        s = r.st
+        var opt = false
+        if px_at(s, "?") {
+            s = px_advance(s)
+            opt = true
+        }
+        // NOTE: mirrors the Python quirk — only inner.name is kept,
+        // nested list structure is flattened.
+        let pr: PRes = { node: make_type_expr(ir.node.name, true, false, opt, [], [], t.line, t.col), st: s }
+        return pr
+    }
+    if px_at(st, "IDENT") and px_peek(st, 0).text == "Map" and px_atn(st, "<", 1) {
+        var s = px_advance(st)
+        s = px_advance(s)
+        let kr = parse_type_expr(s)
+        s = kr.st
+        var r = px_expect(s, ",", "','")
+        s = r.st
+        let vr = parse_type_expr(s)
+        s = vr.st
+        s = px_expect_gt(s)
+        var opt = false
+        if px_at(s, "?") {
+            s = px_advance(s)
+            opt = true
+        }
+        let pr: PRes = { node: make_type_expr("Map", false, true, opt, [] + [kr.node], [] + [vr.node], t.line, t.col), st: s }
+        return pr
+    }
+    var s = st
+    var r = px_expect_ident(s, "type name")
+    let name = r.tok.text
+    s = r.st
+    var opt = false
+    if px_at(s, "?") {
+        s = px_advance(s)
+        opt = true
+    }
+    let pr: PRes = { node: make_type_expr(name, false, false, opt, [], [], t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_params(st: Px) -> PairsRes {
+    var s = st
+    var r = px_expect(s, "(", "'('")
+    s = r.st
+    var params: [FieldPair] = []
+    if not px_at(s, ")") {
+        var done = false
+        while not done {
+            r = px_expect_ident(s, "parameter name")
+            let pn = r.tok.text
+            s = r.st
+            r = px_expect(s, ":", "':'")
+            s = r.st
+            let tr = parse_type_expr(s)
+            s = tr.st
+            params = params + [field_pair(pn, tr.node)]
+            if px_at(s, ",") {
+                s = px_advance(s)
+            } else {
+                done = true
+            }
+        }
+    }
+    r = px_expect(s, ")", "')'")
+    s = r.st
+    let pr: PairsRes = { pairs: params, st: s }
+    return pr
+}
+
+fn parse_model_decl(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "model", "'model'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "model name")
+    let name = r.tok.text
+    s = r.st
+    let prms = parse_params(s)
+    s = prms.st
+    r = px_expect(s, "->", "'->'")
+    s = r.st
+    let retr = parse_type_expr(s)
+    s = retr.st
+    s = px_skip_semis(s)
+    r = px_expect(s, "with", "'with'")
+    s = r.st
+    r = px_expect_ident(s, "provider name")
+    let prov = r.tok.text
+    s = r.st
+    r = px_expect(s, ".", "'.'")
+    s = r.st
+    r = px_expect_ident(s, "model alias")
+    let alias = r.tok.text
+    s = r.st
+    s = px_skip_semis(s)
+    var budg: [Node] = []
+    if px_at(s, "budget") {
+        let br = parse_budget(s)
+        budg = [] + [br.node]
+        s = px_skip_semis(br.st)
+    }
+    r = px_expect(s, "prompt", "'prompt'")
+    s = r.st
+    r = px_expect_ident(s, "version like v3")
+    let vt = r.tok
+    s = r.st
+    let ver = parse_version(vt)
+    r = px_expect(s, "STRING", "prompt template")
+    let strt = r.tok
+    s = r.st
+    let parts = parse_string_parts(strt.text, strt.line, strt.col)
+    let pr: PRes = { node: make_model_decl(name, prms.pairs, [] + [retr.node], prov, alias, budg, ver, parts, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_budget(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "budget", "'budget'")
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var has_tokens = false
+    var tokens = 0
+    var has_latency = false
+    var latency_ms = 0
+    var has_cost = false
+    var cost_usd = 0.0
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        r = px_expect_ident(s, "budget field")
+        let fk = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        if fk == "tokens" {
+            r = px_expect(s, "INT", "integer")
+            tokens = int(r.tok.text)
+            has_tokens = true
+            s = r.st
+        } else {
+            if fk == "latency" {
+                r = px_expect(s, "DURATION", "duration")
+                latency_ms = parse_duration_ms(r.tok.text)
+                has_latency = true
+                s = r.st
+            } else {
+                if fk == "cost" {
+                    r = px_expect(s, "MONEY", "money amount")
+                    cost_usd = parse_money(r.tok.text)
+                    has_cost = true
+                    s = r.st
+                } else {
+                    let pt = px_peek(s, 0)
+                    throw {code: "E001", message: err_msg("unknown budget field '" + fk + "'", pt.line, pt.col)}
+                }
+            }
+        }
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    // Python: ast.Budget() carries line=0, col=0
+    let pr: PRes = { node: make_budget(has_tokens, tokens, has_latency, latency_ms, has_cost, cost_usd, 0, 0), st: s }
+    return pr
+}
+
+// ---------------- screens ----------------
+
+fn parse_screen(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "screen", "'screen'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "screen name")
+    let name = r.tok.text
+    s = r.st
+    var params: [FieldPair] = []
+    if px_at(s, "(") {
+        let pr = parse_params(s)
+        params = pr.pairs
+        s = pr.st
+    }
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    let br = parse_screen_block(s)
+    s = br.st
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PRes = { node: make_screen_decl(name, params, br.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_screen_block(st: Px) -> NodesRes {
+    var items: [Node] = []
+    var s = px_skip_semis(st)
+    while not px_at(s, "}") {
+        let ir = parse_screen_item(s)
+        items = items + [ir.node]
+        s = px_skip_semis(ir.st)
+    }
+    let nr: NodesRes = { nodes: items, st: s }
+    return nr
+}
+
+fn parse_screen_item(st: Px) -> PRes {
+    if px_at(st, "if") {
+        return parse_screen_if(st)
+    }
+    if px_at(st, "for") {
+        return parse_screen_for(st)
+    }
+    return parse_component(st)
+}
+
+fn parse_screen_if(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "if", "'if'")
+    let t = r.tok
+    s = r.st
+    let cr = parse_expr(s)
+    s = cr.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    let tr = parse_screen_block(s)
+    s = tr.st
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    var els: [Node] = []
+    if px_at(s, "SEMI") and px_atn(s, "else", 1) {
+        s = px_advance(s)
+    }
+    if px_at(s, "else") {
+        s = px_advance(s)
+        r = px_expect(s, "{{", "'{{'")
+        s = r.st
+        let er = parse_screen_block(s)
+        els = er.nodes
+        s = er.st
+        r = px_expect(s, "}", "'}'")
+        s = r.st
+    }
+    s = px_maybe_semi(s)
+    let pr: PRes = { node: make_screen_if([] + [cr.node], tr.nodes, els, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_screen_for(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "for", "'for'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "loop variable")
+    let loop_var2 = r.tok.text
+    s = r.st
+    r = px_expect(s, "in", "'in'")
+    s = r.st
+    let ir = parse_expr(s)
+    s = ir.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    let br = parse_screen_block(s)
+    s = br.st
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    s = px_maybe_semi(s)
+    let pr: PRes = { node: make_screen_for(loop_var2, [] + [ir.node], br.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_component(st: Px) -> PRes {
+    var s = st
+    var r = px_expect_ident(s, "component name")
+    let t = r.tok
+    s = r.st
+    var args: [FieldPair] = []
+    if px_at(s, "(") {
+        s = px_advance(s)
+        if not px_at(s, ")") {
+            var done = false
+            while not done {
+                r = px_expect_ident(s, "argument name")
+                let an = r.tok.text
+                s = r.st
+                r = px_expect(s, ":", "':'")
+                s = r.st
+                var aval = make_nil_lit(0, 0)
+                if an == "id" {
+                    r = px_expect_ident(s, "component id")
+                    aval = make_ident(r.tok.text, r.tok.line, r.tok.col)
+                    s = r.st
+                } else {
+                    let er = parse_expr(s)
+                    aval = er.node
+                    s = er.st
+                }
+                args = args + [field_pair(an, aval)]
+                if px_at(s, ",") {
+                    s = px_advance(s)
+                } else {
+                    done = true
+                }
+            }
+        }
+        s = px_skip_semis(s)
+        r = px_expect(s, ")", "')'")
+        s = r.st
+    }
+    var children: [Node] = []
+    if px_at(s, "{{") {
+        s = px_advance(s)
+        let cr = parse_screen_block(s)
+        children = cr.nodes
+        s = cr.st
+        r = px_expect(s, "}", "'}'")
+        s = r.st
+    }
+    let pr: PRes = { node: make_component(t.text, args, children, t.line, t.col), st: s }
+    return pr
+}
+
+// ---------------- eval ----------------
+
+fn parse_eval(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "eval", "'eval'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "eval name")
+    let name = r.tok.text
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var model_name = ""
+    var given_fields: [FieldPair] = []
+    var expected: [Node] = []
+    var runs_n = 1
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        let ft = px_peek(s, 0)
+        var fk = ""
+        if ft.kind == "IDENT" {
+            fk = ft.text
+            s = px_advance(s)
+        } else {
+            if ft.kind == "model" or ft.kind == "given" or ft.kind == "expect" or ft.kind == "runs" {
+                fk = ft.kind
+                s = px_advance(s)
+            } else {
+                throw {code: "E001", message: err_msg("expected field name, found " + ft.kind + " (" + tok_val_repr(ft) + ")", ft.line, ft.col)}
+            }
+        }
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        if fk == "model" {
+            r = px_expect_ident(s, "model name")
+            model_name = r.tok.text
+            s = r.st
+        } else {
+            if fk == "given" {
+                let gr = parse_record_fields(s)
+                given_fields = gr.pairs
+                s = gr.st
+            } else {
+                if fk == "expect" {
+                    let er = parse_expr(s)
+                    expected = [] + [er.node]
+                    s = er.st
+                } else {
+                    if fk == "runs" {
+                        r = px_expect(s, "INT", "integer")
+                        runs_n = int(r.tok.text)
+                        s = r.st
+                    } else {
+                        let pt = px_peek(s, 0)
+                        throw {code: "E001", message: err_msg("unknown eval field '" + fk + "'", pt.line, pt.col)}
+                    }
+                }
+            }
+        }
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    if model_name == "" {
+        throw {code: "E001", message: err_msg("eval needs a 'model:' field", t.line, t.col)}
+    }
+    let pr: PRes = { node: make_eval_decl(name, model_name, given_fields, expected, runs_n, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_record_fields(st: Px) -> PairsRes {
+    var s = st
+    var r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var fields: [FieldPair] = []
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        r = px_expect_ident(s, "field name")
+        let fk = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        let er = parse_expr(s)
+        s = er.st
+        fields = fields + [field_pair(fk, er.node)]
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let pr: PairsRes = { pairs: fields, st: s }
+    return pr
+}
+
+// ---------------- statements ----------------
+
+fn parse_statement(st: Px) -> PRes {
+    let k = px_peek(st, 0).kind
+    if k == "let" {
+        return parse_let(st, false)
+    }
+    if k == "var" {
+        return parse_let(st, true)
+    }
+    if k == "if" {
+        return parse_if(st)
+    }
+    if k == "for" {
+        return parse_for(st)
+    }
+    if k == "while" {
+        return parse_while(st)
+    }
+    if k == "return" {
+        return parse_return(st)
+    }
+    if k == "try" {
+        return parse_try(st)
+    }
+    if k == "throw" {
+        return parse_throw(st)
+    }
+    if k == "on" {
+        return parse_on(st)
+    }
+    let er = parse_expr(st)
+    var s = er.st
+    if er.node.node == "StreamDecl" {
+        s = px_maybe_semi(s)
+        let pr: PRes = { node: er.node, st: s }
+        return pr
+    }
+    if px_at(s, "=") {
+        s = px_advance(s)
+        let vr = parse_expr(s)
+        s = px_maybe_semi(vr.st)
+        let pr2: PRes = { node: make_assign_stmt([] + [er.node], [] + [vr.node], er.node.line, er.node.col), st: s }
+        return pr2
+    }
+    let pr3: PRes = { node: make_expr_stmt([] + [er.node], er.node.line, er.node.col), st: px_maybe_semi(s) }
+    return pr3
+}
+
+fn parse_let(st: Px, mutable: Bool) -> PRes {
+    let t = px_peek(st, 0)
+    var s = px_advance(st)
+    var r = px_expect_ident(s, "variable name")
+    let name = r.tok.text
+    s = r.st
+    var ann: [Node] = []
+    if px_at(s, ":") {
+        s = px_advance(s)
+        let tr = parse_type_expr(s)
+        ann = [] + [tr.node]
+        s = tr.st
+    }
+    r = px_expect(s, "=", "'='")
+    s = r.st
+    let vr = parse_expr(s)
+    s = px_maybe_semi(vr.st)
+    let pr: PRes = { node: make_let_stmt(name, ann, [] + [vr.node], mutable, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_block(st: Px) -> NodesRes {
+    var s = st
+    var r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    var stmts: [Node] = []
+    s = px_skip_semis(s)
+    while not px_at(s, "}") {
+        let sr = parse_statement(s)
+        stmts = stmts + [sr.node]
+        s = px_skip_semis(sr.st)
+    }
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    let nr: NodesRes = { nodes: stmts, st: s }
+    return nr
+}
+
+fn parse_if(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "if", "'if'")
+    let t = r.tok
+    s = r.st
+    let cr = parse_expr(s)
+    s = cr.st
+    let tr = parse_block(s)
+    s = tr.st
+    var els: [Node] = []
+    if px_at(s, "SEMI") and px_atn(s, "else", 1) {
+        s = px_advance(s)
+    }
+    if px_at(s, "else") {
+        s = px_advance(s)
+        let er = parse_block(s)
+        els = er.nodes
+        s = er.st
+    }
+    s = px_maybe_semi(s)
+    let pr: PRes = { node: make_if_stmt([] + [cr.node], tr.nodes, els, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_for(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "for", "'for'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "loop variable")
+    let loop_var2 = r.tok.text
+    s = r.st
+    r = px_expect(s, "in", "'in'")
+    s = r.st
+    let ir = parse_expr(s)
+    s = ir.st
+    let br = parse_block(s)
+    s = px_maybe_semi(br.st)
+    let pr: PRes = { node: make_for_stmt(loop_var2, [] + [ir.node], br.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_while(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "while", "'while'")
+    let t = r.tok
+    s = r.st
+    let cr = parse_expr(s)
+    s = cr.st
+    let br = parse_block(s)
+    s = px_maybe_semi(br.st)
+    let pr: PRes = { node: make_while_stmt([] + [cr.node], br.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_return(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "return", "'return'")
+    let t = r.tok
+    s = r.st
+    var val: [Node] = []
+    if not px_at(s, "SEMI") and not px_at(s, "}") and not px_at(s, "EOF") {
+        let vr = parse_expr(s)
+        val = [] + [vr.node]
+        s = vr.st
+    }
+    s = px_maybe_semi(s)
+    let pr: PRes = { node: make_return_stmt(val, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_fn_decl(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "fn", "'fn'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "function name")
+    let name = r.tok.text
+    s = r.st
+    let prms = parse_params(s)
+    s = prms.st
+    var ret: [Node] = []
+    if px_at(s, "->") {
+        s = px_advance(s)
+        let tr = parse_type_expr(s)
+        ret = [] + [tr.node]
+        s = tr.st
+    }
+    let br = parse_block(s)
+    s = br.st
+    let pr: PRes = { node: make_fn_decl(name, prms.pairs, ret, br.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_import_decl(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "import", "'import'")
+    let t = r.tok
+    s = r.st
+    r = px_expect(s, "STRING", "import path")
+    let path = r.tok.text
+    s = px_maybe_semi(r.st)
+    let pr: PRes = { node: make_import_decl(path, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_try(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "try", "'try'")
+    let t = r.tok
+    s = r.st
+    let br = parse_block(s)
+    s = br.st
+    r = px_expect(s, "catch", "'catch'")
+    s = r.st
+    r = px_expect_ident(s, "catch variable")
+    let cvar = r.tok.text
+    s = r.st
+    let hr = parse_block(s)
+    s = hr.st
+    let pr: PRes = { node: make_try_stmt(br.nodes, cvar, hr.nodes, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_throw(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "throw", "'throw'")
+    let t = r.tok
+    s = r.st
+    let vr = parse_expr(s)
+    s = px_maybe_semi(vr.st)
+    let pr: PRes = { node: make_throw_stmt([] + [vr.node], t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_on(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "on", "'on'")
+    let t = r.tok
+    s = r.st
+    r = px_expect_ident(s, "stream name")
+    let stt = r.tok
+    s = r.st
+    let stream_node = make_ident(stt.text, stt.line, stt.col)
+    r = px_expect(s, ".", "'.'")
+    s = r.st
+    r = px_expect_ident(s, "event name")
+    let event = r.tok.text
+    s = r.st
+    r = px_expect(s, "{{", "'{{'")
+    s = r.st
+    let lr = parse_lambda(s)
+    s = lr.st
+    r = px_expect(s, "}", "'}'")
+    s = r.st
+    s = px_maybe_semi(s)
+    let pr: PRes = { node: make_on_stmt([] + [stream_node], event, [] + [lr.node], t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_lambda(st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "|", "'|'")
+    let t = r.tok
+    s = r.st
+    var params: [Text] = []
+    while not px_at(s, "|") {
+        r = px_expect_ident(s, "parameter name")
+        params = params + [r.tok.text]
+        s = r.st
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+    }
+    r = px_expect(s, "|", "'|'")
+    s = r.st
+    if px_at(s, "{{") {
+        let br = parse_block(s)
+        let pr: PRes = { node: make_lambda(params, br.nodes, [], true, t.line, t.col), st: br.st }
+        return pr
+    }
+    let er = parse_expr(s)
+    let pr2: PRes = { node: make_lambda(params, [], [] + [er.node], false, t.line, t.col), st: er.st }
+    return pr2
+}
+
+// ---------------- expressions ----------------
+
+fn parse_expr(st: Px) -> PRes {
+    return parse_or(st)
+}
+
+fn parse_or(st: Px) -> PRes {
+    var r = parse_and(st)
+    var left = r.node
+    var s = r.st
+    while px_at(s, "or") {
+        let t = px_peek(s, 0)
+        s = px_advance(s)
+        r = parse_and(s)
+        left = make_binop("or", left, r.node, t.line, t.col)
+        s = r.st
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_and(st: Px) -> PRes {
+    var r = parse_eq(st)
+    var left = r.node
+    var s = r.st
+    while px_at(s, "and") {
+        let t = px_peek(s, 0)
+        s = px_advance(s)
+        r = parse_eq(s)
+        left = make_binop("and", left, r.node, t.line, t.col)
+        s = r.st
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_eq(st: Px) -> PRes {
+    var r = parse_cmp(st)
+    var left = r.node
+    var s = r.st
+    var cont = true
+    while cont {
+        if px_at(s, "==") or px_at(s, "!=") {
+            let t = px_peek(s, 0)
+            s = px_advance(s)
+            r = parse_cmp(s)
+            left = make_binop(t.kind, left, r.node, t.line, t.col)
+            s = r.st
+        } else {
+            cont = false
+        }
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_cmp(st: Px) -> PRes {
+    var r = parse_add(st)
+    var left = r.node
+    var s = r.st
+    var cont = true
+    while cont {
+        if px_at(s, "<") or px_at(s, "<=") or px_at(s, ">") or px_at(s, ">=") {
+            let t = px_peek(s, 0)
+            s = px_advance(s)
+            r = parse_add(s)
+            left = make_binop(t.kind, left, r.node, t.line, t.col)
+            s = r.st
+        } else {
+            cont = false
+        }
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_add(st: Px) -> PRes {
+    var r = parse_mul(st)
+    var left = r.node
+    var s = r.st
+    var cont = true
+    while cont {
+        if px_at(s, "+") or px_at(s, "-") {
+            let t = px_peek(s, 0)
+            s = px_advance(s)
+            r = parse_mul(s)
+            left = make_binop(t.kind, left, r.node, t.line, t.col)
+            s = r.st
+        } else {
+            cont = false
+        }
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_mul(st: Px) -> PRes {
+    var r = parse_unary(st)
+    var left = r.node
+    var s = r.st
+    var cont = true
+    while cont {
+        if px_at(s, "*") or px_at(s, "/") or px_at(s, "%") {
+            let t = px_peek(s, 0)
+            s = px_advance(s)
+            r = parse_unary(s)
+            left = make_binop(t.kind, left, r.node, t.line, t.col)
+            s = r.st
+        } else {
+            cont = false
+        }
+    }
+    let pr: PRes = { node: left, st: s }
+    return pr
+}
+
+fn parse_unary(st: Px) -> PRes {
+    if px_at(st, "-") or px_at(st, "not") {
+        let t = px_peek(st, 0)
+        let op = t.kind
+        let r = parse_unary(px_advance(st))
+        let pr: PRes = { node: make_unop(op, r.node, t.line, t.col), st: r.st }
+        return pr
+    }
+    if px_at(st, "await") {
+        let t = px_peek(st, 0)
+        let r = parse_unary(px_advance(st))
+        let pr: PRes = { node: make_await(r.node, t.line, t.col), st: r.st }
+        return pr
+    }
+    return parse_postfix(st)
+}
+
+fn parse_postfix(st: Px) -> PRes {
+    var r = parse_primary(st)
+    var node = r.node
+    var s = r.st
+    var cont = true
+    while cont {
+        if px_at(s, ".") {
+            let t = px_peek(s, 0)
+            s = px_advance(s)
+            let fr = px_expect_ident(s, "field name")
+            let f = fr.tok.text
+            s = fr.st
+            if px_at(s, "(") and node.node == "Ident" {
+                let cr = finish_call(node.name + "." + f, t, s)
+                node = cr.node
+                s = cr.st
+            } else {
+                node = make_field([] + [node], f, t.line, t.col)
+            }
+        } else {
+            if px_at(s, "[") {
+                let t = px_peek(s, 0)
+                s = px_advance(s)
+                let ir = parse_expr(s)
+                s = ir.st
+                let er = px_expect(s, "]", "']'")
+                s = er.st
+                node = make_index([] + [node], [] + [ir.node], t.line, t.col)
+            } else {
+                cont = false
+            }
+        }
+    }
+    let pr: PRes = { node: node, st: s }
+    return pr
+}
+
+fn parse_primary(st: Px) -> PRes {
+    let t = px_peek(st, 0)
+    if t.kind == "INT" {
+        let pr: PRes = { node: make_int_lit(int(t.text), t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "FLOAT" {
+        let pr: PRes = { node: make_float_lit(float(t.text), t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "STRING" {
+        let s2 = px_advance(st)
+        let parts = parse_string_parts(t.text, t.line, t.col)
+        let pr: PRes = { node: make_str_lit(parts, t.line, t.col), st: s2 }
+        return pr
+    }
+    if t.kind == "DURATION" {
+        let pr: PRes = { node: make_duration_lit(parse_duration_ms(t.text), t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "MONEY" {
+        let pr: PRes = { node: make_money_lit(parse_money(t.text), t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "true" or t.kind == "false" {
+        let pr: PRes = { node: make_bool_lit(t.kind == "true", t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "nil" {
+        let pr: PRes = { node: make_nil_lit(t.line, t.col), st: px_advance(st) }
+        return pr
+    }
+    if t.kind == "IDENT" {
+        var s = px_advance(st)
+        if px_at(s, "(") {
+            return finish_call(t.text, t, s)
+        }
+        let pr: PRes = { node: make_ident(t.text, t.line, t.col), st: s }
+        return pr
+    }
+    if t.kind == "navigate" or t.kind == "env" {
+        var s = px_advance(st)
+        if px_at(s, "(") {
+            return finish_call(t.text, t, s)
+        }
+        throw {code: "E001", message: err_msg("'" + t.text + "' must be called", t.line, t.col)}
+        let pr: PRes = { node: make_nil_lit(0, 0), st: s }
+        return pr
+    }
+    if t.kind == "(" {
+        var s = px_advance(st)
+        let er = parse_expr(s)
+        s = er.st
+        let r = px_expect(s, ")", "')'")
+        s = r.st
+        let pr: PRes = { node: er.node, st: s }
+        return pr
+    }
+    if t.kind == "[" {
+        var s = px_advance(st)
+        s = px_skip_semis(s)
+        var items: [Node] = []
+        if not px_at(s, "]") {
+            var done = false
+            while not done {
+                let er = parse_expr(s)
+                items = items + [er.node]
+                s = px_skip_semis(er.st)
+                if px_at(s, ",") {
+                    s = px_advance(s)
+                    s = px_skip_semis(s)
+                    if px_at(s, "]") {
+                        done = true
+                    }
+                } else {
+                    done = true
+                }
+            }
+        }
+        let r = px_expect(s, "]", "']'")
+        s = r.st
+        let pr: PRes = { node: make_list_lit(items, t.line, t.col), st: s }
+        return pr
+    }
+    if t.kind == "{{" {
+        var s = px_advance(st)
+        s = px_skip_semis(s)
+        if px_at(s, "STRING") {
+            let mr = parse_map_fields_rest(s)
+            let pr: PRes = { node: make_map_lit(mr.pairs, t.line, t.col), st: mr.st }
+            return pr
+        }
+        let fr = parse_record_fields_rest(s)
+        let pr2: PRes = { node: make_record_lit(fr.pairs, t.line, t.col), st: fr.st }
+        return pr2
+    }
+    if t.kind == "|" {
+        return parse_lambda(st)
+    }
+    if t.kind == "stream" {
+        var s = px_advance(st)
+        let r = px_expect_ident(s, "stream name")
+        let name = r.tok.text
+        s = r.st
+        let e = px_expect(s, "=", "'='")
+        s = e.st
+        let cr = parse_expr(s)
+        let pr: PRes = { node: make_stream_decl(name, [] + [cr.node], t.line, t.col), st: cr.st }
+        return pr
+    }
+    throw {code: "E001", message: err_msg("unexpected " + t.kind + " (" + tok_val_repr(t) + ") in expression", t.line, t.col)}
+    let pr3: PRes = { node: make_nil_lit(0, 0), st: st }
+    return pr3
+}
+
+fn finish_call(name: Text, t: Tok, st: Px) -> PRes {
+    var s = st
+    var r = px_expect(s, "(", "'('")
+    s = r.st
+    var args: [Node] = []
+    if not px_at(s, ")") {
+        var done = false
+        while not done {
+            let ar = parse_expr(s)
+            args = args + [ar.node]
+            s = ar.st
+            if px_at(s, ",") {
+                s = px_advance(s)
+                if px_at(s, ")") {
+                    done = true
+                }
+            } else {
+                done = true
+            }
+        }
+    }
+    r = px_expect(s, ")", "')'")
+    s = r.st
+    let pr: PRes = { node: make_call(name, args, t.line, t.col), st: s }
+    return pr
+}
+
+fn parse_record_fields_rest(st: Px) -> PairsRes {
+    var fields: [FieldPair] = []
+    var s = px_skip_semis(st)
+    while not px_at(s, "}") {
+        var r = px_expect_ident(s, "field name")
+        let fk = r.tok.text
+        s = r.st
+        r = px_expect(s, ":", "':'")
+        s = r.st
+        let er = parse_expr(s)
+        fields = fields + [field_pair(fk, er.node)]
+        s = er.st
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    let r2 = px_expect(s, "}", "'}'")
+    let pr: PairsRes = { pairs: fields, st: r2.st }
+    return pr
+}
+
+fn parse_map_fields_rest(st: Px) -> PairsRes {
+    var entries: [FieldPair] = []
+    var s = px_skip_semis(st)
+    while not px_at(s, "}") {
+        let r = px_expect(s, "STRING", "string key")
+        let kt = r.tok
+        s = r.st
+        let e = px_expect(s, ":", "':'")
+        s = e.st
+        let er = parse_expr(s)
+        entries = entries + [field_pair(kt.text, er.node)]
+        s = er.st
+        if px_at(s, ",") {
+            s = px_advance(s)
+        }
+        s = px_skip_semis(s)
+    }
+    let r2 = px_expect(s, "}", "'}'")
+    let pr: PairsRes = { pairs: entries, st: r2.st }
+    return pr
+}
+
+fn parse_literal(st: Px) -> PRes {
+    let t = px_peek(st, 0)
+    if t.kind == "INT" or t.kind == "FLOAT" or t.kind == "STRING" or t.kind == "DURATION" or t.kind == "MONEY" or t.kind == "true" or t.kind == "false" or t.kind == "nil" {
+        return parse_primary(st)
+    }
+    throw {code: "E001", message: err_msg("expected a literal, found " + t.kind, t.line, t.col)}
+    let pr: PRes = { node: make_nil_lit(0, 0), st: st }
+    return pr
+}
+
+// ---------------- string interpolation ----------------
+
+fn parse_string_parts(raw: Text, line: Int, col: Int) -> [Node] {
+    var parts: [Node] = []
+    var buf = ""
+    var i = 0
+    let n = len(raw)
+    while i < n {
+        let ch = raw[i]
+        if ch == "{{" and i + 1 < n and raw[i + 1] == "{{" {
+            buf = buf + "{{"
+            i = i + 2
+        } else {
+            if ch == "{{" {
+                var depth = 1
+                var j = i + 1
+                while j < n and depth > 0 {
+                    if raw[j] == "{{" {
+                        depth = depth + 1
+                    } else {
+                        if raw[j] == "}" {
+                            depth = depth - 1
+                        }
+                    }
+                    j = j + 1
+                }
+                if depth > 0 {
+                    throw {code: "E001", message: err_msg("unbalanced '{{' in string", line, col)}
+                }
+                let inner = str.slice(raw, i + 1, j - 1)
+                if len(buf) > 0 {
+                    parts = parts + [make_str_part(buf, line, col)]
+                    buf = ""
+                }
+                let expr_line = line + count_char(str.slice(raw, 0, i), "\n")
+                parts = parts + [parse_inner_expr(inner, expr_line, col)]
+                i = j
+            } else {
+                buf = buf + ch
+                i = i + 1
+            }
+        }
+    }
+    if len(buf) > 0 {
+        parts = parts + [make_str_part(buf, line, col)]
+    }
+    return parts
+}
+
+fn parse_inner_expr(inner: Text, expr_line: Int, col: Int) -> Node {
+    let toks = lex(inner)
+    var st: Px = { toks: toks, pos: 0 }
+    let r = parse_expr(st)
+    st = r.st
+    if not px_at(st, "EOF") {
+        throw {code: "E001", message: err_msg("unexpected token in interpolation", expr_line, col)}
+    }
+    return shift_lines(r.node, expr_line - 1)
+}
+
+// ---------------- S-expression serializer ----------------
+// Canonical text form of the AST, used by the differential test.
+// Must match test_parser.py's Python serializer character for character.
+
+fn qstr(s: Text) -> Text {
+    var out = "\""
+    for c in s {
+        if c == "\\" {
+            out = out + "\\\\"
+        } else {
+            if c == "\"" {
+                out = out + "\\\""
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\r" {
+                        out = out + "\\r"
+                    } else {
+                        if c == "\t" {
+                            out = out + "\\t"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out = out + "\""
+    return out
+}
+
+fn sexprs(ns: [Node]) -> Text {
+    var out = ""
+    for x in ns {
+        out = out + " " + sexpr(x)
+    }
+    return out
+}
+
+fn sexpr_opt(ns: [Node]) -> Text {
+    if len(ns) == 0 {
+        return "nil"
+    }
+    return sexpr(ns[0])
+}
+
+fn type_text(n: Node) -> Text {
+    var s = ""
+    if n.is_map {
+        s = "Map<" + type_text(n.map_key[0]) + "," + type_text(n.map_val[0]) + ">"
+    } else {
+        if n.is_list {
+            s = "[" + n.name + "]"
+        } else {
+            s = n.name
+        }
+    }
+    if n.optional {
+        s = s + "?"
+    }
+    return s
+}
+
+fn sexpr_type(n: Node) -> Text {
+    return "(Type " + qstr(type_text(n)) + " " + str(n.line) + " " + str(n.col) + ")"
+}
+
+fn sexpr_type_opt(ns: [Node]) -> Text {
+    if len(ns) == 0 {
+        return "nil"
+    }
+    return sexpr_type(ns[0])
+}
+
+fn sexpr_params(ps: [FieldPair]) -> Text {
+    var out = ""
+    for p in ps {
+        out = out + " (param " + qstr(p.name) + " " + sexpr_type(p.value) + ")"
+    }
+    return out
+}
+
+fn sexpr_fields(tag: Text, ps: [FieldPair]) -> Text {
+    var out = ""
+    for p in ps {
+        out = out + " (" + tag + " " + qstr(p.name) + " " + sexpr(p.value) + ")"
+    }
+    return out
+}
+
+fn sexpr_tfields(ps: [FieldPair]) -> Text {
+    var out = ""
+    for p in ps {
+        out = out + " (field " + qstr(p.name) + " " + sexpr_type(p.value) + ")"
+    }
+    return out
+}
+
+fn sexpr_triples(ts: [StrTriple]) -> Text {
+    var out = ""
+    for t in ts {
+        out = out + " (entry " + qstr(t.a) + " " + qstr(t.b) + " " + qstr(t.c) + ")"
+    }
+    return out
+}
+
+fn sexpr_part(p: Node) -> Text {
+    if p.node == "StrPart" {
+        return "(StrPart " + qstr(p.sval) + ")"
+    }
+    return sexpr(p)
+}
+
+fn sexpr_parts(ps: [Node]) -> Text {
+    var out = ""
+    for p in ps {
+        out = out + " " + sexpr_part(p)
+    }
+    return out
+}
+
+fn sexpr_slist(ss: [Text]) -> Text {
+    var out = ""
+    for s in ss {
+        out = out + " " + qstr(s)
+    }
+    return out
+}
+
+fn sexpr(n: Node) -> Text {
+    let tag = n.node
+    let lc = " " + str(n.line) + " " + str(n.col)
+    if tag == "Program" {
+        return "(Program (items" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "AppDecl" {
+        return "(AppDecl " + qstr(n.name) + " (fields" + sexpr_fields("field", n.pairs) + ")" + lc + ")"
+    }
+    if tag == "ProviderDecl" {
+        return "(ProviderDecl " + qstr(n.name) + " " + qstr(n.key_env) + " " + qstr(n.model_file) + lc + ")"
+    }
+    if tag == "ModelsDecl" {
+        return "(ModelsDecl (entries" + sexpr_triples(n.triples) + ")" + lc + ")"
+    }
+    if tag == "TypeDecl" {
+        return "(TypeDecl " + qstr(n.name) + " (fields" + sexpr_tfields(n.pairs) + ")" + lc + ")"
+    }
+    if tag == "Budget" {
+        var b = ""
+        if n.has_tokens {
+            b = b + " (tokens " + str(n.tokens) + ")"
+        }
+        if n.has_latency {
+            b = b + " (latency " + str(n.latency_ms) + ")"
+        }
+        if n.has_cost {
+            b = b + " (cost " + str(n.cost_usd) + ")"
+        }
+        return "(Budget" + b + lc + ")"
+    }
+    if tag == "ModelDecl" {
+        return "(ModelDecl " + qstr(n.name) + " (params" + sexpr_params(n.pairs) + ") (ret " + sexpr_type_opt(n.ret) + ") " + qstr(n.prov) + " " + qstr(n.alias) + " (budget " + sexpr_opt(n.budg) + ") " + str(n.ival) + " (prompt" + sexpr_parts(n.items) + ")" + lc + ")"
+    }
+    if tag == "Component" {
+        return "(Component " + qstr(n.name) + " (args" + sexpr_fields("arg", n.pairs) + ") (children" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "ScreenDecl" {
+        return "(ScreenDecl " + qstr(n.name) + " (params" + sexpr_params(n.pairs) + ") (body" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "ScreenIf" {
+        return "(ScreenIf " + sexpr(n.cond[0]) + " (then" + sexprs(n.items) + ") (else" + sexprs(n.items2) + ")" + lc + ")"
+    }
+    if tag == "ScreenFor" {
+        return "(ScreenFor " + qstr(n.name) + " " + sexpr(n.iter[0]) + " (body" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "EvalDecl" {
+        return "(EvalDecl " + qstr(n.name) + " " + qstr(n.model_name) + " (given" + sexpr_fields("field", n.pairs) + ") (expect " + sexpr_opt(n.expected) + ") " + str(n.ival) + lc + ")"
+    }
+    if tag == "FnDecl" {
+        return "(FnDecl " + qstr(n.name) + " (params" + sexpr_params(n.pairs) + ") (ret " + sexpr_type_opt(n.ret) + ") (body" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "ImportDecl" {
+        return "(ImportDecl " + qstr(n.sval) + lc + ")"
+    }
+    if tag == "StreamDecl" {
+        return "(StreamDecl " + qstr(n.name) + " " + sexpr(n.call[0]) + lc + ")"
+    }
+    if tag == "LetStmt" {
+        var mut = "0"
+        if n.bval {
+            mut = "1"
+        }
+        return "(Let " + qstr(n.name) + " " + mut + " (ann " + sexpr_type_opt(n.ann) + ") " + sexpr(n.value[0]) + lc + ")"
+    }
+    if tag == "AssignStmt" {
+        return "(Assign " + sexpr(n.target[0]) + " " + sexpr(n.value[0]) + lc + ")"
+    }
+    if tag == "IfStmt" {
+        return "(If " + sexpr(n.cond[0]) + " (then" + sexprs(n.items) + ") (else" + sexprs(n.items2) + ")" + lc + ")"
+    }
+    if tag == "ForStmt" {
+        return "(For " + qstr(n.name) + " " + sexpr(n.iter[0]) + " (body" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "WhileStmt" {
+        return "(While " + sexpr(n.cond[0]) + " (body" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "ReturnStmt" {
+        return "(Return (value " + sexpr_opt(n.value) + ")" + lc + ")"
+    }
+    if tag == "TryStmt" {
+        return "(Try (body" + sexprs(n.items) + ") (catch " + qstr(n.name) + " (body" + sexprs(n.items2) + "))" + lc + ")"
+    }
+    if tag == "ThrowStmt" {
+        return "(Throw " + sexpr(n.value[0]) + lc + ")"
+    }
+    if tag == "OnStmt" {
+        return "(On " + sexpr(n.stm[0]) + " " + qstr(n.event) + " " + sexpr(n.handler[0]) + lc + ")"
+    }
+    if tag == "ExprStmt" {
+        return "(Expr " + sexpr(n.value[0]) + lc + ")"
+    }
+    if tag == "IntLit" {
+        return "(Int " + str(n.ival) + lc + ")"
+    }
+    if tag == "FloatLit" {
+        return "(Float " + str(n.fval) + lc + ")"
+    }
+    if tag == "StrLit" {
+        return "(Str" + sexpr_parts(n.items) + lc + ")"
+    }
+    if tag == "BoolLit" {
+        var b = "false"
+        if n.bval {
+            b = "true"
+        }
+        return "(Bool " + b + lc + ")"
+    }
+    if tag == "NilLit" {
+        return "(Nil" + lc + ")"
+    }
+    if tag == "DurationLit" {
+        return "(Duration " + str(n.ival) + lc + ")"
+    }
+    if tag == "MoneyLit" {
+        return "(Money " + str(n.fval) + lc + ")"
+    }
+    if tag == "Ident" {
+        return "(Ident " + qstr(n.name) + lc + ")"
+    }
+    if tag == "Call" {
+        return "(Call " + qstr(n.name) + " (args" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "Field" {
+        return "(Field " + sexpr(n.obj[0]) + " " + qstr(n.name) + lc + ")"
+    }
+    if tag == "Index" {
+        return "(Index " + sexpr(n.obj[0]) + " " + sexpr(n.idx[0]) + lc + ")"
+    }
+    if tag == "ListLit" {
+        return "(List (items" + sexprs(n.items) + ")" + lc + ")"
+    }
+    if tag == "RecordLit" {
+        return "(Record (fields" + sexpr_fields("field", n.pairs) + ")" + lc + ")"
+    }
+    if tag == "MapLit" {
+        return "(Map (entries" + sexpr_fields("entry", n.pairs) + ")" + lc + ")"
+    }
+    if tag == "Lambda" {
+        var l = "(Lambda (params" + sexpr_slist(n.slist) + ")"
+        if n.bval {
+            l = l + " (body" + sexprs(n.items) + ")"
+        } else {
+            l = l + " (expr " + sexpr(n.expr_body[0]) + ")"
+        }
+        l = l + lc + ")"
+        return l
+    }
+    if tag == "BinOp" {
+        return "(BinOp " + qstr(n.op) + " " + sexpr(n.left[0]) + " " + sexpr(n.right[0]) + lc + ")"
+    }
+    if tag == "UnOp" {
+        return "(UnOp " + qstr(n.op) + " " + sexpr(n.operand[0]) + lc + ")"
+    }
+    if tag == "Await" {
+        return "(Await " + sexpr(n.operand[0]) + lc + ")"
+    }
+    return "(Unknown " + qstr(tag) + lc + ")"
+}

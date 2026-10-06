@@ -1,0 +1,1706 @@
+// Misa self-hosted checker (Phase 6a, third component).
+//
+// Mirrors impl/misa/checker.py exactly: name resolution + pragmatic
+// type checking. Collects diagnostics (does not throw on errors).
+//
+// Differences from the Python implementation (all documented):
+// - Checker state is threaded explicitly as Cx (functions cannot see
+//   module-level vars). Global tables are StrTab parallel lists
+//   (Misa has no generics for a typed has_key helper).
+// - Scopes are [ScopeEntry] lists (value semantics; linear search
+//   from the end gives shadowing).
+// - `_file_of` is always absent (single-file pipeline, no imports) so
+//   _dup always emits E210, never E110 — matching check_source.
+// - The on-device model_file validation (providers.ondevice_runtime)
+//   is skipped: it needs Python-only model loading. E209 for unknown
+//   provider/model alias is still emitted.
+// - `throw` only accepts {code, message}; this checker never throws —
+//   it collects Diags.
+//
+// Entry point: check(prog) -> [Diag]  (prog is a "Program" node)
+
+import "lexer.misa"
+import "parser.misa"
+
+// ---------------- types ----------------
+
+type Diag {
+    code: Text,
+    message: Text,
+    line: Int,
+    col: Int
+}
+
+type ScopeEntry {
+    name: Text,
+    t: Text,
+    mut: Bool
+}
+
+// name -> Node table as parallel lists (no generics in Misa)
+type StrTab {
+    names: [Text],
+    nodes: [Node]
+}
+
+type Cx {
+    errors: [Diag],
+    types: StrTab,
+    models: StrTab,
+    providers: StrTab,
+    screens: StrTab,
+    evals: StrTab,
+    fns: StrTab,
+    alias_names: [Text],
+    alias_provs: [Text],
+    alias_mids: [Text],
+    app_seen: Bool,
+    has_idk: Bool,
+    idk_names: [Text],
+    idk_kinds: [Text]
+}
+
+// result of inference: updated checker + type name
+type InfRes {
+    cx: Cx,
+    t: Text
+}
+
+// ---------------- constructors ----------------
+
+fn make_diag(code: Text, message: Text, line: Int, col: Int) -> Diag {
+    let d: Diag = { code: code, message: message, line: line, col: col }
+    return d
+}
+
+fn make_scope_entry(name: Text, t: Text, mut: Bool) -> ScopeEntry {
+    let e: ScopeEntry = { name: name, t: t, mut: mut }
+    return e
+}
+
+fn empty_tab() -> StrTab {
+    let t: StrTab = { names: [], nodes: [] }
+    return t
+}
+
+fn make_cx() -> Cx {
+    let c: Cx = { errors: [], types: empty_tab(), models: empty_tab(), providers: empty_tab(), screens: empty_tab(), evals: empty_tab(), fns: empty_tab(), alias_names: [], alias_provs: [], alias_mids: [], app_seen: false, has_idk: false, idk_names: [], idk_kinds: [] }
+    return c
+}
+
+fn make_infres(cx: Cx, t: Text) -> InfRes {
+    let r: InfRes = { cx: cx, t: t }
+    return r
+}
+
+// ---------------- small helpers ----------------
+
+fn cx_err(cx: Cx, code: Text, message: Text, line: Int, col: Int) -> Cx {
+    var c = cx
+    c.errors = c.errors + [make_diag(code, message, line, col)]
+    return c
+}
+
+fn tab_find(t: StrTab, name: Text) -> Int {
+    var i = len(t.names) - 1
+    while i >= 0 {
+        if t.names[i] == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn tab_has(t: StrTab, name: Text) -> Bool {
+    return tab_find(t, name) >= 0
+}
+
+fn tab_get(t: StrTab, name: Text) -> [Node] {
+    let i = tab_find(t, name)
+    if i >= 0 {
+        return [] + [t.nodes[i]]
+    }
+    return []
+}
+
+fn tab_put(t: StrTab, name: Text, node: Node) -> StrTab {
+    var nt = t
+    nt.names = nt.names + [name]
+    nt.nodes = nt.nodes + [node]
+    return nt
+}
+
+// scope lookup: search from end (shadowing); returns [ScopeEntry]
+fn scope_find(scope: [ScopeEntry], name: Text) -> [ScopeEntry] {
+    var i = len(scope) - 1
+    while i >= 0 {
+        if scope[i].name == name {
+            return [] + [scope[i]]
+        }
+        i = i - 1
+    }
+    return []
+}
+
+fn scope_has(scope: [ScopeEntry], name: Text) -> Bool {
+    return len(scope_find(scope, name)) > 0
+}
+
+fn alias_find(cx: Cx, alias: Text) -> Int {
+    var i = len(cx.alias_names) - 1
+    while i >= 0 {
+        if cx.alias_names[i] == alias {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn idk_find(cx: Cx, name: Text) -> Int {
+    var i = len(cx.idk_names) - 1
+    while i >= 0 {
+        if cx.idk_names[i] == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// ---------------- builtin tables ----------------
+
+fn is_primitive(t: Text) -> Bool {
+    return t == "Text" or t == "Int" or t == "Float" or t == "Bool" or t == "Error" or t == "Void"
+}
+
+fn is_media(t: Text) -> Bool {
+    return t == "Photo" or t == "Audio" or t == "Video" or t == "Document"
+}
+
+fn is_special(t: Text) -> Bool {
+    return t == "TokenStream" or t == "Embedding"
+}
+
+fn is_builtin(name: Text) -> Bool {
+    return name == "print" or name == "len" or name == "str" or name == "int" or name == "float" or name == "assert" or name == "env" or name == "navigate"
+}
+
+fn builtin_ret(name: Text) -> Text {
+    if name == "print" {
+        return "Text"
+    }
+    if name == "len" {
+        return "Int"
+    }
+    if name == "str" {
+        return "Text"
+    }
+    if name == "int" {
+        return "Int"
+    }
+    if name == "float" {
+        return "Float"
+    }
+    if name == "assert" {
+        return "Text"
+    }
+    if name == "env" {
+        return "Text"
+    }
+    return "Text"
+}
+
+fn builtin_arity_ok(name: Text, n: Int) -> Bool {
+    if name == "print" {
+        return n == 1
+    }
+    if name == "len" {
+        return n == 1
+    }
+    if name == "str" {
+        return n == 1
+    }
+    if name == "int" {
+        return n == 1
+    }
+    if name == "float" {
+        return n == 1
+    }
+    if name == "assert" {
+        return n == 1 or n == 2
+    }
+    if name == "env" {
+        return n == 1
+    }
+    if name == "navigate" {
+        return n == 1
+    }
+    return false
+}
+
+fn builtin_arity_text(name: Text) -> Text {
+    if name == "assert" {
+        return "1-2"
+    }
+    return "1"
+}
+
+fn is_ns_builtin(name: Text) -> Bool {
+    return name == "fs.read" or name == "fs.write" or name == "http.get" or name == "str.slice" or name == "str.starts_with" or name == "str.split" or name == "str.trim" or name == "str.ord" or name == "str.chr" or name == "process.run"
+}
+
+fn ns_builtin_params(name: Text) -> [Text] {
+    if name == "fs.read" {
+        return ["Text"]
+    }
+    if name == "fs.write" {
+        return ["Text", "Text"]
+    }
+    if name == "http.get" {
+        return ["Text"]
+    }
+    if name == "str.slice" {
+        return ["Text", "Int", "Int"]
+    }
+    if name == "str.starts_with" {
+        return ["Text", "Text"]
+    }
+    if name == "str.split" {
+        return ["Text", "Text"]
+    }
+    if name == "str.trim" {
+        return ["Text"]
+    }
+    if name == "str.ord" {
+        return ["Text"]
+    }
+    if name == "str.chr" {
+        return ["Int"]
+    }
+    return ["[Text]"]
+}
+
+fn ns_builtin_ret(name: Text) -> Text {
+    if name == "fs.read" {
+        return "Text"
+    }
+    if name == "fs.write" {
+        return "Void"
+    }
+    if name == "http.get" {
+        return "Text"
+    }
+    if name == "str.slice" {
+        return "Text"
+    }
+    if name == "str.starts_with" {
+        return "Bool"
+    }
+    if name == "str.split" {
+        return "[Text]"
+    }
+    if name == "str.trim" {
+        return "Text"
+    }
+    if name == "str.ord" {
+        return "Int"
+    }
+    if name == "str.chr" {
+        return "Text"
+    }
+    return "record"
+}
+
+fn is_layout_component(name: Text) -> Bool {
+    return name == "Column" or name == "Row"
+}
+
+fn is_leaf_component(name: Text) -> Bool {
+    return name == "Text" or name == "Heading" or name == "Button" or name == "TextInput" or name == "Image" or name == "List" or name == "Banner" or name == "CameraButton" or name == "Spacer"
+}
+
+fn is_component(name: Text) -> Bool {
+    return is_layout_component(name) or is_leaf_component(name)
+}
+
+fn all_components_text() -> Text {
+    return "Banner, Button, CameraButton, Column, Heading, Image, List, Row, Spacer, Text, TextInput"
+}
+
+// ---------------- type helpers ----------------
+
+fn tname(te: [Node]) -> Text {
+    if len(te) == 0 {
+        return "unknown"
+    }
+    let t = te[0]
+    var s = t.name
+    if t.is_list {
+        s = "[" + s + "]"
+    } else {
+        if t.is_map {
+            s = "Map<" + tname(t.map_key) + ", " + tname(t.map_val) + ">"
+        }
+    }
+    if t.optional {
+        s = s + "?"
+    }
+    return s
+}
+
+fn known_type(cx: Cx, te: [Node]) -> Bool {
+    if len(te) == 0 {
+        return false
+    }
+    let t = te[0]
+    if t.is_map {
+        if len(t.map_key) == 0 or len(t.map_val) == 0 {
+            return false
+        }
+        let k = t.map_key[0]
+        if k.name != "Text" and k.name != "Int" {
+            return false
+        }
+        if k.is_list or k.is_map {
+            return false
+        }
+        return known_type(cx, t.map_val)
+    }
+    let base = t.name
+    if is_primitive(base) or is_media(base) or is_special(base) {
+        return true
+    }
+    return tab_has(cx.types, base)
+}
+
+fn assignable(want: Text, got: Text) -> Bool {
+    if want == got {
+        return true
+    }
+    if want == "Float" and got == "Int" {
+        return true
+    }
+    if str.starts_with(want, "") and len(want) > 0 and want[len(want) - 1] == "?" {
+        let base = str.slice(want, 0, len(want) - 1)
+        if got == "nil" {
+            return true
+        }
+        if got == base {
+            return true
+        }
+    }
+    if got == "[unknown]" and str.starts_with(want, "[") and len(want) > 0 and want[len(want) - 1] == "]" {
+        return true
+    }
+    return false
+}
+
+fn map_val_type(map_t: Text) -> Text {
+    // "Map<K, V>" -> V (single-level; nested maps stay opaque)
+    if str.starts_with(map_t, "Map<") and len(map_t) > 0 and map_t[len(map_t) - 1] == ">" {
+        let inner = str.slice(map_t, 4, len(map_t) - 1)
+        var depth = 0
+        var i = 0
+        while i < len(inner) {
+            let ch = inner[i]
+            if ch == "<" {
+                depth = depth + 1
+            } else {
+                if ch == ">" {
+                    depth = depth - 1
+                } else {
+                    if ch == "," and depth == 0 {
+                        return str.trim(str.slice(inner, i + 1, len(inner)))
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    return ""
+}
+
+// ---------------- entry point ----------------
+
+fn check(prog: Node) -> [Diag] {
+    var cx = make_cx()
+    cx = collect(cx, prog)
+    var scope: [ScopeEntry] = []
+    var i = 0
+    while i < len(prog.items) {
+        cx = check_item(cx, prog.items[i], scope)
+        i = i + 1
+    }
+    return cx.errors
+}
+
+fn collect(cx: Cx, prog: Node) -> Cx {
+    var c = cx
+    var i = 0
+    while i < len(prog.items) {
+        let item = prog.items[i]
+        if item.node == "AppDecl" {
+            if c.app_seen {
+                c = cx_err(c, "E210", "duplicate 'app' block", item.line, item.col)
+            }
+            c.app_seen = true
+        } else {
+            if item.node == "ProviderDecl" {
+                c = dup_put(c, "provider", item)
+            } else {
+                if item.node == "ModelsDecl" {
+                    var j = 0
+                    while j < len(item.triples) {
+                        let tr = item.triples[j]
+                        if alias_find(c, tr.a) >= 0 {
+                            c = cx_err(c, "E210", "duplicate model alias '" + tr.a + "'", item.line, item.col)
+                        } else {
+                            c.alias_names = c.alias_names + [tr.a]
+                            c.alias_provs = c.alias_provs + [tr.b]
+                            c.alias_mids = c.alias_mids + [tr.c]
+                        }
+                        j = j + 1
+                    }
+                } else {
+                    if item.node == "TypeDecl" {
+                        c = dup_put(c, "type", item)
+                    } else {
+                        if item.node == "ModelDecl" {
+                            c = dup_put(c, "model", item)
+                        } else {
+                            if item.node == "ScreenDecl" {
+                                c = dup_put(c, "screen", item)
+                            } else {
+                                if item.node == "EvalDecl" {
+                                    c = dup_put(c, "eval", item)
+                                } else {
+                                    if item.node == "FnDecl" {
+                                        c = dup_put(c, "function", item)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// duplicate-checked table insert (always E210; E110 needs file_of which
+// the single-file pipeline never provides)
+fn dup_put(cx: Cx, kind: Text, item: Node) -> Cx {
+    var c = cx
+    let name = item.name
+    var tab = c.types
+    if kind == "provider" {
+        tab = c.providers
+    } else {
+        if kind == "model" {
+            tab = c.models
+        } else {
+            if kind == "screen" {
+                tab = c.screens
+            } else {
+                if kind == "eval" {
+                    tab = c.evals
+                } else {
+                    if kind == "function" {
+                        tab = c.fns
+                    }
+                }
+            }
+        }
+    }
+    if tab_has(tab, name) {
+        c = cx_err(c, "E210", "duplicate " + kind + " '" + name + "'", item.line, item.col)
+    }
+    tab = tab_put(tab, name, item)
+    if kind == "provider" {
+        c.providers = tab
+    } else {
+        if kind == "model" {
+            c.models = tab
+        } else {
+            if kind == "screen" {
+                c.screens = tab
+            } else {
+                if kind == "eval" {
+                    c.evals = tab
+                } else {
+                    if kind == "function" {
+                        c.fns = tab
+                    } else {
+                        c.types = tab
+                    }
+                }
+            }
+        }
+    }
+    return c
+}
+
+// ---------------- items ----------------
+
+fn check_item(cx: Cx, item: Node, scope: [ScopeEntry]) -> Cx {
+    var c = cx
+    if item.node == "ModelDecl" {
+        c = check_model(c, item)
+    } else {
+        if item.node == "ScreenDecl" {
+            c = check_screen(c, item)
+        } else {
+            if item.node == "EvalDecl" {
+                c = check_eval(c, item)
+            } else {
+                if item.node == "FnDecl" {
+                    c = check_fn(c, item)
+                } else {
+                    if item.node == "AppDecl" or item.node == "ProviderDecl" or item.node == "ModelsDecl" or item.node == "TypeDecl" or item.node == "ImportDecl" {
+                        // nothing to check
+                    } else {
+                        var blk: [Node] = [] + [item]
+                        let r = check_block(c, blk, scope, [], false)
+                        c = r.cx
+                    }
+                }
+            }
+        }
+    }
+    return c
+}
+
+// block result: updated cx
+type BlkRes {
+    cx: Cx
+}
+
+fn make_blkres(cx: Cx) -> BlkRes {
+    let r: BlkRes = { cx: cx }
+    return r
+}
+
+fn check_fn(cx: Cx, fn: Node) -> Cx {
+    var c = cx
+    var seen: [Text] = []
+    var scope: [ScopeEntry] = []
+    var i = 0
+    while i < len(fn.pairs) {
+        let p = fn.pairs[i]
+        var dup = false
+        var j = 0
+        while j < len(seen) {
+            if seen[j] == p.name {
+                dup = true
+            }
+            j = j + 1
+        }
+        if dup {
+            c = cx_err(c, "E210", "duplicate parameter '" + p.name + "'", p.value.line, p.value.col)
+        }
+        seen = seen + [p.name]
+        if not known_type(c, [] + [p.value]) {
+            c = cx_err(c, "E208", "unknown type '" + tname([] + [p.value]) + "'", p.value.line, p.value.col)
+        }
+        scope = scope + [make_scope_entry(p.name, tname([] + [p.value]), false)]
+        i = i + 1
+    }
+    var ret_name = "Void"
+    var has_ret = false
+    if len(fn.ret) > 0 {
+        has_ret = true
+        ret_name = tname(fn.ret)
+        if not known_type(c, fn.ret) {
+            c = cx_err(c, "E208", "unknown type '" + tname(fn.ret) + "'", fn.ret[0].line, fn.ret[0].col)
+        }
+    }
+    let br = check_block_sc(c, fn.items, scope, [] + [ret_name])
+    c = br.cx
+    if ret_name != "Void" and not block_returns(fn.items) {
+        c = cx_err(c, "E211", "function '" + fn.name + "' may exit without returning " + ret_name, fn.line, fn.col)
+    }
+    return c
+}
+
+fn block_returns(stmts: [Node]) -> Bool {
+    var i = 0
+    while i < len(stmts) {
+        let s = stmts[i]
+        if s.node == "ReturnStmt" {
+            return true
+        }
+        if s.node == "IfStmt" and len(s.items2) > 0 {
+            if block_returns(s.items) and block_returns(s.items2) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn check_model(cx: Cx, m: Node) -> Cx {
+    var c = cx
+    if not tab_has(c.providers, m.prov) {
+        c = cx_err(c, "E209", "unknown provider '" + m.prov + "'", m.line, m.col)
+    } else {
+        // on-device model_file validation needs Python-only loading;
+        // skipped in the self-hosted checker.
+        if m.prov != "mock" and m.prov != "openai" and m.prov != "gemini" {
+            let pv = tab_get(c.providers, m.prov)
+            if len(pv) > 0 and pv[0].model_file == "" {
+                c = cx_err(c, "E209", "unknown provider kind '" + m.prov + "'", m.line, m.col)
+            }
+        }
+    }
+    let ai = alias_find(c, m.alias)
+    if ai < 0 {
+        c = cx_err(c, "E209", "unknown model alias '" + m.alias + "'", m.line, m.col)
+    } else {
+        if c.alias_provs[ai] != m.prov {
+            c = cx_err(c, "E209", "alias '" + m.alias + "' belongs to provider '" + c.alias_provs[ai] + "', not '" + m.prov + "'", m.line, m.col)
+        }
+    }
+    if not known_type(c, m.ret) {
+        c = cx_err(c, "E208", "unknown return type '" + tname(m.ret) + "'", m.line, m.col)
+    }
+    var scope: [ScopeEntry] = []
+    var i = 0
+    while i < len(m.pairs) {
+        let p = m.pairs[i]
+        if not known_type(c, [] + [p.value]) {
+            c = cx_err(c, "E208", "unknown type '" + tname([] + [p.value]) + "'", p.value.line, p.value.col)
+        }
+        scope = scope + [make_scope_entry(p.name, tname([] + [p.value]), false)]
+        i = i + 1
+    }
+    // prompt interpolations may only reference params
+    var k = 0
+    while k < len(m.items) {
+        let part = m.items[k]
+        if part.node != "StrPart" {
+            let ir = infer(c, part, scope)
+            c = ir.cx
+        }
+        k = k + 1
+    }
+    return c
+}
+
+fn check_screen(cx: Cx, s: Node) -> Cx {
+    var c = cx
+    var scope: [ScopeEntry] = []
+    var i = 0
+    while i < len(s.pairs) {
+        let p = s.pairs[i]
+        if not known_type(c, [] + [p.value]) {
+            c = cx_err(c, "E208", "unknown type '" + tname([] + [p.value]) + "'", p.value.line, p.value.col)
+        }
+        scope = scope + [make_scope_entry(p.name, tname([] + [p.value]), false)]
+        i = i + 1
+    }
+    // id tracking: seen ids + id kinds; bindings excluded in_for
+    var seen_ids: [Text] = []
+    c.has_idk = true
+    c.idk_names = []
+    c.idk_kinds = []
+    var j = 0
+    while j < len(s.items) {
+        let r = check_screen_item(c, s.items[j], scope, seen_ids, false)
+        c = r.cx
+        seen_ids = r.seen_ids
+        j = j + 1
+    }
+    c.has_idk = false
+    c.idk_names = []
+    c.idk_kinds = []
+    return c
+}
+
+type ScrRes {
+    cx: Cx,
+    seen_ids: [Text]
+}
+
+fn make_scrres(cx: Cx, seen_ids: [Text]) -> ScrRes {
+    let r: ScrRes = { cx: cx, seen_ids: seen_ids }
+    return r
+}
+
+fn check_screen_item(cx: Cx, item: Node, scope: [ScopeEntry], seen_ids: [Text], in_for: Bool) -> ScrRes {
+    var c = cx
+    var seen = seen_ids
+    if item.node == "Component" {
+        let r = check_component(c, item, scope, seen, in_for)
+        c = r.cx
+        seen = r.seen_ids
+    } else {
+        if item.node == "ScreenIf" {
+            let ir = infer(c, item.cond[0], scope)
+            c = ir.cx
+            var j = 0
+            while j < len(item.items) {
+                let r = check_screen_item(c, item.items[j], scope, seen, in_for)
+                c = r.cx
+                seen = r.seen_ids
+                j = j + 1
+            }
+            var k = 0
+            while k < len(item.items2) {
+                let r2 = check_screen_item(c, item.items2[k], scope, seen, in_for)
+                c = r2.cx
+                seen = r2.seen_ids
+                k = k + 1
+            }
+        } else {
+            if item.node == "ScreenFor" {
+                let ir2 = infer(c, item.iter[0], scope)
+                c = ir2.cx
+                var inner = scope + [make_scope_entry(item.name, "unknown", false)]
+                var j2 = 0
+                while j2 < len(item.items) {
+                    let r3 = check_screen_item(c, item.items[j2], inner, seen, true)
+                    c = r3.cx
+                    seen = r3.seen_ids
+                    j2 = j2 + 1
+                }
+            }
+        }
+    }
+    return make_scrres(c, seen)
+}
+
+fn check_component(cx: Cx, comp: Node, scope: [ScopeEntry], seen_ids: [Text], in_for: Bool) -> ScrRes {
+    var c = cx
+    var seen = seen_ids
+    if not is_component(comp.name) {
+        c = cx_err(c, "E206", "unknown component '" + comp.name + "'", comp.line, comp.col)
+        return make_scrres(c, seen)
+    }
+    if is_leaf_component(comp.name) and len(comp.items) > 0 {
+        c = cx_err(c, "E206", "component '" + comp.name + "' cannot have children", comp.line, comp.col)
+    }
+    var i = 0
+    while i < len(comp.pairs) {
+        let a = comp.pairs[i]
+        if a.name == "id" {
+            if a.value.node != "Ident" {
+                c = cx_err(c, "E206", "'id:' needs a plain name", a.value.line, a.value.col)
+            } else {
+                var dup = false
+                var j = 0
+                while j < len(seen) {
+                    if seen[j] == a.value.name {
+                        dup = true
+                    }
+                    j = j + 1
+                }
+                if dup {
+                    c = cx_err(c, "E207", "duplicate component id '" + a.value.name + "'", a.value.line, a.value.col)
+                } else {
+                    seen = seen + [a.value.name]
+                    c.idk_names = c.idk_names + [a.value.name]
+                    c.idk_kinds = c.idk_kinds + [comp.name]
+                }
+            }
+        } else {
+            let ir = infer(c, a.value, scope)
+            c = ir.cx
+            if a.value.node == "Lambda" {
+                c = check_handler_body(c, a.value, scope)
+            }
+        }
+        i = i + 1
+    }
+    var k = 0
+    while k < len(comp.items) {
+        let r = check_screen_item(c, comp.items[k], scope, seen, in_for)
+        c = r.cx
+        seen = r.seen_ids
+        k = k + 1
+    }
+    return make_scrres(c, seen)
+}
+
+fn check_handler_body(cx: Cx, lam: Node, scope: [ScopeEntry]) -> Cx {
+    var c = cx
+    if len(lam.slist) > 1 {
+        c = cx_err(c, "E206", "event handler takes at most 1 param (the event), got " + str(len(lam.slist)), lam.line, lam.col)
+        return c
+    }
+    var hscope = scope
+    var i = 0
+    while i < len(lam.slist) {
+        hscope = hscope + [make_scope_entry(lam.slist[i], "unknown", false)]
+        i = i + 1
+    }
+    // _cur_id_kinds is already set (we are inside check_screen)
+    if len(lam.expr_body) > 0 {
+        let ir = infer(c, lam.expr_body[0], hscope)
+        c = ir.cx
+    } else {
+        let br = check_block(c, lam.items, hscope, [], false)
+        c = br.cx
+    }
+    return c
+}
+
+fn check_eval(cx: Cx, e: Node) -> Cx {
+    var c = cx
+    let mv = tab_get(c.models, e.model_name)
+    if len(mv) == 0 {
+        c = cx_err(c, "E101", "unknown model '" + e.model_name + "'", e.line, e.col)
+        return c
+    }
+    let m = mv[0]
+    var params: [Text] = []
+    var given_keys: [Text] = []
+    var scope: [ScopeEntry] = []
+    var i = 0
+    while i < len(m.pairs) {
+        params = params + [m.pairs[i].name]
+        scope = scope + [make_scope_entry(m.pairs[i].name, tname([] + [m.pairs[i].value]), false)]
+        i = i + 1
+    }
+    var j = 0
+    while j < len(e.pairs) {
+        given_keys = given_keys + [e.pairs[j].name]
+        j = j + 1
+    }
+    if not text_list_eq_sorted(given_keys, params) {
+        c = cx_err(c, "E203", "eval 'given' keys " + text_list_str(given_keys) + " do not match model params " + text_list_str(params), e.line, e.col)
+    }
+    var k = 0
+    while k < len(e.pairs) {
+        let ir = infer(c, e.pairs[k].value, scope)
+        c = ir.cx
+        k = k + 1
+    }
+    var escope = scope + [make_scope_entry("result", tname(m.ret), false)]
+    let er = infer(c, e.expected[0], escope)
+    c = er.cx
+    if er.t != "Bool" {
+        c = cx_err(c, "E204", "'expect' must be a Bool expression", e.expected[0].line, e.expected[0].col)
+    }
+    return c
+}
+
+fn text_list_eq_sorted(a: [Text], b: [Text]) -> Bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var sa = sort_texts(a)
+    var sb = sort_texts(b)
+    var i = 0
+    while i < len(sa) {
+        if sa[i] != sb[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn sort_texts(xs: [Text]) -> [Text] {
+    var arr = xs
+    var i = 0
+    while i < len(arr) {
+        var j = i + 1
+        while j < len(arr) {
+            if arr[j] < arr[i] {
+                let tmp = arr[i]
+                arr[i] = arr[j]
+                arr[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return arr
+}
+
+fn text_list_str(xs: [Text]) -> Text {
+    var s = "["
+    var i = 0
+    while i < len(xs) {
+        if i > 0 {
+            s = s + ", "
+        }
+        s = s + "'" + xs[i] + "'"
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// ---------------- statements ----------------
+
+// fn_ret: [Text] — 0 elements = not in a function, else [return type name]
+fn check_block(cx: Cx, stmts: [Node], scope: [ScopeEntry], fn_ret: [Text]) -> BlkRes {
+    var c = cx
+    var sc = scope
+    var i = 0
+    while i < len(stmts) {
+        let r = check_stmt(c, stmts[i], sc, fn_ret)
+        c = r.cx
+        sc = r.scope
+        i = i + 1
+    }
+    return make_blkres2(c, sc)
+}
+
+type StmtRes {
+    cx: Cx,
+    scope: [ScopeEntry]
+}
+
+type BoolRes {
+    cx: Cx,
+    ok: Bool
+}
+
+fn make_boolres(cx: Cx, ok: Bool) -> BoolRes {
+    let r: BoolRes = { cx: cx, ok: ok }
+    return r
+}
+
+fn make_blkres2(cx: Cx, scope: [ScopeEntry]) -> BlkRes {
+    // check_block returns BlkRes; scope is threaded via StmtRes inside
+    let r: BlkRes = { cx: cx }
+    return r
+}
+
+fn make_stmtres(cx: Cx, scope: [ScopeEntry]) -> StmtRes {
+    let r: StmtRes = { cx: cx, scope: scope }
+    return r
+}
+
+// check_block needs scope threading: wrap it
+fn check_block_sc(cx: Cx, stmts: [Node], scope: [ScopeEntry], fn_ret: [Text]) -> StmtRes {
+    var c = cx
+    var sc = scope
+    var i = 0
+    while i < len(stmts) {
+        let r = check_stmt(c, stmts[i], sc, fn_ret)
+        c = r.cx
+        sc = r.scope
+        i = i + 1
+    }
+    return make_stmtres(c, sc)
+}
+
+fn check_stmt(cx: Cx, s: Node, scope: [ScopeEntry], fn_ret: [Text]) -> StmtRes {
+    var c = cx
+    var sc = scope
+    if s.node == "LetStmt" {
+        let r = check_let(c, s, sc)
+        c = r.cx
+        sc = r.scope
+    } else {
+        if s.node == "AssignStmt" {
+            let r2 = check_assign(c, s, sc)
+            c = r2.cx
+        } else {
+            if s.node == "IfStmt" {
+                let ir = infer(c, s.cond[0], sc)
+                c = ir.cx
+                let t1 = check_block_sc(c, s.items, sc, fn_ret)
+                c = t1.cx
+                let t2 = check_block_sc(c, s.items2, sc, fn_ret)
+                c = t2.cx
+            } else {
+                if s.node == "ForStmt" {
+                    let ir2 = infer(c, s.iter[0], sc)
+                    c = ir2.cx
+                    var inner = sc + [make_scope_entry(s.name, "unknown", false)]
+                    let b = check_block_sc(c, s.items, inner, fn_ret)
+                    c = b.cx
+                } else {
+                    if s.node == "WhileStmt" {
+                        let ir3 = infer(c, s.cond[0], sc)
+                        c = ir3.cx
+                        let b2 = check_block_sc(c, s.items, sc, fn_ret)
+                        c = b2.cx
+                    } else {
+                        if s.node == "ReturnStmt" {
+                            c = check_return(c, s, sc, fn_ret)
+                        } else {
+                            if s.node == "TryStmt" {
+                                let b3 = check_block_sc(c, s.items, sc, fn_ret)
+                                c = b3.cx
+                                var inner2 = sc + [make_scope_entry(s.name, "Error", false)]
+                                let h = check_block_sc(c, s.items2, inner2, fn_ret)
+                                c = h.cx
+                            } else {
+                                if s.node == "ThrowStmt" {
+                                    let ev = is_error_value(c, s.value[0], sc)
+                                    c = ev.cx
+                                    if not ev.ok {
+                                        c = cx_err(c, "E212", "'throw' needs an Error ({{ code: Text, message: Text }})", s.line, s.col)
+                                    }
+                                } else {
+                                    if s.node == "OnStmt" {
+                                        let tr = infer(c, s.stm[0], sc)
+                                        c = tr.cx
+                                        if tr.t != "TokenStream" {
+                                            c = cx_err(c, "E205", "'on' needs a TokenStream, found " + tr.t, s.line, s.col)
+                                        }
+                                        if s.event != "token" {
+                                            c = cx_err(c, "E206", "unknown stream event '" + s.event + "'", s.line, s.col)
+                                        }
+                                    } else {
+                                        if s.node == "ExprStmt" {
+                                            let er = infer(c, s.value[0], sc)
+                                            c = er.cx
+                                        } else {
+                                            if s.node == "StreamDecl" {
+                                                c = check_stream_decl(c, s, sc)
+                                                sc = sc + [make_scope_entry(s.name, "TokenStream", false)]
+                                            } else {
+                                                c = cx_err(c, "E001", "cannot check " + s.node, s.line, s.col)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return make_stmtres(c, sc)
+}
+
+fn check_let(cx: Cx, s: Node, scope: [ScopeEntry]) -> StmtRes {
+    var c = cx
+    var sc = scope
+    if scope_has(sc, s.name) {
+        c = cx_err(c, "E210", "redefinition of '" + s.name + "'", s.line, s.col)
+    }
+    let ir = infer(c, s.value[0], sc)
+    c = ir.cx
+    var t = ir.t
+    if t == "Void" {
+        if s.value[0].node == "Call" {
+            c = cx_err(c, "E211", "cannot use Void result of '" + s.value[0].name + "' as a value", s.line, s.col)
+        } else {
+            c = cx_err(c, "E211", "cannot use a Void value here", s.line, s.col)
+        }
+        t = "unknown"
+    }
+    if len(s.ann) > 0 {
+        let want = tname(s.ann)
+        let ar = check_annotated(c, s.ann[0], s.value[0], sc)
+        c = ar.cx
+        if ar.ok {
+            t = want
+        } else {
+            if t != "unknown" and not assignable(want, t) {
+                c = cx_err(c, "E200", "cannot assign " + t + " to '" + s.name + ": " + want + "'", s.line, s.col)
+                t = want
+            } else {
+                t = want
+            }
+        }
+    }
+    sc = sc + [make_scope_entry(s.name, t, s.bval)]
+    return make_stmtres(c, sc)
+}
+
+fn check_assign(cx: Cx, s: Node, scope: [ScopeEntry]) -> StmtRes {
+    var c = cx
+    let tgt = s.target[0]
+    let name = assign_target_name(tgt)
+    if name == "" {
+        c = cx_err(c, "E201", "invalid assignment target", s.line, s.col)
+    } else {
+        let f = scope_find(scope, name)
+        if len(f) == 0 {
+            c = cx_err(c, "E101", "undefined name '" + name + "'", s.line, s.col)
+        } else {
+            if not f[0].mut {
+                c = cx_err(c, "E201", "cannot assign to immutable '" + name + "'", s.line, s.col)
+            }
+        }
+    }
+    let ir = infer(c, s.value[0], scope)
+    c = ir.cx
+    return make_stmtres(c, scope)
+}
+
+fn assign_target_name(tgt: Node) -> Text {
+    if tgt.node == "Ident" {
+        return tgt.name
+    }
+    if tgt.node == "Field" or tgt.node == "Index" {
+        if len(tgt.obj) > 0 {
+            return assign_target_name(tgt.obj[0])
+        }
+        return ""
+    }
+    return ""
+}
+
+fn check_return(cx: Cx, s: Node, scope: [ScopeEntry], fn_ret: [Text]) -> Cx {
+    var c = cx
+    if len(fn_ret) == 0 {
+        if len(s.value) > 0 {
+            let ir = infer(c, s.value[0], scope)
+            c = ir.cx
+        }
+    } else {
+        let want = fn_ret[0]
+        if len(s.value) == 0 {
+            if want != "Void" {
+                c = cx_err(c, "E211", "missing return value (function returns " + want + ")", s.line, s.col)
+            }
+        } else {
+            let ir2 = infer(c, s.value[0], scope)
+            c = ir2.cx
+            if want == "Void" {
+                c = cx_err(c, "E211", "cannot return a value from a Void function", s.line, s.col)
+            } else {
+                if ir2.t != "unknown" and not assignable(want, ir2.t) {
+                    c = cx_err(c, "E211", "return wants " + want + ", got " + ir2.t, s.line, s.col)
+                }
+            }
+        }
+    }
+    return c
+}
+
+fn check_stream_decl(cx: Cx, s: Node, scope: [ScopeEntry]) -> Cx {
+    var c = cx
+    if len(s.call) > 0 and s.call[0].node == "Call" and tab_has(c.models, s.call[0].name) {
+        c = check_model_call(c, s.call[0], scope)
+    } else {
+        c = cx_err(c, "E205", "'stream' must wrap a model call", s.line, s.col)
+    }
+    return c
+}
+
+// ---------------- annotated types & records ----------------
+
+// Returns ok=True when the annotation named a declared record type
+// (caller then skips the generic assignability check).
+fn check_annotated(cx: Cx, te: Node, value: Node, scope: [ScopeEntry]) -> BoolRes {
+    var c = cx
+    if te.is_map and te.name == "Map" {
+        let want_v = tname(te.map_val)
+        if value.node == "MapLit" {
+            if len(te.map_key) == 0 or te.map_key[0].name != "Text" {
+                var kname = "?"
+                if len(te.map_key) > 0 {
+                    kname = te.map_key[0].name
+                }
+                c = cx_err(c, "E202", "map literal keys are Text; annotation wants Map<" + kname + ", …>", value.line, value.col)
+                return make_boolres(c, true)
+            }
+            var i = 0
+            while i < len(value.pairs) {
+                let ir = infer(c, value.pairs[i].value, scope)
+                c = ir.cx
+                if ir.t != "unknown" and not assignable(want_v, ir.t) {
+                    c = cx_err(c, "E202", "map value wants " + want_v + ", got " + ir.t, value.pairs[i].value.line, value.pairs[i].value.col)
+                }
+                i = i + 1
+            }
+            return make_boolres(c, true)
+        }
+        if value.node == "RecordLit" and len(value.pairs) == 0 {
+            return make_boolres(c, true)
+        }
+        return make_boolres(c, false)
+    }
+    if not tab_has(c.types, te.name) {
+        return make_boolres(c, false)
+    }
+    if te.is_list and value.node == "ListLit" {
+        var i = 0
+        while i < len(value.items) {
+            let it = value.items[i]
+            if it.node == "RecordLit" {
+                c = check_record_fields(c, te.name, it, scope)
+            } else {
+                c = cx_err(c, "E202", "expected " + te.name + " record in list", it.line, it.col)
+            }
+            i = i + 1
+        }
+        return make_boolres(c, true)
+    }
+    if not te.is_list and value.node == "RecordLit" {
+        c = check_record_fields(c, te.name, value, scope)
+        return make_boolres(c, true)
+    }
+    return make_boolres(c, false)
+}
+
+fn check_record_fields(cx: Cx, type_name: Text, rec: Node, scope: [ScopeEntry]) -> Cx {
+    var c = cx
+    let tv = tab_get(c.types, type_name)
+    if len(tv) == 0 {
+        return c
+    }
+    let decl = tv[0]
+    var seen: [Text] = []
+    var i = 0
+    while i < len(rec.pairs) {
+        let fp = rec.pairs[i]
+        seen = seen + [fp.name]
+        let df = type_field_find(decl, fp.name)
+        if len(df) == 0 {
+            c = cx_err(c, "E202", "type '" + type_name + "' has no field '" + fp.name + "'", fp.value.line, fp.value.col)
+        } else {
+            let fte = df[0]
+            if fp.value.node == "RecordLit" and not fte.is_list and tab_has(c.types, fte.name) {
+                c = check_record_fields(c, fte.name, fp.value, scope)
+            } else {
+                if fp.value.node == "ListLit" and fte.is_list and tab_has(c.types, fte.name) {
+                    var j = 0
+                    while j < len(fp.value.items) {
+                        let it = fp.value.items[j]
+                        if it.node == "RecordLit" {
+                            c = check_record_fields(c, fte.name, it, scope)
+                        } else {
+                            c = cx_err(c, "E202", "field '" + fp.name + "' wants [" + fte.name + "] record", it.line, it.col)
+                        }
+                        j = j + 1
+                    }
+                } else {
+                    let ir = infer(c, fp.value, scope)
+                    c = ir.cx
+                    let want = tname([] + [fte])
+                    if ir.t != "unknown" and not assignable(want, ir.t) {
+                        c = cx_err(c, "E202", "field '" + fp.name + "' wants " + want + ", got " + ir.t, fp.value.line, fp.value.col)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // missing required fields
+    var k = 0
+    while k < len(decl.pairs) {
+        let df2 = decl.pairs[k]
+        var found = false
+        var m = 0
+        while m < len(seen) {
+            if seen[m] == df2.name {
+                found = true
+            }
+            m = m + 1
+        }
+        if not found and not df2.value.optional {
+            c = cx_err(c, "E202", "missing field '" + df2.name + "' for type '" + type_name + "'", rec.line, rec.col)
+        }
+        k = k + 1
+    }
+    return c
+}
+
+// find a field in a TypeDecl node; returns [TypeExpr Node]
+fn type_field_find(decl: Node, name: Text) -> [Node] {
+    var i = 0
+    while i < len(decl.pairs) {
+        if decl.pairs[i].name == name {
+            return [] + [decl.pairs[i].value]
+        }
+        i = i + 1
+    }
+    return []
+}
+
+fn is_error_value(cx: Cx, v: Node, scope: [ScopeEntry]) -> BoolRes {
+    let ir = infer(cx, v, scope)
+    let t = ir.t
+    var c = ir.cx
+    if t == "Error" {
+        return make_boolres(c, true)
+    }
+    if tab_has(c.types, t) {
+        let dv = tab_get(c.types, t)
+        if len(dv) > 0 {
+            let decl = dv[0]
+            if len(decl.pairs) == 2 {
+                var ok = true
+                var i = 0
+                while i < 2 {
+                    let fp = decl.pairs[i]
+                    let ft = tname([] + [fp.value])
+                    if fp.name == "code" and ft != "Text" {
+                        ok = false
+                    }
+                    if fp.name == "message" and ft != "Text" {
+                        ok = false
+                    }
+                    if fp.name != "code" and fp.name != "message" {
+                        ok = false
+                    }
+                    i = i + 1
+                }
+                if ok {
+                    return make_boolres(c, true)
+                }
+            }
+        }
+    }
+    if v.node == "RecordLit" {
+        if len(v.pairs) == 2 {
+            var ok2 = true
+            var j = 0
+            while j < 2 {
+                let fp2 = v.pairs[j]
+                let jr = infer(c, fp2.value, scope)
+                c = jr.cx
+                if fp2.name == "code" and jr.t != "Text" {
+                    ok2 = false
+                }
+                if fp2.name == "message" and jr.t != "Text" {
+                    ok2 = false
+                }
+                if fp2.name != "code" and fp2.name != "message" {
+                    ok2 = false
+                }
+                j = j + 1
+            }
+            if ok2 {
+                return make_boolres(c, true)
+            }
+        }
+    }
+    return make_boolres(c, false)
+}
+
+// ---------------- expressions ----------------
+
+fn infer(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
+    var c = cx
+    if e.node == "IntLit" {
+        return make_infres(c, "Int")
+    }
+    if e.node == "FloatLit" {
+        return make_infres(c, "Float")
+    }
+    if e.node == "StrLit" {
+        var i = 0
+        while i < len(e.items) {
+            let p = e.items[i]
+            if p.node != "StrPart" {
+                let pr = infer(c, p, scope)
+                c = pr.cx
+            }
+            i = i + 1
+        }
+        return make_infres(c, "Text")
+    }
+    if e.node == "StrPart" {
+        return make_infres(c, "Text")
+    }
+    if e.node == "BoolLit" {
+        return make_infres(c, "Bool")
+    }
+    if e.node == "NilLit" {
+        return make_infres(c, "nil")
+    }
+    if e.node == "DurationLit" {
+        return make_infres(c, "Int")
+    }
+    if e.node == "MoneyLit" {
+        return make_infres(c, "Float")
+    }
+    if e.node == "Ident" {
+        return infer_ident(c, e, scope)
+    }
+    if e.node == "Call" {
+        return infer_call(c, e, scope)
+    }
+    if e.node == "Field" {
+        return infer_field(c, e, scope)
+    }
+    if e.node == "Index" {
+        return infer_index(c, e, scope)
+    }
+    if e.node == "MapLit" {
+        var vts: [Text] = []
+        var i = 0
+        while i < len(e.pairs) {
+            let vr = infer(c, e.pairs[i].value, scope)
+            c = vr.cx
+            var seen = false
+            var j = 0
+            while j < len(vts) {
+                if vts[j] == vr.t {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if not seen {
+                vts = vts + [vr.t]
+            }
+            i = i + 1
+        }
+        var vt = "unknown"
+        if len(vts) == 1 {
+            vt = vts[0]
+        }
+        return make_infres(c, "Map<Text, " + vt + ">")
+    }
+    if e.node == "ListLit" {
+        var ts: [Text] = []
+        var i2 = 0
+        while i2 < len(e.items) {
+            let ir2 = infer(c, e.items[i2], scope)
+            c = ir2.cx
+            var seen2 = false
+            var j2 = 0
+            while j2 < len(ts) {
+                if ts[j2] == ir2.t {
+                    seen2 = true
+                }
+                j2 = j2 + 1
+            }
+            if not seen2 {
+                ts = ts + [ir2.t]
+            }
+            i2 = i2 + 1
+        }
+        var inner = "unknown"
+        if len(ts) == 1 {
+            inner = ts[0]
+        }
+        return make_infres(c, "[" + inner + "]")
+    }
+    if e.node == "RecordLit" {
+        var i3 = 0
+        while i3 < len(e.pairs) {
+            let fr = infer(c, e.pairs[i3].value, scope)
+            c = fr.cx
+            i3 = i3 + 1
+        }
+        return make_infres(c, "record")
+    }
+    if e.node == "Lambda" {
+        return make_infres(c, "lambda")
+    }
+    if e.node == "BinOp" {
+        let lr = infer(c, e.left[0], scope)
+        c = lr.cx
+        let rr = infer(c, e.right[0], scope)
+        c = rr.cx
+        let lt = lr.t
+        let rt = rr.t
+        if e.op == "and" or e.op == "or" {
+            return make_infres(c, "Bool")
+        }
+        if e.op == "==" or e.op == "!=" or e.op == "<" or e.op == "<=" or e.op == ">" or e.op == ">=" {
+            return make_infres(c, "Bool")
+        }
+        if e.op == "+" and (lt == "Text" or rt == "Text") {
+            return make_infres(c, "Text")
+        }
+        if (lt == "Int" or lt == "Float") and (rt == "Int" or rt == "Float") {
+            if lt == "Float" or rt == "Float" {
+                return make_infres(c, "Float")
+            }
+            return make_infres(c, "Int")
+        }
+        return make_infres(c, "unknown")
+    }
+    if e.node == "UnOp" {
+        let tr = infer(c, e.operand[0], scope)
+        c = tr.cx
+        if e.op == "not" {
+            return make_infres(c, "Bool")
+        }
+        return make_infres(c, tr.t)
+    }
+    if e.node == "Await" {
+        let ar = infer(c, e.operand[0], scope)
+        c = ar.cx
+        if ar.t != "TokenStream" {
+            c = cx_err(c, "E205", "'await' needs a TokenStream, found " + ar.t, e.line, e.col)
+        }
+        return make_infres(c, "unknown")
+    }
+    if e.node == "StreamDecl" {
+        return make_infres(c, "TokenStream")
+    }
+    c = cx_err(c, "E001", "cannot infer " + e.node, e.line, e.col)
+    return make_infres(c, "unknown")
+}
+
+fn infer_ident(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
+    var c = cx
+    if c.has_idk and idk_find(c, e.name) >= 0 {
+        c = cx_err(c, "E201", "component id '" + e.name + "' cannot be used as a value (use '" + e.name + ".text' to read a TextInput)", e.line, e.col)
+        return make_infres(c, "unknown")
+    }
+    let f = scope_find(scope, e.name)
+    if len(f) == 0 {
+        if tab_has(c.models, e.name) or tab_has(c.screens, e.name) {
+            return make_infres(c, "unknown")
+        }
+        c = cx_err(c, "E101", "undefined name '" + e.name + "'", e.line, e.col)
+        return make_infres(c, "unknown")
+    }
+    return make_infres(c, f[0].t)
+}
+
+fn infer_field(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
+    var c = cx
+    // <id>.text readback inside handler bodies
+    if len(e.obj) > 0 and e.obj[0].node == "Ident" and c.has_idk {
+        let ii = idk_find(c, e.obj[0].name)
+        if ii >= 0 {
+            let kind = c.idk_kinds[ii]
+            if e.name == "text" and kind == "TextInput" {
+                return make_infres(c, "Text")
+            }
+            c = cx_err(c, "E101", "component id '" + e.obj[0].name + "' (" + kind + ") has no readable field '." + e.name + "' (only TextInput.text is supported)", e.line, e.col)
+            return make_infres(c, "unknown")
+        }
+    }
+    // Error.code / Error.message on a name typed Error
+    if len(e.obj) > 0 and e.obj[0].node == "Ident" {
+        let f = scope_find(scope, e.obj[0].name)
+        if len(f) > 0 and f[0].t == "Error" and (e.name == "code" or e.name == "message") {
+            return make_infres(c, "Text")
+        }
+    }
+    let or_ = infer(c, e.obj[0], scope)
+    c = or_.cx
+    let ot = or_.t
+    if ot == "Error" and (e.name == "code" or e.name == "message") {
+        return make_infres(c, "Text")
+    }
+    if tab_has(c.types, ot) {
+        let dv = tab_get(c.types, ot)
+        if len(dv) > 0 {
+            let ff = type_field_find(dv[0], e.name)
+            if len(ff) > 0 {
+                return make_infres(c, tname(ff))
+            }
+            c = cx_err(c, "E101", "type '" + ot + "' has no field '" + e.name + "'", e.line, e.col)
+        }
+    }
+    return make_infres(c, "unknown")
+}
+
+fn infer_index(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
+    var c = cx
+    let or_ = infer(c, e.obj[0], scope)
+    c = or_.cx
+    let ir = infer(c, e.idx[0], scope)
+    c = ir.cx
+    let ot = or_.t
+    if len(ot) >= 2 and ot[0] == "[" and ot[len(ot) - 1] == "]" {
+        return make_infres(c, str.slice(ot, 1, len(ot) - 1))
+    }
+    if str.starts_with(ot, "Map<") {
+        let vt = map_val_type(ot)
+        if vt != "" {
+            return make_infres(c, vt)
+        }
+    }
+    return make_infres(c, "unknown")
+}
+
+fn infer_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> InfRes {
+    var c = cx
+    var arg_ts: [Text] = []
+    var i = 0
+    while i < len(e.items) {
+        let ar = infer(c, e.items[i], scope)
+        c = ar.cx
+        arg_ts = arg_ts + [ar.t]
+        i = i + 1
+    }
+    if tab_has(c.models, e.name) {
+        c = check_model_call(c, e, scope)
+        let mv = tab_get(c.models, e.name)
+        return make_infres(c, tname(mv[0].ret))
+    }
+    if tab_has(c.screens, e.name) {
+        let sv = tab_get(c.screens, e.name)
+        let want = len(sv[0].pairs)
+        if len(e.items) != want {
+            c = cx_err(c, "E102", "screen '" + e.name + "' takes " + str(want) + " args, got " + str(len(e.items)), e.line, e.col)
+        }
+        return make_infres(c, "screen")
+    }
+    if tab_has(c.fns, e.name) {
+        let fv = tab_get(c.fns, e.name)
+        let fn = fv[0]
+        let want2 = len(fn.pairs)
+        if len(e.items) != want2 {
+            c = cx_err(c, "E102", "function '" + e.name + "' takes " + str(want2) + " args, got " + str(len(e.items)), e.line, e.col)
+        } else {
+            var j = 0
+            while j < want2 {
+                let want_t = tname([] + [fn.pairs[j].value])
+                let at = arg_ts[j]
+                if at != "unknown" and not assignable(want_t, at) {
+                    c = cx_err(c, "E211", "argument '" + fn.pairs[j].name + "' wants " + want_t + ", got " + at, e.items[j].line, e.items[j].col)
+                }
+                j = j + 1
+            }
+        }
+        if len(fn.ret) > 0 {
+            return make_infres(c, tname(fn.ret))
+        }
+        return make_infres(c, "Void")
+    }
+    if is_ns_builtin(e.name) {
+        let params = ns_builtin_params(e.name)
+        let ret = ns_builtin_ret(e.name)
+        if len(e.items) != len(params) {
+            c = cx_err(c, "E102", "'" + e.name + "' takes " + str(len(params)) + " args, got " + str(len(e.items)), e.line, e.col)
+        } else {
+            var k = 0
+            while k < len(params) {
+                let want_t2 = params[k]
+                let at2 = arg_ts[k]
+                if at2 != "unknown" and not assignable(want_t2, at2) {
+                    c = cx_err(c, "E211", "'" + e.name + "' wants " + want_t2 + ", got " + at2, e.items[k].line, e.items[k].col)
+                }
+                k = k + 1
+            }
+        }
+        return make_infres(c, ret)
+    }
+    if is_builtin(e.name) {
+        if not builtin_arity_ok(e.name, len(e.items)) {
+            c = cx_err(c, "E102", "'" + e.name + "' takes " + builtin_arity_text(e.name) + " args, got " + str(len(e.items)), e.line, e.col)
+        }
+        return make_infres(c, builtin_ret(e.name))
+    }
+    if is_media(e.name) {
+        if len(e.items) != 1 {
+            c = cx_err(c, "E102", e.name + "(path) takes 1 arg, got " + str(len(e.items)), e.line, e.col)
+        }
+        return make_infres(c, e.name)
+    }
+    if tab_has(c.types, e.name) {
+        c = cx_err(c, "E101", "type '" + e.name + "' is not callable (media types excepted)", e.line, e.col)
+        return make_infres(c, "unknown")
+    }
+    c = cx_err(c, "E101", "undefined function '" + e.name + "'", e.line, e.col)
+    return make_infres(c, "unknown")
+}
+
+fn check_model_call(cx: Cx, e: Node, scope: [ScopeEntry]) -> Cx {
+    var c = cx
+    let mv = tab_get(c.models, e.name)
+    if len(mv) == 0 {
+        return c
+    }
+    let want = len(mv[0].pairs)
+    if len(e.items) != want {
+        c = cx_err(c, "E102", "model '" + e.name + "' takes " + str(want) + " args, got " + str(len(e.items)), e.line, e.col)
+    }
+    return c
+}
