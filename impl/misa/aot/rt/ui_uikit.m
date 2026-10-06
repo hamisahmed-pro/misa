@@ -59,10 +59,14 @@ typedef struct {
 } UIKitWidgetMeta;
 
 struct MisaUI {
-    __unsafe_unretained NSMutableArray *views; /* 1-based UIView*/;
+    /* __strong (not unsafe_unretained): the driver owns these for the
+     * life of the process. An unretained pointer here lets ARC free the
+     * array at the end of misa_ui_create, leaving a dangling pointer
+     * that hangs/crashes on the next use. */
+    __strong NSMutableArray *views; /* 1-based UIView*/;
     UIKitWidgetMeta *meta;      /* parallel, 1-based */
     int32_t          nw, wcap;  /* nw = highest handle in use */
-    __unsafe_unretained UIView *rootView; /* set by misa_ui_set_root_view */
+    __strong UIView *rootView; /* set by misa_ui_set_root_view */
     /* shim call-stack (misa_screen_* layer) */
     MisaWidget *stack;
     int32_t     ssp, scap;
