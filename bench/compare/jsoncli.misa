@@ -1,0 +1,4 @@
+// jsoncli: read a JSON object from /tmp/input.json, print name and age.
+let text = fs.read("/tmp/input.json")
+let p = json.parse(text)
+print("{p.name} is {p.age}")
