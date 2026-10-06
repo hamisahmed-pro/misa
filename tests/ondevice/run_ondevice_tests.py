@@ -372,7 +372,7 @@ def _():
         [sys.executable, os.path.join(ROOT, "tests", "run_tests.py")],
         capture_output=True, text=True, cwd=ROOT, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "74 passed" in r.stdout, r.stdout
+    assert "94 passed" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":

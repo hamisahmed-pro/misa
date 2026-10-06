@@ -294,7 +294,12 @@ class Checker:
                     if not in_for:
                         bindings.append((val.name, c.name))
             else:
-                self._infer(val, scope)
+                # Phase 5a: handler lambdas are checked by
+                # _check_handler_body below (with the id: scope); running
+                # them through _infer first would check the body without
+                # _cur_id_kinds and spuriously fail on `<id>.text`.
+                if not isinstance(val, ast.Lambda):
+                    self._infer(val, scope)
                 # Phase 4 (M4): event-handler bodies are real compiled
                 # functions now, so check them with the handler scope:
                 # lambda params + screen id: bindings. Closures over
@@ -315,7 +320,7 @@ class Checker:
                        lam.line, lam.col)
             return
         hscope = dict(scope)
-        for pn in lam.params:
+        for pn, _ in lam.params:
             hscope[pn] = ("unknown", False)
         prev = self._cur_id_kinds
         self._cur_id_kinds = id_kinds
@@ -350,16 +355,21 @@ class Checker:
 
     # -- statements -----------------------------------------------------
 
-    def _check_block(self, stmts: list, scope: dict, fn_ret=None):
+    def _check_block(self, stmts: list, scope: dict, fn_ret=None,
+                     _ret_collect=None):
         for s in stmts:
-            self._check_stmt(s, scope, fn_ret)
+            self._check_stmt(s, scope, fn_ret, _ret_collect)
 
-    def _check_stmt(self, s: ast.Node, scope: dict, fn_ret=None):
+    def _check_stmt(self, s: ast.Node, scope: dict, fn_ret=None,
+                    _ret_collect=None):
         if isinstance(s, ast.LetStmt):
             if s.name in scope:
                 self.error("E210", f"redefinition of '{s.name}'",
                            s.line, s.col)
-            t = self._infer(s.value, scope)
+            # Phase 5a: an annotated lambda gets the annotation as its
+            # expected type (untyped params infer from it).
+            exp = self._tname(s.ann) if s.ann else None
+            t = self._infer(s.value, scope, expected=exp)
             if t == "Void":
                 self.error("E211",
                            f"cannot use Void result of '{s.value.name}' "
@@ -394,27 +404,35 @@ class Checker:
             self._infer(s.value, scope)
         elif isinstance(s, ast.IfStmt):
             self._infer(s.cond, scope)
-            self._check_block(s.then, dict(scope), fn_ret)
-            self._check_block(s.els, dict(scope), fn_ret)
+            self._check_block(s.then, dict(scope), fn_ret,
+                                 _ret_collect=_ret_collect)
+            self._check_block(s.els, dict(scope), fn_ret,
+                               _ret_collect=_ret_collect)
         elif isinstance(s, ast.ForStmt):
             self._infer(s.iter, scope)
             inner = dict(scope)
             inner[s.var] = ("unknown", False)
-            self._check_block(s.body, inner, fn_ret)
+            self._check_block(s.body, inner, fn_ret,
+                              _ret_collect=_ret_collect)
         elif isinstance(s, ast.WhileStmt):
             self._infer(s.cond, scope)
-            self._check_block(s.body, dict(scope), fn_ret)
+            self._check_block(s.body, dict(scope), fn_ret,
+                                   _ret_collect=_ret_collect)
         elif isinstance(s, ast.ReturnStmt):
             if fn_ret is None:
                 if s.value is not None:
-                    self._infer(s.value, scope)
+                    t = self._infer(s.value, scope)
+                    if _ret_collect is not None:
+                        _ret_collect.append(t)
             elif s.value is None:
                 if fn_ret != "Void":
                     self.error("E211", "missing return value "
                                f"(function returns {fn_ret})",
                                s.line, s.col)
             else:
-                t = self._infer(s.value, scope)
+                # Phase 5a: a returned lambda infers untyped params
+                # from the function's declared return type.
+                t = self._infer(s.value, scope, expected=fn_ret)
                 if fn_ret == "Void":
                     self.error("E211", "cannot return a value from "
                                "a Void function", s.line, s.col)
@@ -423,10 +441,12 @@ class Checker:
                                f"return wants {fn_ret}, got {t}",
                                s.line, s.col)
         elif isinstance(s, ast.TryStmt):
-            self._check_block(s.body, dict(scope), fn_ret)
+            self._check_block(s.body, dict(scope), fn_ret,
+                                   _ret_collect=_ret_collect)
             inner = dict(scope)
             inner[s.catch_var] = ("Error", False)
-            self._check_block(s.handler, inner, fn_ret)
+            self._check_block(s.handler, inner, fn_ret,
+                              _ret_collect=_ret_collect)
         elif isinstance(s, ast.ThrowStmt):
             if not self._is_error_value(s.value, scope):
                 self.error("E212", "'throw' needs an Error "
@@ -580,7 +600,8 @@ class Checker:
 
     # -- expressions ----------------------------------------------------
 
-    def _infer(self, e: ast.Node, scope: dict) -> str:
+    def _infer(self, e: ast.Node, scope: dict,
+               expected: Optional[str] = None) -> str:
         if isinstance(e, ast.IntLit):
             return "Int"
         if isinstance(e, ast.FloatLit):
@@ -611,6 +632,21 @@ class Checker:
                            e.line, e.col)
                 return "unknown"
             if e.name not in scope:
+                # Phase 5a: an `fn` decl used as a value has its
+                # function type `(params) -> ret`.
+                if e.name in self.fns:
+                    fn = self.fns[e.name]
+                    ps = ", ".join(self._tname(te)
+                                   for _, te in fn.params)
+                    r = self._tname(fn.ret) if fn.ret else "Void"
+                    return f"({ps}) -> {r}"
+                # Phase 5a: builtins are not values.
+                if e.name in BUILTINS or e.name in NS_BUILTINS:
+                    self.error("E214",
+                               f"'{e.name}' is a builtin and cannot be "
+                               f"used as a value",
+                               e.line, e.col)
+                    return "unknown"
                 # maybe a model/screen/type used as value?
                 if e.name in self.models or e.name in self.screens:
                     return "unknown"
@@ -635,6 +671,15 @@ class Checker:
                            f"(only TextInput.text is supported)",
                            e.line, e.col)
                 return "unknown"
+            # Phase 5a: namespaced builtins are not values either.
+            if isinstance(e.obj, ast.Ident):
+                dotted = f"{e.obj.name}.{e.field}"
+                if dotted in NS_BUILTINS:
+                    self.error("E214",
+                               f"'{dotted}' is a builtin and cannot be "
+                               f"used as a value",
+                               e.line, e.col)
+                    return "unknown"
             # Error.code / Error.message on the builtin error type
             if isinstance(e.obj, ast.Ident) and e.obj.name in scope \
                     and scope[e.obj.name][0] == "Error" \
@@ -677,7 +722,7 @@ class Checker:
                 self._infer(v, scope)
             return "record"
         if isinstance(e, ast.Lambda):
-            return "lambda"
+            return self._infer_lambda(e, scope, expected)
         if isinstance(e, ast.BinOp):
             lt = self._infer(e.left, scope)
             rt = self._infer(e.right, scope)
@@ -706,8 +751,111 @@ class Checker:
                    e.line, e.col)
         return "unknown"
 
+    def _infer_lambda(self, lam: ast.Lambda, scope: dict,
+                      expected: Optional[str]) -> str:
+        """Phase 5a: infer a lambda's function type.
+
+        Typed params (`|x: Int|`) stand alone; untyped params take their
+        type from the expected function type at the use site (E213 when
+        neither is available). The return type comes from the expected
+        type when present, else from the body.
+        """
+        exp_params, exp_ret = None, None
+        if expected:
+            fp = self._func_parts(expected)
+            if fp is not None:
+                exp_params, exp_ret = fp
+        ptypes = []
+        for i, (pn, pte) in enumerate(lam.params):
+            if pte is not None:
+                ptypes.append(self._tname(pte))
+            elif exp_params is not None and i < len(exp_params):
+                ptypes.append(exp_params[i])
+            else:
+                self.error("E213",
+                           f"cannot infer type of lambda parameter "
+                           f"'{pn}': annotate it ('|{pn}: Int|') or use "
+                           f"the lambda where a function type is expected",
+                           lam.line, lam.col)
+                ptypes.append("unknown")
+        # duplicate param names
+        seen = set()
+        for pn, _ in lam.params:
+            if pn in seen:
+                self.error("E210", f"duplicate parameter '{pn}'",
+                           lam.line, lam.col)
+            seen.add(pn)
+        lscope = dict(scope)
+        for (pn, _), pt in zip(lam.params, ptypes):
+            lscope[pn] = (pt, False)
+        if lam.expr_body is not None:
+            body_t = self._infer(lam.expr_body, lscope)
+            ret = exp_ret if exp_ret is not None else body_t
+            if exp_ret is not None and body_t != "unknown" \
+                    and not self._assignable(exp_ret, body_t):
+                self.error("E211",
+                           f"lambda returns {body_t}, expected {exp_ret}",
+                           lam.expr_body.line, lam.expr_body.col)
+        else:
+            # block body: single pass checks statements and collects
+            # return types (no double inference).
+            ret_ts = []
+            self._check_block(lam.body, lscope,
+                              fn_ret=exp_ret if exp_ret is not None
+                              else None,
+                              _ret_collect=ret_ts)
+            if exp_ret is not None:
+                ret = exp_ret
+            elif ret_ts:
+                ret = (ret_ts[0] if all(t == ret_ts[0] for t in ret_ts)
+                       else "unknown")
+            else:
+                ret = "Void"
+        ps = ", ".join(ptypes)
+        return f"({ps}) -> {ret}"
+
     def _infer_call(self, e: ast.Call, scope: dict) -> str:
-        arg_ts = [self._infer(a, scope) for a in e.args]
+        # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
+        if e.callee is not None:
+            ct = self._infer(e.callee, scope)
+            fp = self._func_parts(ct)
+            if fp is None:
+                self.error("E215",
+                           f"call result has type '{ct}' and is not callable",
+                           e.line, e.col)
+                return "unknown"
+            fps, fret = fp
+            arg_ts = []
+            for i, a in enumerate(e.args):
+                exp = fps[i] if i < len(fps) else None
+                arg_ts.append(self._infer(a, scope, expected=exp))
+            if len(e.args) != len(fps):
+                self.error("E102",
+                           f"function takes {len(fps)} args, "
+                           f"got {len(e.args)}", e.line, e.col)
+            else:
+                for want_t, a, at in zip(fps, e.args, arg_ts):
+                    # skip when either side is "unknown" (cascades from a
+                    # prior error, e.g. E213 untyped lambda param)
+                    if at != "unknown" and want_t != "unknown" \
+                            and not self._assignable(want_t, at):
+                        self.error("E211",
+                                   f"argument wants {want_t}, got {at}",
+                                   a.line, a.col)
+            return fret
+        # Phase 5a: per-arg expected types so lambdas infer untyped
+        # params from the callee's function type.
+        exp_ts = None
+        if e.name in self.fns:
+            exp_ts = [self._tname(te) for _, te in self.fns[e.name].params]
+        elif e.name in scope:
+            fp = self._func_parts(scope[e.name][0])
+            if fp is not None:
+                exp_ts, _ = fp
+        arg_ts = []
+        for i, a in enumerate(e.args):
+            exp = exp_ts[i] if exp_ts and i < len(exp_ts) else None
+            arg_ts.append(self._infer(a, scope, expected=exp))
         if e.name in self.models:
             self._check_model_call(e, scope)
             return self._tname(self.models[e.name].ret)
@@ -733,6 +881,30 @@ class Checker:
                                    f"argument '{pn}' wants {want_t}, "
                                    f"got {at}", a.line, a.col)
             return self._tname(fn.ret) if fn.ret else "Void"
+        # Phase 5a: calling a variable holding a function value.
+        if e.name in scope:
+            st = scope[e.name][0]
+            fp = self._func_parts(st)
+            if fp is None:
+                self.error("E215",
+                           f"'{e.name}' has type '{st}' and is not callable",
+                           e.line, e.col)
+                return "unknown"
+            fps, fret = fp
+            if len(e.args) != len(fps):
+                self.error("E102",
+                           f"function '{e.name}' takes {len(fps)} args, "
+                           f"got {len(e.args)}", e.line, e.col)
+            else:
+                for want_t, a, at in zip(fps, e.args, arg_ts):
+                    # skip when either side is "unknown" (cascades from a
+                    # prior error, e.g. E213 untyped lambda param)
+                    if at != "unknown" and want_t != "unknown" \
+                            and not self._assignable(want_t, at):
+                        self.error("E211",
+                                   f"argument wants {want_t}, got {at}",
+                                   a.line, a.col)
+            return fret
         if e.name in NS_BUILTINS:
             params, ret = NS_BUILTINS[e.name]
             if len(e.args) != len(params):
@@ -781,6 +953,14 @@ class Checker:
     def _tname(self, te: Optional[ast.TypeExpr]) -> str:
         if te is None:
             return "unknown"
+        # Phase 5a: function types render `(Int, Text) -> Bool`
+        if te.is_func:
+            ps = ", ".join(self._tname(p) for p in te.func_params)
+            r = self._tname(te.func_ret)
+            s = f"({ps}) -> {r}"
+            if te.optional:
+                s += "?"
+            return s
         s = te.name
         if te.is_list:
             s = f"[{s}]"
@@ -793,6 +973,11 @@ class Checker:
     def _known_type(self, te: Optional[ast.TypeExpr]) -> bool:
         if te is None:
             return False
+        # Phase 5a: function types — every param and the return must be known
+        if te.is_func:
+            return (te.func_ret is not None
+                    and all(self._known_type(p) for p in te.func_params)
+                    and self._known_type(te.func_ret))
         if te.is_map:
             return (te.map_key is not None and te.map_val is not None
                     and te.map_key.name in ("Text", "Int")
@@ -802,9 +987,59 @@ class Checker:
         return (base in PRIMITIVES or base in MEDIA or base in SPECIAL
                 or base in self.types)
 
+    @staticmethod
+    def _func_parts(t: str):
+        """Phase 5a: if t is a `(P, ...) -> R` function type string,
+        return (param_type_strings, ret_string). Else None."""
+        if not t.startswith("("):
+            return None
+        depth = 0
+        for i, ch in enumerate(t):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    rest = t[i + 1:].strip()
+                    if not rest.startswith("->"):
+                        return None
+                    ret = rest[2:].strip()
+                    inner = t[1:i].strip()
+                    if not inner:
+                        return [], ret
+                    params, depth2, cur = [], 0, ""
+                    for ch2 in inner:
+                        if ch2 == "(":
+                            depth2 += 1
+                        elif ch2 == ")":
+                            depth2 -= 1
+                        if ch2 == "," and depth2 == 0:
+                            params.append(cur.strip())
+                            cur = ""
+                        else:
+                            cur += ch2
+                    params.append(cur.strip())
+                    return params, ret
+        return None
+
     def _assignable(self, want: str, got: str) -> bool:
         if want == got:
             return True
+        # Phase 5a: structural function subtyping — params
+        # contravariant, return covariant.
+        wf = self._func_parts(want)
+        gf = self._func_parts(got)
+        if wf is not None or gf is not None:
+            if wf is None or gf is None:
+                return False
+            wps, wr = wf
+            gps, gr = gf
+            if len(wps) != len(gps):
+                return False
+            for wp, gp in zip(wps, gps):
+                if not self._assignable(gp, wp):
+                    return False
+            return self._assignable(wr, gr)
         if want == "Float" and got == "Int":
             return True
         if want.endswith("?") and got == "nil":

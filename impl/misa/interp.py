@@ -35,6 +35,12 @@ class LambdaValue:
 
 
 @dataclass
+class FnValue:
+    """Phase 5a: an `fn` declaration used as a first-class value."""
+    decl: ast.FnDecl
+
+
+@dataclass
 class TokenStreamHandle:
     decl: ast.ModelDecl
     arg_values: list
@@ -111,6 +117,8 @@ def render_value(v: Any) -> str:
         return "<stream>"
     if isinstance(v, LambdaValue):
         return "<lambda>"
+    if isinstance(v, FnValue):
+        return f"<function {v.decl.name}>"
     return str(v)
 
 
@@ -238,7 +246,8 @@ class Interpreter:
                 raise RuntimeError_(f"unknown stream event '{s.event}'")
             lam = s.handler
             handle.handlers.append(
-                LambdaValue(lam.params, lam.body, lam.expr_body, env))
+                LambdaValue([pn for pn, _ in lam.params],
+                            lam.body, lam.expr_body, env))
         elif isinstance(s, ast.ExprStmt):
             self.eval_expr(s.expr, env)
         elif isinstance(s, ast.StreamDecl):
@@ -312,7 +321,13 @@ class Interpreter:
         if isinstance(e, ast.MoneyLit):
             return e.usd
         if isinstance(e, ast.Ident):
-            return env.lookup(e.name)[0]
+            try:
+                return env.lookup(e.name)[0]
+            except UndefinedName:
+                # Phase 5a: an `fn` declaration used as a value.
+                if e.name in self.fns:
+                    return FnValue(self.fns[e.name])
+                raise
         if isinstance(e, ast.Call):
             return self.eval_call(e, env)
         if isinstance(e, ast.Field):
@@ -344,7 +359,8 @@ class Interpreter:
         if isinstance(e, ast.RecordLit):
             return {k: self.eval_expr(v, env) for k, v in e.fields}
         if isinstance(e, ast.Lambda):
-            return LambdaValue(e.params, e.body, e.expr_body, env)
+            return LambdaValue([pn for pn, _ in e.params],
+                               e.body, e.expr_body, env)
         if isinstance(e, ast.BinOp):
             return self.eval_binop(e, env)
         if isinstance(e, ast.UnOp):
@@ -405,6 +421,15 @@ class Interpreter:
 
     def eval_call(self, e: ast.Call, env: Env) -> Any:
         args = [self.eval_expr(a, env) for a in e.args]
+        # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
+        if e.callee is not None:
+            v = self.eval_expr(e.callee, env)
+            if isinstance(v, LambdaValue):
+                return self.invoke_lambda_value(v, args, e)
+            if isinstance(v, FnValue):
+                return self.call_fn(v.decl, args, e)
+            raise RuntimeError_(f"call result is not callable",
+                                line=e.line, col=e.col)
         name = e.name
         if name in self.models:
             return self.call_model(self.models[name], args, e)
@@ -477,6 +502,20 @@ class Interpreter:
                     f"str.chr: invalid code point {args[0]}")
         if name == "process.run":
             return self.process_run(args[0], e)
+        # Phase 5a: call through a variable holding a function value.
+        if "." not in name:
+            try:
+                cell = env.lookup(name)
+            except UndefinedName:
+                cell = None
+            if cell is not None:
+                v = cell[0]
+                if isinstance(v, LambdaValue):
+                    return self.invoke_lambda_value(v, args, e)
+                if isinstance(v, FnValue):
+                    return self.call_fn(v.decl, args, e)
+                raise RuntimeError_(
+                    f"'{name}' is not callable", line=e.line, col=e.col)
         return self.call_builtin(name, args, e)
 
     def process_run(self, cmd, node) -> dict:
@@ -958,7 +997,11 @@ class Interpreter:
                           handle.model_id)
         return value
 
-    def invoke_lambda(self, lam: ast.Lambda, args: list, env: Env):
+    def invoke_lambda(self, lam: LambdaValue, args: list, env: Env):
+        return self.invoke_lambda_value(lam, args, None)
+
+    def invoke_lambda_value(self, lam: LambdaValue, args: list,
+                            node: Optional[ast.Node]):
         inner = Env(lam.closure)
         for p, v in zip(lam.params, args):
             inner.define(p, v, False)

@@ -64,6 +64,10 @@ class FnCtx:
         self.scope = Scope()
         self.err_stack = []     # basic blocks: innermost error target
         self.nil = None         # cached nil value
+        # Phase 5a: names of `var`s cell-allocated (1-elem lists) because
+        # a nested lambda may capture them. Reads/writes go through
+        # misa_list_get/misa_index_set instead of a plain alloca.
+        self.cell_vars: set = set()
         # Phase 4 (M4): handler compilation state. id_slots maps
         # screen id: names -> binding slots; in_handler marks a
         # compiled event handler (restricted scope).
@@ -85,6 +89,8 @@ _RT_SIGS = {
     "misa_text_cstr": (PTR, [PTR]),
     "misa_list_new": (PTR, []),
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
+    "misa_list_get": (PTR, [PTR, I64]),
+    "misa_as_int": (I64, [PTR]),
     "misa_map_new": (PTR, []),
     "misa_record_new": (PTR, []),
     "misa_record_set_cstr": (ir.VoidType(), [PTR, PTR, PTR]),
@@ -165,6 +171,13 @@ class Emitter:
         self.models = {}    # model name -> (ir.Function, meta_global)
         self.screens = {}   # screen name -> ir.Function
         self.handlers = []  # Phase 4 (M4): handler fns, dispatch order
+        # Phase 5a: first-class functions. Closure values are MVal*
+        # records {__closure_fn: Int(fn ptr), __closure_env: record}.
+        self.lambda_counter = 0
+        self.trampolines = {}  # fn name -> ir.Function (value wrapper)
+        self.CLOSURE_FN = "__closure_fn"
+        self.CLOSURE_ENV = "__closure_env"
+        self.CLOSURE_DISP = "__closure_disp"
         self.fn_decls = {}
         self.model_decls = {}
         self.screen_decls = {}
@@ -296,6 +309,39 @@ class Emitter:
 
     # -- functions ------------------------------------------------------
 
+    # -- Phase 5a: closure capture analysis -------------------------------
+    #
+    # Over-approximate but sound: if a function body contains ANY lambda
+    # expression, every `var` declared in that body becomes a heap cell
+    # (1-elem list) so closures share mutable state with the defining
+    # scope. Lambdas capture the whole scope chain by walking it at the
+    # creation site (immutable vars by value, cell vars by shared cell).
+
+    def _subtree_has_lambda(self, node) -> bool:
+        """True if any Lambda occurs anywhere under node."""
+        if isinstance(node, A.Lambda):
+            return True
+        for child in self.children(node):
+            if self._subtree_has_lambda(child):
+                return True
+        return False
+
+    def _cell_vars_for(self, stmts) -> set:
+        """Names of `var`s to cell-allocate in this function body."""
+        if not any(self._subtree_has_lambda(s) for s in stmts):
+            return set()
+        out = set()
+
+        def walk(node):
+            if isinstance(node, A.LetStmt) and node.mutable:
+                out.add(node.name)
+            for child in self.children(node):
+                walk(child)
+
+        for st in stmts:
+            walk(st)
+        return out
+
     def new_fn_ctx(self, fn: ir.Function) -> FnCtx:
         entry = fn.append_basic_block("entry")
         b = ir.IRBuilder(entry)
@@ -343,6 +389,8 @@ class Emitter:
     def emit_fn_body(self, name: str, decl: A.FnDecl):
         fn = self.fns[name]
         ctx = self.new_fn_ctx(fn)
+        # Phase 5a: cell-allocate `var`s captured by nested lambdas.
+        ctx.cell_vars = self._cell_vars_for(decl.body)
         b = ctx.builder
         for (pn, _), arg in zip(decl.params, fn.args):
             arg.name = f"p_{pn}"
@@ -360,6 +408,14 @@ class Emitter:
         fty = ir.FunctionType(PTR, [])
         fn = ir.Function(self.mod, fty, name="misa_main")
         ctx = self.new_fn_ctx(fn)
+        # Phase 5a: cell-allocate top-level `var`s captured by lambdas.
+        top_stmts = [item for item in self.prog.items
+                     if not isinstance(item, (A.AppDecl, A.ProviderDecl,
+                                             A.ModelsDecl, A.TypeDecl,
+                                             A.ModelDecl, A.ScreenDecl,
+                                             A.EvalDecl, A.FnDecl,
+                                             A.ImportDecl))]
+        ctx.cell_vars = self._cell_vars_for(top_stmts)
         self.get_nil(ctx)
         scope = ctx.scope
         for item in self.prog.items:
@@ -451,7 +507,13 @@ class Emitter:
             v = self.emit_expr(val_node, ctx)
             self.check(ctx, s)
             a = self.alloca_var(ctx, s.name)
-            b.store(v, a)
+            if s.name in ctx.cell_vars:
+                # Phase 5a: heap cell (1-elem list) shared with closures.
+                cell = self.call(ctx, "misa_list_new", [], s, check=False)
+                self.call(ctx, "misa_list_push", [cell, v], s, check=False)
+                b.store(cell, a)
+            else:
+                b.store(v, a)
             ctx.scope.declare(s.name, a)
         elif isinstance(s, A.AssignStmt):
             v = self.emit_expr(s.value, ctx)
@@ -459,7 +521,16 @@ class Emitter:
             tgt = s.target
             if isinstance(tgt, A.Ident):
                 a = ctx.scope.lookup(tgt.name)
-                b.store(v, a)
+                if tgt.name in ctx.cell_vars:
+                    # Phase 5a: store through the shared cell.
+                    cell = b.load(a, name=f"cell_{tgt.name}")
+                    line, col = self.loc(s)
+                    zero = self.call(ctx, "misa_int",
+                                     [self.const_i64(0)], s, check=False)
+                    self.call(ctx, "misa_index_set",
+                              [cell, zero, v, line, col], s)
+                else:
+                    b.store(v, a)
             elif isinstance(tgt, A.Field):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
@@ -644,8 +715,19 @@ class Emitter:
                         f"id: bindings",
                         e.line, e.col)
                 return b.load(a, name=f"l_{e.name}")
-            a = ctx.scope.lookup(e.name)
-            return b.load(a, name=f"l_{e.name}")
+            try:
+                a = ctx.scope.lookup(e.name)
+            except AOTError:
+                # Phase 5a: an `fn` declaration used as a value.
+                if e.name in self.fns:
+                    return self.emit_fn_value(e.name, e, ctx)
+                raise
+            v = b.load(a, name=f"l_{e.name}")
+            if e.name in ctx.cell_vars:
+                # Phase 5a: read through the shared heap cell.
+                v = self.call(ctx, "misa_list_get",
+                              [v, self.const_i64(0)], e, check=False)
+            return v
         if isinstance(e, A.Call):
             return self.emit_call(e, ctx)
         if isinstance(e, A.Field):
@@ -710,11 +792,9 @@ class Emitter:
         if isinstance(e, A.BinOp):
             return self.emit_binop(e, ctx)
         if isinstance(e, A.Lambda):
-            raise AOTError("E402",
-                           "first-class lambdas are not supported "
-                           "in AOT v0.3 (lambdas work as component "
-                           "event handlers)",
-                           e.line, e.col)
+            # Phase 5a: first-class lambdas become closure values
+            # (record {__closure_fn, __closure_env}).
+            return self.emit_closure(e, ctx)
         if isinstance(e, A.UnOp):
             v = self.emit_expr(e.operand, ctx)
             self.check(ctx, e)
@@ -804,6 +884,11 @@ class Emitter:
     _MEDIA_KIND = {"Photo": 0, "Audio": 1, "Video": 2, "Document": 3}
 
     def emit_call(self, e: A.Call, ctx: FnCtx):
+        # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
+        if e.callee is not None:
+            clos = self.emit_expr(e.callee, ctx)
+            self.check(ctx, e)
+            return self.emit_closure_call(e, ctx, clos)
         name = e.name
         if name in self.fns:
             decl = self.fn_decls[name]
@@ -829,6 +914,15 @@ class Emitter:
                 args.append(v)
             return self.call(ctx, f"misa_screen_{name}", args, e,
                              check=True, direct=True)
+        # Phase 5a: call through a variable holding a closure value.
+        # (Builtins aren't scope variables, so they still fall through.)
+        if "." not in name:
+            try:
+                target = ctx.scope.lookup(name)
+            except AOTError:
+                target = None
+            if target is not None:
+                return self.emit_closure_call_var(e, ctx, name, target)
         return self.emit_builtin(e, ctx)
 
     def call(self, ctx: FnCtx, name, args, node, check=True,
@@ -934,6 +1028,167 @@ class Emitter:
         self.check(ctx, decl)
         b.ret(r)
         self.finish_fn_ctx(ctx)
+
+    # -- Phase 5a: first-class functions (closures) -----------------------
+    #
+    # A closure value is an MVal* record:
+    #   {__closure_fn: Int(fn address as i64), __closure_env: record}
+    # Every closure body is emitted as `misa_lambda_N(env, args)` where
+    # args is an MVal* list — one uniform signature, so calls through
+    # values need no per-arity dispatch. `fn` decls used as values get
+    # a trampoline with the same shape.
+
+    def emit_closure(self, lam: A.Lambda, ctx: FnCtx):
+        b = ctx.builder
+        node = lam
+        # 1. capture the scope chain: (name, is_cell), innermost first.
+        names = []
+        seen = set()
+        s = ctx.scope
+        while s is not None:
+            for name in s.names:
+                if name not in seen:
+                    seen.add(name)
+                    names.append((name, name in ctx.cell_vars))
+            s = s.parent
+        # 2. build the env record (cells shared, values copied).
+        env = self.call(ctx, "misa_record_new", [], node, check=False)
+        for name, _ in names:
+            a = ctx.scope.lookup(name)
+            v = b.load(a, name=f"cap_{name}")
+            self.call(ctx, "misa_record_set_cstr",
+                      [env, self.cstr(name), v], node, check=False)
+        # 3. emit the body as misa_lambda_N(env, args).
+        fn = ir.Function(self.mod, ir.FunctionType(PTR, [PTR, PTR]),
+                         name=f"misa_lambda_{self.lambda_counter}")
+        self.lambda_counter += 1
+        lctx = self.new_fn_ctx(fn)
+        lb = lctx.builder
+        self.get_nil(lctx)
+        for name, is_cell in names:
+            if is_cell:
+                lctx.cell_vars.add(name)
+        lenv, largs = fn.args[0], fn.args[1]
+        lenv.name, largs.name = "env", "args"
+        line, col = self.loc(node)
+        for name, _ in names:
+            v = self.call(lctx, "misa_record_get",
+                          [lenv, self.cstr(name), line, col],
+                          node, check=False)
+            a = self.alloca_var(lctx, f"cap_{name}")
+            lb.store(v, a)
+            lctx.scope.declare(name, a)
+        for i, (pn, _) in enumerate(lam.params):
+            v = self.call(lctx, "misa_list_get",
+                          [largs, self.const_i64(i)], node, check=False)
+            a = self.alloca_var(lctx, pn)
+            lb.store(v, a)
+            lctx.scope.declare(pn, a)
+        # nested lambdas inside this body get their own cell analysis
+        if lam.expr_body is None:
+            lctx.cell_vars |= self._cell_vars_for(lam.body)
+        if lam.expr_body is not None:
+            v = self.emit_expr(lam.expr_body, lctx)
+            self.check(lctx, lam)
+            lb.ret(v)
+        else:
+            self.emit_block(lam.body, lctx)
+        self.finish_fn_ctx(lctx)
+        # 4. build the closure record {__closure_fn, __closure_env}.
+        clos = self.call(ctx, "misa_record_new", [], node, check=False)
+        fn_i64 = b.ptrtoint(fn, I64, name="lambdafn")
+        fn_val = self.call(ctx, "misa_int", [fn_i64], node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_FN), fn_val],
+                  node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_ENV), env],
+                  node, check=False)
+        disp = self.call(ctx, "misa_text_cstr",
+                         [self.cstr("<lambda>")], node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_DISP), disp],
+                  node, check=False)
+        return clos
+
+    def emit_closure_call(self, e: A.Call, ctx: FnCtx, clos):
+        """Call a closure MVal* value."""
+        b = ctx.builder
+        line, col = self.loc(e)
+        fn_val = self.call(ctx, "misa_record_get",
+                            [clos, self.cstr(self.CLOSURE_FN),
+                             line, col], e)
+        fn_i64 = self.call(ctx, "misa_as_int", [fn_val], e)
+        env = self.call(ctx, "misa_record_get",
+                         [clos, self.cstr(self.CLOSURE_ENV), line, col], e)
+        args_list = self.call(ctx, "misa_list_new", [], e, check=False)
+        for a in e.args:
+            v = self.emit_expr(a, ctx)
+            self.check(ctx, e)
+            self.call(ctx, "misa_list_push", [args_list, v], e,
+                      check=False)
+        fnty = ir.FunctionType(PTR, [PTR, PTR])
+        fnptr = b.inttoptr(fn_i64, fnty.as_pointer(), name="closure_fn")
+        r = b.call(fnptr, [env, args_list], name="_closure_call")
+        self.check(ctx, e)
+        return r
+
+    def emit_closure_call_var(self, e: A.Call, ctx: FnCtx, name: str,
+                              target):
+        """Call a variable holding a closure value."""
+        b = ctx.builder
+        clos = b.load(target, name=f"l_{name}")
+        if name in ctx.cell_vars:
+            # `var f = <closure>` — load through the cell.
+            clos = self.call(ctx, "misa_list_get",
+                              [clos, self.const_i64(0)], e, check=False)
+        return self.emit_closure_call(e, ctx, clos)
+
+    def emit_fn_trampoline(self, name: str) -> ir.Function:
+        """Uniform `(env, args)` wrapper around an `fn` declaration."""
+        if name in self.trampolines:
+            return self.trampolines[name]
+        decl = self.fn_decls[name]
+        fn = ir.Function(self.mod, ir.FunctionType(PTR, [PTR, PTR]),
+                         name=f"misa_tramp_{name}")
+        ctx = self.new_fn_ctx(fn)
+        b = ctx.builder
+        self.get_nil(ctx)
+        fn.args[0].name, fn.args[1].name = "env", "args"
+        call_args = []
+        for i in range(len(decl.params)):
+            v = self.call(ctx, "misa_list_get",
+                          [fn.args[1], self.const_i64(i)],
+                          decl, check=False)
+            call_args.append(v)
+        r = self.call(ctx, f"misa_fn_{name}", call_args, decl,
+                      check=True, direct=True)
+        b.ret(r)
+        self.finish_fn_ctx(ctx)
+        self.trampolines[name] = fn
+        return fn
+
+    def emit_fn_value(self, name: str, node: A.Node, ctx: FnCtx):
+        """A closure value wrapping an `fn` declaration."""
+        tramp = self.emit_fn_trampoline(name)
+        b = ctx.builder
+        clos = self.call(ctx, "misa_record_new", [], node, check=False)
+        fn_i64 = b.ptrtoint(tramp, I64, name="trampfn")
+        fn_val = self.call(ctx, "misa_int", [fn_i64], node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_FN), fn_val],
+                  node, check=False)
+        env = self.call(ctx, "misa_record_new", [], node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_ENV), env],
+                  node, check=False)
+        disp = self.call(ctx, "misa_text_cstr",
+                         [self.cstr(f"<function {name}>")],
+                         node, check=False)
+        self.call(ctx, "misa_record_set_cstr",
+                  [clos, self.cstr(self.CLOSURE_DISP), disp],
+                  node, check=False)
+        return clos
 
     def emit_model_call(self, name: str, e: A.Call, ctx: FnCtx):
         fn, _g = self.models[name]
@@ -1197,7 +1452,7 @@ class Emitter:
             # the checker rejects this first (E206); backstop only.
             raise AOTError("E600", "event handler takes at most 1 param",
                            lam.line, lam.col)
-        for pn in lam.params:
+        for pn, _ in lam.params:
             a = self.alloca_var(ctx, pn)
             b.store(fn.args[0], a)
             ctx.scope.declare(pn, a)

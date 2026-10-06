@@ -152,6 +152,13 @@ class Formatter:
         return '"""\n' + body + '"""'
 
     def fmt_type(self, te: ast.TypeExpr) -> str:
+        # Phase 5a: function types
+        if te.is_func:
+            ps = ", ".join(self.fmt_type(p) for p in te.func_params)
+            s = f"({ps}) -> {self.fmt_type(te.func_ret)}"
+            if te.optional:
+                s += "?"
+            return s
         s = te.name
         if te.is_list:
             s = f"[{s}]"
@@ -398,7 +405,10 @@ class Formatter:
                        .replace("\r", "\\r") + '"'
 
     def fmt_lambda(self, e: ast.Lambda) -> str:
-        params = ", ".join(e.params)
+        def _p(pn_pte):
+            pn, pte = pn_pte
+            return f"{pn}: {self.fmt_type(pte)}" if pte else pn
+        params = ", ".join(_p(pp) for pp in e.params)
         if e.expr_body is not None:
             return f"|{params}| {self.fmt_expr(e.expr_body)}"
         inline = _Inline()

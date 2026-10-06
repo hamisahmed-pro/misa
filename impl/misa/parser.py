@@ -206,6 +206,27 @@ class Parser:
 
     def parse_type_expr(self) -> ast.TypeExpr:
         t = self.peek()
+        # Phase 5a: function type `(Int, Text) -> Bool`, `() -> Void`.
+        if self.at("("):
+            self.advance()
+            params = []
+            if not self.at(")"):
+                while True:
+                    params.append(self.parse_type_expr())
+                    if self.at(","):
+                        self.advance()
+                        continue
+                    break
+            self.expect(")", "')'")
+            self.expect("->", "'->'")
+            ret = self.parse_type_expr()
+            opt = False
+            if self.at("?"):
+                self.advance()
+                opt = True
+            return ast.TypeExpr(is_func=True, func_params=params,
+                                func_ret=ret, optional=opt,
+                                line=t.line, col=t.col)
         if self.at("["):
             self.advance()
             inner = self.parse_type_expr()
@@ -606,7 +627,13 @@ class Parser:
         t = self.expect("|", "'|'")
         params = []
         while not self.at("|"):
-            params.append(self.expect_ident("parameter name").value)
+            pn = self.expect_ident("parameter name").value
+            pte = None
+            # Phase 5a: typed params `|x: Int|`
+            if self.at(":"):
+                self.advance()
+                pte = self.parse_type_expr()
+            params.append((pn, pte))
             if self.at(","):
                 self.advance()
         self.expect("|", "'|'")
@@ -706,9 +733,33 @@ class Parser:
                 idx = self.parse_expr()
                 self.expect("]", "']'")
                 node = ast.Index(obj=node, idx=idx, line=t.line, col=t.col)
+            elif self.at("("):
+                # Phase 5a: calling the result of an expression,
+                # e.g. `mk(9)(1)`. (Plain `f(x)` is built in
+                # parse_primary; this only fires on non-Ident nodes.)
+                t = self.peek()
+                args = self.parse_call_args()
+                node = ast.Call(name="", callee=node, args=args,
+                                line=t.line, col=t.col)
             else:
                 break
         return node
+
+    def parse_call_args(self) -> list:
+        """Parse `(a, b, ...)`; the opening paren must be next."""
+        self.expect("(", "'('")
+        args = []
+        if not self.at(")"):
+            while True:
+                args.append(self.parse_expr())
+                if self.at(","):
+                    self.advance()
+                    if self.at(")"):
+                        break
+                    continue
+                break
+        self.expect(")", "')'")
+        return args
 
     def parse_primary(self) -> ast.Node:
         t = self.peek()
@@ -790,18 +841,7 @@ class Parser:
                          t.line, t.col)
 
     def finish_call(self, name: str, t: Token) -> ast.Call:
-        self.expect("(", "'('")
-        args = []
-        if not self.at(")"):
-            while True:
-                args.append(self.parse_expr())
-                if self.at(","):
-                    self.advance()
-                    if self.at(")"):
-                        break
-                    continue
-                break
-        self.expect(")", "')'")
+        args = self.parse_call_args()
         return ast.Call(name=name, args=args, line=t.line, col=t.col)
 
     def parse_record_fields_rest(self) -> list:

@@ -412,7 +412,22 @@ static void render_into(Str *s, MVal *v) {
         }
         str_puts(s, "]");
         break;
-    case M_TAG_RECORD:
+    case M_TAG_RECORD: {
+        /* Phase 5a: closure values render opaquely, matching the
+         * interpreter's "<lambda>" / "<function name>". */
+        int64_t cdisp_idx = -1;
+        for (int64_t i = 0; i < v->u.record.len; i++) {
+            if (strcmp(v->u.record.names[i], "__closure_disp") == 0
+                && v->u.record.vals[i]->tag == M_TAG_TEXT) {
+                cdisp_idx = i;
+                break;
+            }
+        }
+        if (cdisp_idx >= 0) {
+            MVal *d = v->u.record.vals[cdisp_idx];
+            str_putn(s, d->u.text.data, d->u.text.len);
+            break;
+        }
         str_puts(s, "{ ");
         for (int64_t i = 0; i < v->u.record.len; i++) {
             if (i) str_puts(s, ", ");
@@ -422,6 +437,7 @@ static void render_into(Str *s, MVal *v) {
         }
         str_puts(s, " }");
         break;
+    }
     case M_TAG_MAP:
         str_puts(s, "{");
         for (int64_t i = 0; i < v->u.map.len; i++) {

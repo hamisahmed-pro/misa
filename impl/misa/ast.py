@@ -21,6 +21,10 @@ class TypeExpr(Node):
     map_key: Optional["TypeExpr"] = None
     map_val: Optional["TypeExpr"] = None
     optional: bool = False
+    # Phase 5a: function types `(Int, Text) -> Bool`
+    is_func: bool = False
+    func_params: List["TypeExpr"] = field(default_factory=list)
+    func_ret: Optional["TypeExpr"] = None
 
 
 # ---------------------------------------------------------------- program
@@ -244,6 +248,9 @@ class Ident(Node):
 class Call(Node):
     name: str = ""
     args: List[Node] = field(default_factory=list)
+    # Phase 5a: calling the result of an expression, e.g. `mk(9)(1)`.
+    # When callee is not None, `name` is unused.
+    callee: Optional[Node] = None
 
 
 @dataclass
@@ -276,7 +283,10 @@ class MapLit(Node):
 
 @dataclass
 class Lambda(Node):
-    params: List[str] = field(default_factory=list)
+    # Phase 5a: (param_name, optional TypeExpr); None = untyped, inferred
+    # from the expected function type at the use site.
+    params: List[Tuple[str, Optional[TypeExpr]]] = field(
+        default_factory=list)
     body: List[Node] = field(default_factory=list)
     expr_body: Optional[Node] = None
 

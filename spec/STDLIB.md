@@ -100,4 +100,5 @@ expose: `TextInput.text -> Text`. Event lambdas: `onTap: || { ... }`,
 ## 7. Reserved for future versions
 
 `Embedding` type and vector ops, JSON value type, dates/times,
-on-device inference bindings, first-class function values.
+on-device inference bindings. (First-class function values shipped in
+Phase 5a.)

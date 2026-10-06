@@ -41,8 +41,11 @@ fn greet(name: Text) {
   `E211`.
 - Calls are expressions: `fib(10)`. Arity mismatch is `E102`;
   argument type mismatch is `E211`.
-- Functions are not first-class values in v0.2 (no function types,
-  no passing `fn` as an argument). Lambdas remain handler-only.
+- Functions are first-class values (Phase 5a): function types
+  `(Int, Text) -> Bool`, lambdas with typed or inferred params,
+  `fn` declarations usable as values, and closures capturing their
+  defining scope. Builtins (`print`, `str`, `fs.read`, …) are not
+  values (`E214`).
 - Recursion is legal; each call gets a fresh local scope. There is no
   tail-call optimization in the v0.2 interpreter.
 

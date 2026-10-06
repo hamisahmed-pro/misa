@@ -67,6 +67,8 @@ typeField   := IDENT ":" typeExpr ","?
 
 typeExpr    := IDENT "?"? | "[" typeExpr "]" "?"?
              | "Map" "<" typeExpr "," typeExpr ">" "?"?
+             | "(" (typeExpr ("," typeExpr)*)? ")" "->" typeExpr "?"?
+             // Phase 5a: function types, e.g. (Int, Text) -> Bool
 
 fnDecl      := "fn" IDENT "(" params? ")" ("->" typeExpr)? "{" statement* "}"
 importDecl  := "import" STRING
@@ -133,7 +135,11 @@ mapLit      := "{" (STRING ":" expr ("," STRING ":" expr)*)? "}"
             // STRING key -> map, IDENT key -> record. `{}` is an empty
             // record; an empty map needs an annotation, e.g.
             // let m: Map<Text,Int> = {}
-lambda      := "|" (IDENT ("," IDENT)*)? "|" ("{" statement* "}" | expr)
+lambda      := "|" (lambdaParam ("," lambdaParam)*)? "|" ("{" statement* "}" | expr)
+lambdaParam := IDENT (":" typeExpr)?
+// Phase 5a: typed params, e.g. |x: Int| x * 2
+callExpr    := IDENT "(" callArgs? ")" | expr "(" callArgs? ")"
+// Phase 5a: calling a call result, e.g. mk(9)(1)
 literal     := INT | FLOAT | STRING | TRISTRING | DURATION | MONEY
              | "true" | "false" | "nil"
 ```

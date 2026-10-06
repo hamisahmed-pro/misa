@@ -817,6 +817,194 @@ def _():
     eq(format_source(out, "f.misa"), out)
 
 
+# ---------------------------------------------------------------- Phase 5a: first-class functions
+
+@test("5a parser: function type")
+def _():
+    p = parse_source('let f: (Int, Text) -> Bool = g\n', "f.misa")
+    te = p.items[0].ann
+    assert te.is_func, te
+    assert [t.name for t in te.func_params] == ["Int", "Text"]
+    assert te.func_ret.name == "Bool"
+
+
+@test("5a parser: thunk type and nested function type")
+def _():
+    p = parse_source('let f: () -> Void = g\n', "f.misa")
+    te = p.items[0].ann
+    assert te.is_func and te.func_params == []
+    assert te.func_ret.name == "Void"
+    p2 = parse_source('let f: ((Int) -> Int) -> Bool = g\n', "f.misa")
+    te2 = p2.items[0].ann
+    assert te2.is_func and te2.func_params[0].is_func
+
+
+@test("5a parser: typed lambda params")
+def _():
+    p = parse_source('let f = |x: Int, y| x\n', "f.misa")
+    lam = p.items[0].value
+    assert isinstance(lam, last.Lambda)
+    assert lam.params[0][0] == "x" and lam.params[0][1].name == "Int"
+    assert lam.params[1][0] == "y" and lam.params[1][1] is None
+
+
+@test("5a checker: fn as value has function type")
+def _():
+    src = ('fn double(x: Int) -> Int {\n    return x * 2\n}\n'
+           'let g = double\n'
+           'let h: (Int) -> Int = g\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5a checker: fn value type mismatch E200")
+def _():
+    src = ('fn foo() -> Int {\n    return 1\n}\n'
+           'let g: (Text) -> Int = foo\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("5a checker: untyped lambda without expected type E213")
+def _():
+    errs = check_source('let f = |x| x + 1\n')
+    assert any(e["code"] == "E213" for e in errs), errs
+
+
+@test("5a checker: builtin as value E214")
+def _():
+    for b in ("print", "str", "len", "fs.read", "str.slice"):
+        errs = check_source(f'let f = {b}\n')
+        assert any(e["code"] == "E214" for e in errs), (b, errs)
+
+
+@test("5a checker: calling non-function E215")
+def _():
+    errs = check_source('let x = 5\nx(1)\n')
+    assert any(e["code"] == "E215" for e in errs), errs
+
+
+@test("5a checker: arity through variable E102")
+def _():
+    src = 'let f: (Int) -> Int = |x: Int| x\nf(1, 2)\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E102" for e in errs), errs
+
+
+@test("5a checker: arg type through variable E211")
+def _():
+    src = 'let f: (Int) -> Int = |x: Int| x\nf("s")\n'
+    errs = check_source(src)
+    assert any(e["code"] == "E211" for e in errs), errs
+
+
+@test("5a checker: lambda arg infers from fn param")
+def _():
+    src = ('fn apply(f: (Int) -> Int, v: Int) -> Int {\n'
+           '    return f(v)\n}\n'
+           'print(apply(|x| x + 1, 10))\n')
+    assert check_source(src) == [], check_source(src)
+
+
+@test("5a checker: function subtyping is structural")
+def _():
+    # (Float) -> Int is assignable to (Int) -> Float:
+    # params contravariant (Int arg usable where Float expected),
+    # return covariant (Int usable where Float expected).
+    src = ('let g: (Float) -> Int = |x: Float| 1\n'
+           'let h: (Int) -> Float = g\n')
+    assert check_source(src) == [], check_source(src)
+    # ...but not the other way: (Int) -> Float cannot take a Float.
+    src2 = ('let g: (Int) -> Float = |x: Int| 1.5\n'
+            'let h: (Float) -> Float = g\n')
+    errs = check_source(src2)
+    assert any(e["code"] == "E200" for e in errs), errs
+    # arity mismatch is not assignable
+    src3 = ('fn foo() -> Int {\n    return 1\n}\n'
+            'let g: (Int) -> Int = foo\n')
+    errs = check_source(src3)
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("5a interp: fn value call and higher-order")
+def _():
+    src = ('fn double(x: Int) -> Int {\n    return x * 2\n}\n'
+           'fn apply(f: (Int) -> Int, v: Int) -> Int {\n'
+           '    return f(v)\n}\n'
+           'let g = double\n'
+           'print(g(21))\n'
+           'print(apply(double, 5))\n'
+           'print(apply(|x: Int| x + 1, 10))\n')
+    eq(run_src(src), "42\n10\n11\n")
+
+
+@test("5a interp: closure captures defining scope")
+def _():
+    src = ('fn make_adder(n: Int) -> (Int) -> Int {\n'
+           '    return |x: Int| x + n\n}\n'
+           'let add5 = make_adder(5)\n'
+           'print(add5(10))\n'
+           'print(add5(100))\n')
+    eq(run_src(src), "15\n105\n")
+
+
+@test("5a interp: closure shares mutable state")
+def _():
+    src = ('var count = 0\n'
+           'let inc = || {\n'
+           '    count = count + 1\n'
+           '    return count\n}\n'
+           'print(inc())\n'
+           'print(inc())\n'
+           'count = 10\n'
+           'print(inc())\n'
+           'print(count)\n')
+    eq(run_src(src), "1\n2\n11\n11\n")
+
+
+@test("5a interp: nested closures and compose")
+def _():
+    src = ('fn compose(f: (Int) -> Int, g: (Int) -> Int) -> (Int) -> Int {\n'
+           '    return |x: Int| f(g(x))\n}\n'
+           'let f = compose(|x: Int| x + 1, |x: Int| x * 10)\n'
+           'print(f(5))\n'
+           'let mk = |a: Int| {\n'
+           '    let inner = |b: Int| a + b\n'
+           '    return inner\n}\n'
+           'let add9 = mk(9)\n'
+           'print(add9(1))\n')
+    eq(run_src(src), "51\n10\n")
+
+
+@test("5a interp: call result is callable")
+def _():
+    src = ('fn mk(a: Int) -> (Int) -> Int {\n'
+           '    return |b: Int| a + b\n}\n'
+           'print(mk(9)(1))\n')
+    eq(run_src(src), "10\n")
+
+
+@test("5a interp: untyped lambda infers from annotation")
+def _():
+    src = 'let h: (Int) -> Int = |x| x * 3\nprint(h(7))\n'
+    eq(run_src(src), "21\n")
+
+
+@test("5a interp: function renders as <function name>")
+def _():
+    src = 'fn foo() {\n}\nprint(foo)\n'
+    eq(run_src(src), "<function foo>\n")
+
+
+@test("5a formatter: function types and typed lambdas round-trip")
+def _():
+    src = ('let f: (Int, Text) -> Bool = g\n'
+           'let h = |x: Int| x + 1\n')
+    out = format_source(src, "f.misa")
+    assert "(Int, Text) -> Bool" in out, out
+    assert "|x: Int|" in out, out
+    eq(format_source(out, "f.misa"), out)
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "
