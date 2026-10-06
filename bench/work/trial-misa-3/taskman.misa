@@ -115,10 +115,16 @@ fn do_import(db: Db, arg: Text) {
         var title = ""
         var st = "todo"
         try {
-            let t: Text = item["title"]
+            let raw = item.title
+            let rs = json.stringify(raw)
+            let dq = "\""
+            if not str.starts_with(rs, dq) {
+                throw { code: "EBAD", message: "title not a string" }
+            }
+            let t: Text = raw
             title = t
             try {
-                let s: Text = item["status"]
+                let s: Text = item.status
                 st = s
             } catch e2 {
                 st = "todo"

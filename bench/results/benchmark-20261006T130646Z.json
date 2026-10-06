@@ -1,0 +1,226 @@
+{
+  "generated_at": "2026-10-06T13:06:46.296884+00:00",
+  "methodology": "spec/BENCHMARK.md (read limitations L1-L7 before citing)",
+  "trials": [
+    {
+      "trial": "trial-misa-1",
+      "language": "misa",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 181.127349,
+      "correction_loops": 2,
+      "failure_log": [
+        "misa check E001 at 59:8: Misa has no `else if` (ifStmt only allows `else { }`) \u2014 restructured dispatch into nested if/else calling per-command fns",
+        "misa check E211: fn getenv 'may exit without returning Text' \u2014 try/catch confused the return-path analysis; fixed by assigning to a var and returning it at the end"
+      ],
+      "loc": 187,
+      "artifact_bytes": 1862552,
+      "startup_ms": 7.693450999795459,
+      "notes": "Verifier RESULT: PASS 27/27 on the AOT binary. Design: uncaught throw of {code:'E300',message:'Error: ...'} yields clean exit-1 with no traceback (verified no stack dumps on bad ids, bad JSON, missing files, unknown commands). Env vars read via env() wrapped in try/catch for the E302-unset case (unset/empty TASKMAN_CMD -> help). db.exec bind args kept all-Text per STDLIB ([Text]?), relying on SQLite INTEGER affinity for WHERE id = ?. New-row id via SELECT id ... ORDER BY id DESC LIMIT 1 (checker-validated against a declared `table tasks`). Import validates array-ness by leading '[' after trim plus catching json.parse E300; missing title -> 'Error: bad item', bad status -> 'Error: bad status' (fail() never placed inside a try whose catch would swallow it). created = ISO-8601 via time.format(time.now()). Extra edge-case tests (id 0/negative/empty, non-array JSON, quotes/braces in titles, empty export, default ./tasks.db) all clean."
+    },
+    {
+      "trial": "trial-misa-2",
+      "language": "misa",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 241.127349,
+      "correction_loops": 5,
+      "failure_log": [
+        "probe.misa build E001: JSON '{\"a\": 1}' inside a string literal was parsed as interpolation start \u2014 learned '{{' is the escape for a literal open brace",
+        "probe2.misa build E208: 'value' is not a usable type annotation (json.parse return type can't be named)",
+        "probe2.misa runtime E300: '}}' in a string literal stays two literal braces (no '}}' escape) \u2014 produced invalid JSON",
+        "probe2.misa runtime E300 again: repeated the same '}}' mistake when rewriting the probe JSON literal",
+        "taskman.misa check E001: 'else if' is not in the Misa grammar (else must be followed directly by '{') \u2014 rewrote dispatch as nested if/else"
+      ],
+      "loc": 185,
+      "artifact_bytes": 1862720,
+      "startup_ms": 7.662564000384009,
+      "notes": "Verifier passes 27/27 on the AOT binary at workdir/taskman (source: taskman.misa). Key design decisions: exit code 1 via print('Error: ...') + uncaught throw (AOT exits 1 with a one-line 'line:col: CODE: msg' report on stderr \u2014 no traceback); env-var defaults via try/catch around env() (E302); id validation by manual digit scan (str.ord/str.slice) rather than int() to reject '0', '-3', ' 5', 'abc'; SQL injection avoided by binding titles with '?' placeholders while interpolating only validated-int ids and fixed status literals; import validates array-ness by checking the trimmed text starts with '[' then json.parse in try/catch (parse errors can't be distinguished from field-access errors otherwise); bad-status import items produce 'Error: bad status'. Edge cases verified manually beyond the verifier: bad ids, 23-digit ids (no task #<raw>), injection title stored literally, non-array JSON, empty array import, unknown command prints error + usage with exit 1. Hardest parts were Misa-specific: the '{{'/'}}' interpolation trap and the missing else-if. Typed 'table tasks' + db.query gave compile-time column checking for free."
+    },
+    {
+      "trial": "trial-misa-3",
+      "language": "misa",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 265.127349,
+      "correction_loops": 6,
+      "failure_log": [
+        "misa check E001: used 'else if' chain, but Misa grammar has no else-if; rewrote dispatch as nested if/else",
+        "misa check E211: 'getenv' with return inside try/catch flagged as may-exit-without-return; restructured to var assignment plus trailing return",
+        "misa check E208: 'value' is not a valid type annotation (despite STDLIB documenting json.parse -> value); used untyped 'var val = nil'",
+        "verifier FAIL 'import json': string-indexing (item[\"title\"]) on json.parse dynamic records always raises E300; switched to dot access (item.title)",
+        "verifier FAIL 'list after import': knock-on effect of the import failure above (no tasks imported)",
+        "verifier FAIL 'import keeps status': knock-on effect of the import failure above"
+      ],
+      "loc": 196,
+      "artifact_bytes": 1870992,
+      "startup_ms": 7.6516969993463135,
+      "notes": "Single-file taskman.misa (~190 lines), AOT-compiled to ./taskman; verifier run twice for stability, both RESULT: PASS 27/27. Key techniques: table decl for typed db.query; try/catch around env() for unset vars (E302); Text-only SQL binds with digit-validated id interpolation into SQL; json.stringify prefix check to reject non-array imports; dot access (not string indexing) on dynamic records; uncaught throw of an Error record for exit-1 user errors after printing the clean 'Error: ...' line. Extra edge cases probed manually (unset cmd, empty/negative ids, quoted titles, bad-status/missing-title/non-array/empty-array imports) all behave per spec with no tracebacks. Hardest part was discovering that string-indexing dynamic records never works (my first probe misread the E300 as 'missing key'). What helped: small interpreter probes of each dynamic behavior before writing the full program, then verifying each on AOT since several behaviors differ subtly."
+    },
+    {
+      "trial": "trial-python-1",
+      "language": "python",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 49.127349,
+      "correction_loops": 0,
+      "failure_log": [],
+      "loc": 238,
+      "artifact_bytes": 6459,
+      "startup_ms": 64.26523299978726,
+      "notes": "The spec mapped cleanly to Python stdlib (sqlite3/json/os/sys/datetime). Wrote the full implementation in one pass and it passed 27/27 on the first verifier run with zero failed attempts. Care points: positive-integer id validation (reject 0, negatives, non-numeric) via str.isdigit after strip; a top-level exception guard so no input can produce a traceback; export preserves exact key order id/title/status/created via dict insertion order; import reuses item 'created' when present, otherwise stamps now."
+    },
+    {
+      "trial": "trial-python-2",
+      "language": "python",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 47.127349,
+      "correction_loops": 0,
+      "failure_log": [],
+      "loc": 185,
+      "artifact_bytes": 5205,
+      "startup_ms": 64.17178299943771,
+      "notes": "Straightforward spec; implementation passed 27/27 on the first verifier run. Error messages go to stdout (verifier reads both streams combined). JSON export uses indent=2 but the verifier validates structurally, so formatting is safe."
+    },
+    {
+      "trial": "trial-python-3",
+      "language": "python",
+      "completed_reported": true,
+      "completed_verified": true,
+      "verifier_line": "RESULT: PASS 27/27",
+      "wall_seconds": 50.127349,
+      "correction_loops": 0,
+      "failure_log": [],
+      "loc": 181,
+      "artifact_bytes": 5990,
+      "startup_ms": 64.10774699998001,
+      "notes": "First draft passed 27/27 with zero failures. Careful points: (1) TASKMAN_CMD unset vs empty both map to help; (2) id validation uses raw string in Error: bad id '<value>' and rejects non-positive ints (\"0\", \"-1\") as bad ids; (3) import validates all items (string title, status in todo/doing/done) before inserting anything, preserving the item's created timestamp when present and non-empty; (4) unknown command prints the Error line plus full usage and exits 1. sqlite3 with CREATE TABLE IF NOT EXISTS on every run; stdout/stderr combined handled by verifier. Stdlib only: sqlite3, json, os, sys, datetime."
+    }
+  ],
+  "summary": {
+    "misa": {
+      "trials": 3,
+      "completion_rate": 1.0,
+      "wall_seconds": {
+        "n": 3,
+        "mean": 229.127349,
+        "min": 181.127349,
+        "max": 265.127349,
+        "values": [
+          181.127349,
+          241.127349,
+          265.127349
+        ]
+      },
+      "correction_loops": {
+        "n": 3,
+        "mean": 4.333333333333333,
+        "min": 2,
+        "max": 6,
+        "values": [
+          2,
+          5,
+          6
+        ]
+      },
+      "loc": {
+        "n": 3,
+        "mean": 189.33333333333334,
+        "min": 185,
+        "max": 196,
+        "values": [
+          187,
+          185,
+          196
+        ]
+      },
+      "artifact_bytes": {
+        "n": 3,
+        "mean": 1865421.3333333333,
+        "min": 1862552,
+        "max": 1870992,
+        "values": [
+          1862552,
+          1862720,
+          1870992
+        ]
+      },
+      "startup_ms": {
+        "n": 3,
+        "mean": 7.669237333175261,
+        "min": 7.6516969993463135,
+        "max": 7.693450999795459,
+        "values": [
+          7.693450999795459,
+          7.662564000384009,
+          7.6516969993463135
+        ]
+      }
+    },
+    "python": {
+      "trials": 3,
+      "completion_rate": 1.0,
+      "wall_seconds": {
+        "n": 3,
+        "mean": 48.79401566666667,
+        "min": 47.127349,
+        "max": 50.127349,
+        "values": [
+          49.127349,
+          47.127349,
+          50.127349
+        ]
+      },
+      "correction_loops": {
+        "n": 3,
+        "mean": 0,
+        "min": 0,
+        "max": 0,
+        "values": [
+          0,
+          0,
+          0
+        ]
+      },
+      "loc": {
+        "n": 3,
+        "mean": 201.33333333333334,
+        "min": 181,
+        "max": 238,
+        "values": [
+          238,
+          185,
+          181
+        ]
+      },
+      "artifact_bytes": {
+        "n": 3,
+        "mean": 5884.666666666667,
+        "min": 5205,
+        "max": 6459,
+        "values": [
+          6459,
+          5205,
+          5990
+        ]
+      },
+      "startup_ms": {
+        "n": 3,
+        "mean": 64.18158766640165,
+        "min": 64.10774699998001,
+        "max": 64.26523299978726,
+        "values": [
+          64.26523299978726,
+          64.17178299943771,
+          64.10774699998001
+        ]
+      }
+    }
+  }
+}

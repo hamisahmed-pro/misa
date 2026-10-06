@@ -1,2 +1,0 @@
-print("Error: boom")
-throw { code: "E999", message: "boom" }
