@@ -21,13 +21,6 @@ ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MISA=os.path.join(ROOT,"impl","bin","misa")
 SRC=os.path.join(ROOT,"bench","benchlang.misa")
 N=5
-EXPECTED={
- "primes":"1270607",
- "fib":"1134903170",
- "strings":"5000000",
- "mandelbrot":"16727474",
- "binarytrees":"-?",
-}
 # The binary-tree checksum is obtained from the reference implementations
 # at runtime below; it must agree across all five languages.  We don't hardcode
 # a guessed value.
@@ -52,33 +45,13 @@ def one(cmd,cwd=None):
 def write(path,s):
     open(path,"w").write(s)
 
-# The non-Misa programs are exact translations of the checked-in benchLANG
-# programs. Keeping them generated here makes the benchmark self-contained.
-PY=os.path.join(WORK,"bench.py")
-NODE=os.path.join(WORK,"bench.js")
-PHP=os.path.join(WORK,"bench.php")
-RUST=os.path.join(WORK,"bench.rs")
-GO=os.path.join(WORK,"bench.go")
-
-# Fetch the pinned upstream-equivalent sources from the local benchmark corpus
-# where available; fall back to checked-in generated copies.
-UP=os.path.join(ROOT,"bench","external","bgsrc")
-
-# Use small, purpose-built equivalents so Misa and the five baselines share
-# exactly the same algorithms and constants.
-COMMON='''PRIMES_LIMIT=20000000
-FIBONACCI_N=45
-STRING_ITER=5000000
-MANDEL_SIZE=4096
-MANDEL_MAX_ITER=256
-TREE_MIN_DEPTH=4
-TREE_MAX_DEPTH=18
-SENTENCE="The quick brown fox jumps over dat lazy dog that was not enough to jump over the frog again"
-'''
-# Rather than maintain five huge source strings here, generate from compact
-# templates below.
+# Canonical language baselines are pinned in bench/compare/ and were adapted
+# from GlebOlsen/benchLANG commit 2731f29bcf0bfda750a62c81337b5e5e7456bb4a.
+# They expose an optional workload selector so every language executes exactly
+# one kernel per measured process.
 
 write(PY, COMMON+r'''
+import sys, time
 def is_prime(n):
     if n<2:return False
     if n<4:return True
@@ -88,65 +61,55 @@ def is_prime(n):
         if n%i==0 or n%(i+2)==0:return False
         i+=6
     return True
-def primes():
+def bench_primes(limit):
     c=0
-    for i in range(2,PRIMES_LIMIT):
+    for i in range(2,limit):
         if is_prime(i):c+=1
     return c
 def fib(n): return n if n<2 else fib(n-1)+fib(n-2)
-def strings():
-    w=SENTENCE.split(" "); c=0
-    for _ in range(STRING_ITER):
-      for a in w:
-       for b in w:
-        if a==b:c+=1
-    return c
-def mandel():
-    c=0
-    for py in range(MANDEL_SIZE):
-      cy=py/MANDEL_SIZE*3.0-1.5
-      for px in range(MANDEL_SIZE):
-       cx=px/MANDEL_SIZE*3.0-2.0; zx=zy=0.0; it=0
+def bench_strings(sentence,iters):
+    words=sentence.split(' '); total=0
+    for _ in range(iters):
+      for wi in words:
+       for wj in words:
+        if wi==wj: total+=1
+    return total
+def bench_mandelbrot(size):
+    checksum=0
+    for py in range(size):
+      cy=py/size*3.0-1.5
+      for px in range(size):
+       cx=px/size*3.0-2.0; zx=0.0; zy=0.0; it=0
        while it<MANDEL_MAX_ITER and zx*zx+zy*zy<=4.0:
         nx=zx*zx-zy*zy+cx; zy=2*zx*zy+cy; zx=nx; it+=1
-       c+=it
-    return c
+       checksum+=it
+    return checksum
 class Node:
-    __slots__=("l","r","v")
-    def __init__(self,l,r,v):self.l=l;self.r=r;self.v=v
-def tree(v,d):
-    return Node(None,None,v) if d==0 else Node(tree(2*v-1,d-1),tree(2*v,d-1),v)
-def check(n):return n.v if n.l is None else n.v+check(n.l)-check(n.r)
-def trees():
-    c=check(tree(0,TREE_MAX_DEPTH+1)); ll=tree(0,TREE_MAX_DEPTH)
-    d=TREE_MIN_DEPTH
-    while d<=TREE_MAX_DEPTH:
-      for i in range(1<<(TREE_MAX_DEPTH-d+TREE_MIN_DEPTH)):c+=check(tree(i+1,d))
-      d+=2
-    return c
-for n,f in [("primes",primes),("fib",lambda:fib(FIBONACCI_N)),("strings",strings),("mandelbrot",mandel),("binarytrees",trees)]:
- t=time.perf_counter(); print(n,f(),time.perf_counter()-t)
+    __slots__=('left','right','item')
+    def __init__(self,left,right,item): self.left=left; self.right=right; self.item=item
+def make_tree(item,depth):
+    if depth==0:return Node(None,None,item)
+    return Node(make_tree(2*item-1,depth-1),make_tree(2*item,depth-1),item)
+def check_tree(n):
+    return n.item if n.left is None else n.item+check_tree(n.left)-check_tree(n.right)
+def bench_binary_trees(max_depth):
+    checksum=check_tree(make_tree(0,max_depth+1)); long_lived=make_tree(0,max_depth)
+    for d in range(TREE_MIN_DEPTH,max_depth+1,2):
+      for i in range(1 << (max_depth-d+TREE_MIN_DEPTH)): checksum+=check_tree(make_tree(i+1,d))
+    return checksum
+bench=sys.argv[1] if len(sys.argv)>1 else "all"
+jobs={
+ "primes":lambda:bench_primes(PRIMES_LIMIT),
+ "fib":lambda:fib(FIBONACCI_N),
+ "strings":lambda:bench_strings(SENTENCE,STRING_ITER),
+ "mandelbrot":lambda:bench_mandelbrot(MANDEL_SIZE),
+ "binarytrees":lambda:bench_binary_trees(TREE_MAX_DEPTH)}
+for name,fn in jobs.items():
+    if bench not in ("all",name): continue
+    t=time.perf_counter(); result=fn(); print(name,result,f"{time.perf_counter()-t:.6f}")
 ''')
 
-# Node/PHP/Rust/Go sources are compact equivalents of the Python reference.
-write(NODE, COMMON.replace("PRIMES_LIMIT=20000000","const PRIMES_LIMIT=20000000;").replace("FIBONACCI_N=45","const FIBONACCI_N=45;").replace("STRING_ITER=5000000","const STRING_ITER=5000000;").replace("MANDEL_SIZE=4096","const MANDEL_SIZE=4096;").replace("MANDEL_MAX_ITER=256","const MANDEL_MAX_ITER=256;").replace("TREE_MIN_DEPTH=4","const TREE_MIN_DEPTH=4;").replace("TREE_MAX_DEPTH=18","const TREE_MAX_DEPTH=18;").replace('SENTENCE="','const SENTENCE="')+";
-// generated baseline is supplied by the checked-in benchLANG source\n"+open(os.path.join(ROOT,"bench","external","bgsrc","mandelbrot.node.js"),errors="ignore").read())
-# For exact five-workload baselines use the upstream benchLANG files.
-import pathlib
-# These are materialized from repository data by this runner only if present.
-# CI checks them into the runner's workspace through the source files below.
-for p,src in [(NODE,"benchLANG-node.js"),(PHP,"benchLANG-php.php"),(RUST,"benchLANG-rust.rs"),(GO,"benchLANG-go.go")]:
-    pass
-
-# Instead of duplicating upstream source in this harness, invoke a tiny
-# generated wrapper around the canonical language-specific files checked in
-# under bench/compare when available.
 compare=os.path.join(ROOT,"bench","compare")
-os.makedirs(compare,exist_ok=True)
-
-# Copy the canonical benchLANG implementations from a vendored snapshot
-# created during benchmark setup. If absent, fail loudly rather than silently
-# substituting a different workload.
 sources={
  "node":os.path.join(compare,"benchlang.js"),
  "php":os.path.join(compare,"benchlang.php"),
@@ -156,7 +119,6 @@ sources={
 missing=[p for p in sources.values() if not os.path.exists(p)]
 if missing:
     print("ERROR: missing benchmark baselines:",*missing,sep="\n")
-    print("The benchmark refuses to run because substituting workloads would invalidate comparison.")
     raise SystemExit(2)
 
 langs={}
@@ -164,44 +126,75 @@ langs["python"]=["python3",PY]
 langs["node"]=["node",sources["node"]]
 langs["php"]=["php",sources["php"]]
 
-# Compile Rust and Go.
+build_times={}
 for lang,src,cmd in [
  ("rust",sources["rust"],["rustc","-O",src,"-o",os.path.join(WORK,"rust-bench")]),
  ("go",sources["go"],["go","build","-o",os.path.join(WORK,"go-bench"),src]),
 ]:
-    t=time.perf_counter(); rc,out,err=sh(cmd,cwd=ROOT); build=time.perf_counter()-t
+    t=time.perf_counter(); rc,out,err=sh(cmd,cwd=ROOT); build_times[lang]=time.perf_counter()-t
     if rc: print(err); raise SystemExit(3)
     langs[lang]=[os.path.join(WORK,lang+"-bench")]
 
-# Misa AOT.
 misa_out=os.path.join(WORK,"misa-bench")
-t=time.perf_counter(); rc,out,err=sh(["python3",MISA,"build",SRC,"-o",misa_out],cwd=ROOT); misa_build=time.perf_counter()-t
+t=time.perf_counter(); rc,out,err=sh(["python3",MISA,"build",SRC,"-o",misa_out],cwd=ROOT); build_times["misa"]=time.perf_counter()-t
 if rc: print(err); raise SystemExit(4)
 langs["misa"]=[misa_out]
+
+def measure(cmd):
+    # /usr/bin/time gives process-level wall time and peak RSS, while the
+    # program's checksum is captured independently.
+    t=time.perf_counter()
+    p=subprocess.run(["/usr/bin/time","-f","%e %M"]+cmd,capture_output=True,text=True)
+    wall=time.perf_counter()-t
+    if p.returncode: raise RuntimeError(p.stderr)
+    lines=p.stdout.strip().splitlines()
+    metric=p.stderr.strip().splitlines()[-1].split()
+    rss_kb=int(metric[1]) if len(metric)>1 else None
+    return wall,rss_kb,lines[-1] if lines else ""
 
 results={}
 for lang,cmd in langs.items():
     print("\n==",lang,"==")
     results[lang]={}
     for bench in ["primes","fib","strings","mandelbrot","binarytrees"]:
-        samples=[]; outs=[]
-        # baseline programs accept an optional benchmark selector; Misa does too.
-        actual=cmd+[bench]
-        one(actual) # warmup
+        samples=[]; rss=[]; last=""
         for _ in range(N):
-            sec,rc,lines,err=one(actual)
-            if rc!=0:
-                raise RuntimeError(f"{lang}/{bench} failed: {err}")
-            samples.append(sec); outs.append(lines[-1] if lines else "")
-        results[lang][bench]={"median_s":statistics.median(samples),"samples_s":samples,"last":outs[-1]}
+            wall,mem,last=measure(cmd+[bench])
+            samples.append(wall); rss.append(mem)
+        fields=last.split()
+        checksum=fields[1] if lang!="misa" and len(fields)>1 else fields[0]
+        results[lang][bench]={
+          "median_s":statistics.median(samples),
+          "samples_s":samples,
+          "peak_rss_kb_max":max(rss),
+          "checksum":checksum}
         print(bench,results[lang][bench])
 
-# Correctness: each benchmark's reported checksum must match across all languages.
 for bench in ["primes","fib","strings","mandelbrot","binarytrees"]:
-    vals={lang:results[lang][bench]["last"].split()[1] if len(results[lang][bench]["last"].split())>1 else results[lang][bench]["last"] for lang in results}
+    vals={lang:results[lang][bench]["checksum"] for lang in results}
     if len(set(vals.values()))!=1:
         raise RuntimeError(f"checksum divergence {bench}: {vals}")
 
+artifacts={}
+for lang,path in [("misa",misa_out),("rust",os.path.join(WORK,"rust-bench")),("go",os.path.join(WORK,"go-bench"))]:
+    artifacts[lang]=os.path.getsize(path)
+artifacts["python"]=os.path.getsize(PY)
+artifacts["node"]=os.path.getsize(sources["node"])
+artifacts["php"]=os.path.getsize(sources["php"])
+
+out={
+ "timestamp":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
+ "host":platform.platform(),
+ "python":platform.python_version(),
+ "benchlang_source_commit":"2731f29bcf0bfda750a62c81337b5e5e7456bb4a",
+ "languages":results,
+ "artifact_bytes":artifacts,
+ "build_seconds":build_times,
+ "method":"5 independent process executions per workload; median wall time; peak RSS; exact checksum agreement required"
+}
+path=os.path.join(ROOT,"bench","results","benchlang-latest.json")
+json.dump(out,open(path,"w"),indent=2)
+print("\nWROTE",path)
 # Build artifacts.
 artifacts={}
 for lang,path in [("misa",misa_out),("rust",os.path.join(WORK,"rust-bench")),("go",os.path.join(WORK,"go-bench"))]:
