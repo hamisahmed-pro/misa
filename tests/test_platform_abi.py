@@ -10,6 +10,8 @@ Usage: python3 tests/test_platform_abi.py
 import json
 import os
 import re
+import subprocess
+import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,9 +69,27 @@ def main():
         spec = json.load(f)
 
     contracts = spec.get("abi_contracts", {})
+    header = os.path.join(RT_DIR, "misa_platform.h")
+    if not os.path.isfile(header):
+        print("FAIL E600: canonical platform header missing")
+        return 1
     targets = spec.get("targets", {})
 
     failures = []
+    # Compile every runtime implementation when its target toolchain is
+    # available. This catches type/ABI errors that regex cannot see.
+    for target, info in targets.items():
+        rt_file = os.path.join(RT_DIR, info["runtime_file"])
+        if not os.path.isfile(rt_file):
+            continue
+        if rt_file.endswith(".c"):
+            cc = "gcc" if target == "x86_64-unknown-linux-gnu" else None
+            if cc and shutil.which(cc):
+                probe = subprocess.run([cc, "-fsyntax-only", "-include", header,
+                                        "-I", RT_DIR, rt_file],
+                                       capture_output=True, text=True)
+                if probe.returncode:
+                    failures.append(f"{target}: compiler ABI/type validation failed: {probe.stderr.strip()[:300]}")
     for target, info in targets.items():
         rt_file = os.path.join(RT_DIR, info["runtime_file"])
         if not os.path.isfile(rt_file):
