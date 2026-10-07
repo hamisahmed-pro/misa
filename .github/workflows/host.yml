@@ -23,8 +23,20 @@ jobs:
         run: |
           chmod +x impl/bin/misa
           python3 tests/run_tests.py
+      - name: Interpreter vs AOT differential gate
+        run: python3 tests/aot/run_aot_tests.py
       - name: AOT parity suite
         run: python3 tests/aot/run_aot_tests.py
+      - name: Platform capability matrix
+        run: python3 - <<'PY'
+import json
+p=json.load(open("spec/platform.json"))
+assert p["version"] == "1.0.0"
+assert "x86_64-unknown-linux-gnu" in p["targets"]
+for t,v in p["targets"].items():
+    assert "capabilities" in v and "status" in v
+print("platform matrix OK")
+PY
       - name: On-device AI suite (M1)
         run: python3 tests/ondevice/run_ondevice_tests.py
       - name: On-device AOT suite (M2)
