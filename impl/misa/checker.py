@@ -21,7 +21,9 @@ SPECIAL = {"TokenStream", "Embedding", "Db", "Builder",
            # Wave 3 (stdlib): compiled regex handle.
            "Regex",
            # Final wave (stdlib): opaque binary data (compress.*).
-           "Bytes"}
+           "Bytes",
+           # cli: declarative args parsing.
+           "CliParser", "CliArgs"}
 # Phase 7 (concurrency): builtin generic type names, exactly 1 type
 # argument (like List<T>). `Task<Text>`, `Chan<Int>` are valid
 # annotations; bare `Task`/`Chan` is an error (E221, suggesting the
@@ -108,6 +110,20 @@ NS_BUILTINS = {
     "compress.gunzip_bytes": (["Bytes"], "Bytes"),
     "compress.gzip_file": (["Text", "Text"], "Int"),
     "compress.gunzip_file": (["Text", "Text"], "Int"),
+    # cli: declarative args parsing. cli.flag takes an optional 5th
+    # arg (default); see NS_BUILTIN_ARITY. cli.get/get_bool take
+    # CliArgs? so the `if args == nil { return }` pattern typechecks
+    # without flow-sensitive narrowing (nil receiver -> clean E300).
+    "cli.parser": (["Text", "Text"], "CliParser"),
+    "cli.flag": (["CliParser", "Text", "Text", "Text"], "Void"),
+    "cli.bool_flag": (["CliParser", "Text", "Text"], "Void"),
+    "cli.short": (["CliParser", "Text", "Text"], "Void"),
+    "cli.command": (["CliParser", "Text", "Text"], "Void"),
+    "cli.parse": (["CliParser", "[Text]"], "CliArgs?"),
+    "cli.get": (["CliArgs?", "Text"], "Text"),
+    "cli.get_bool": (["CliArgs?", "Text"], "Bool"),
+    "cli.get_command": (["CliArgs?"], "Text?"),
+    "cli.positionals": (["CliArgs?"], "[Text]"),
     "http.serve": (["Int", "any"], "Void"),
     "time.now": ([], "Int"),
     "time.now_ms": ([], "Int"),
@@ -184,6 +200,8 @@ POLY_BUILTINS = {
 NS_BUILTIN_ARITY = {
     "db.exec": (2, 3),
     "db.query": (2, 3),
+    # cli: p.flag(name, metavar, help[, default]).
+    "cli.flag": (4, 5),
 }
 
 # Phase 8 (overtake): checked `throws` signatures — known E-code sets for
@@ -214,6 +232,14 @@ BUILTIN_THROWS = {
     "compress.gunzip_bytes": frozenset({"E300"}),
     "compress.gzip_file": frozenset({"E303"}),
     "compress.gunzip_file": frozenset({"E303", "E300"}),
+    # cli: schema definition errors (duplicates) and parse/get errors.
+    "cli.flag": frozenset({"E300"}),
+    "cli.bool_flag": frozenset({"E300"}),
+    "cli.short": frozenset({"E300"}),
+    "cli.command": frozenset({"E300"}),
+    "cli.parse": frozenset({"E300"}),
+    "cli.get": frozenset({"E300"}),
+    "cli.get_bool": frozenset({"E300"}),
     # I/O
     "fs.read": frozenset({"E303"}),
     "fs.write": frozenset({"E303"}),
@@ -1033,6 +1059,11 @@ class Checker:
                        a.line, a.col)
 
     # -- Wave 3 (stdlib expansion) ------------------------------------
+
+    @staticmethod
+    def _strlit_text(nm) -> str:
+        """Concatenated text of a string literal ("" has no parts)."""
+        return "".join(p for p in nm.parts if isinstance(p, str))
 
     @staticmethod
     def _validate_regex(pattern: str):
@@ -2628,6 +2659,33 @@ class Checker:
                 e.name = "listener.close"
                 e.args.insert(0, ast.Ident(name=recv, line=e.line,
                                            col=e.col))
+        # cli: `p.flag(..)` / `p.bool_flag(..)` / `p.short(..)` /
+        # `p.command(..)` / `p.parse(..)` where p: CliParser, and
+        # `args.get(..)` / `args.get_bool(..)` / `args.command()` /
+        # `args.positionals()` where args: CliArgs or CliArgs?, rewrite
+        # to the canonical `cli.*` builtins with the receiver prepended
+        # (same trick as Db/Chan/Socket).
+        if e.callee is None and e.name not in NS_BUILTINS \
+                and "." in e.name:
+            recv, _, field = e.name.partition(".")
+            if recv in scope and scope[recv][0] == "CliParser" \
+                    and field in ("flag", "bool_flag", "short",
+                                  "command", "parse"):
+                e.name = f"cli.{field}"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+            elif recv in scope \
+                    and scope[recv][0] in ("CliArgs", "CliArgs?") \
+                    and field in ("get", "get_bool", "positionals"):
+                e.name = f"cli.{field}"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
+            elif recv in scope \
+                    and scope[recv][0] in ("CliArgs", "CliArgs?") \
+                    and field == "command":
+                e.name = "cli.get_command"
+                e.args.insert(0, ast.Ident(name=recv, line=e.line,
+                                           col=e.col))
         # Phase 8 (overtake): interface method calls. `d.draw()`
         # where `d: Drawable` rewrites to `iface.Drawable.draw` with the
         # receiver prepended (dynamic dispatch); `c.draw()` where
@@ -2961,6 +3019,25 @@ class Checker:
                                arg.line, arg.col)
                     return "unknown"
             return "Regex"
+        # cli: check-time validation of string literals (the overtake
+        # angle — bad schemas fail at check time, like regex patterns).
+        # Empty flag names and multi-char shorts are E200 here; the
+        # runtime re-checks for non-literal args (E300).
+        if e.name in ("cli.flag", "cli.bool_flag") and len(e.args) >= 2:
+            nm = e.args[1]
+            if isinstance(nm, ast.StrLit) and not self._strlit_text(nm):
+                self.error("E200", "flag name cannot be empty",
+                           nm.line, nm.col)
+                return "unknown"
+        if e.name == "cli.short" and len(e.args) >= 3:
+            sh = e.args[2]
+            if isinstance(sh, ast.StrLit) and len(sh.parts) == 1 \
+                    and isinstance(sh.parts[0], str) \
+                    and len(sh.parts[0]) != 1:
+                self.error("E200",
+                           "short flag must be one character, got "
+                           f"'{sh.parts[0]}'", sh.line, sh.col)
+                return "unknown"
         # Wave 3 (stdlib): `set()` / `set<T>()` constructs an empty
         # `Set<T>` (defaults to `Set<unknown>`).
         if e.name == "set" and "set" not in self.fns \

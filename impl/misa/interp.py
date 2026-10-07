@@ -287,6 +287,99 @@ class BytesValue:
         return f"BytesValue({len(self.data)} bytes)"
 
 
+class CliParserValue:
+    """cli: a `CliParser` — accumulates flag/command declarations.
+
+    Mirrors MisaCliParser in the AOT runtime. flags is a list of dicts:
+    {name, metavar (None for bool), help, is_bool, default (None),
+     short (None or one char)}. commands is a list of {name, help}.
+    """
+
+    def __init__(self, prog: str, desc: str):
+        self.prog = prog
+        self.desc = desc
+        self.flags: list = []
+        self.commands: list = []
+
+    def find_flag(self, name: str):
+        for f in self.flags:
+            if f["name"] == name:
+                return f
+        return None
+
+    def find_short(self, c: str):
+        for f in self.flags:
+            if f["short"] == c:
+                return f
+        return None
+
+    def find_command(self, name: str):
+        for c in self.commands:
+            if c["name"] == name:
+                return c
+        return None
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"CliParserValue({self.prog!r})"
+
+
+class CliArgsValue:
+    """cli: a `CliArgs` — one parse result. Mirrors MisaCliArgs."""
+
+    def __init__(self, parser: CliParserValue):
+        self.parser = parser
+        self.values: dict = {}   # name -> explicit Text value
+        self.bools: dict = {}    # name -> True (bool flags only)
+        self.command = None      # Text or None
+        self.positionals: list = []
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"CliArgsValue({self.parser.prog!r})"
+
+
+def cli_build_help(p: CliParserValue) -> str:
+    """Build the --help text. Mirrors cli_help_into() in misa_rt.c
+    exactly — byte-identical output is asserted by AOT parity tests."""
+    out = []
+    if p.desc:
+        out.append(f"{p.prog} - {p.desc}\n\n")
+    else:
+        out.append(f"{p.prog}\n\n")
+    out.append(f"Usage: {p.prog} [flags]")
+    if p.commands:
+        out.append(" <command> [args]")
+    else:
+        out.append(" [args]")
+    out.append("\n\nFlags:\n")
+    specs = []
+    for f in p.flags:
+        if f["short"]:
+            spec = f"-{f['short']}, --{f['name']}"
+        else:
+            spec = f"--{f['name']}"
+        if not f["is_bool"]:
+            spec += f" {f['metavar']}"
+        specs.append(spec)
+    specs.append("-h, --help")
+    width = max(len(s) for s in specs)
+    for f, spec in zip(p.flags, specs):
+        line = f"  {spec:<{width}}  {f['help']}"
+        if f["default"] is not None:
+            line += f" (default: {f['default']})"
+        out.append(line + "\n")
+    out.append(f"  {'-h, --help':<{width}}  Show this help and exit\n")
+    if p.commands:
+        out.append("\nCommands:\n")
+        cwidth = max(len(c["name"]) for c in p.commands)
+        for c in p.commands:
+            out.append(f"  {c['name']:<{cwidth}}  {c['help']}\n")
+    return "".join(out)
+
+
+def _cli_is_flaglike(tok: str) -> bool:
+    return tok.startswith("-") and tok != "-" and len(tok) > 1
+
+
 # Final wave (stdlib): fixed gzip header (mtime=0, XFL=max, OS=Unix)
 # shared by the manual framing below and mirrored in the AOT runtime.
 _GZ_HDR = bytes([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -399,6 +492,10 @@ def render_value(v: Any) -> str:
     # Wave 3 (stdlib).
     if isinstance(v, RegexValue):
         return f"<regex: {v.pattern}>"
+    if isinstance(v, CliParserValue):
+        return f"<cli-parser: {v.prog}>"
+    if isinstance(v, CliArgsValue):
+        return "<cli-args>"
     if isinstance(v, SetValue):
         return "{" + ", ".join(render_value(i) for i in v.items) + "}"
     # Final wave (stdlib): opaque bytes render as their length.
@@ -1395,6 +1492,28 @@ class Interpreter:
                         and field == "set_timeout":
                     name = "socket.set_timeout"
                     args = [rv] + args
+            elif field in ("flag", "bool_flag", "short", "command",
+                           "parse", "get", "get_bool", "positionals"):
+                # cli: `p.flag(..)` / `p.parse(..)` where the variable
+                # holds a CliParserValue, and `args.get(..)` /
+                # `args.command()` / ... where it holds a CliArgsValue
+                # (the checker rewrites the checked AST; this covers
+                # ASTs that bypass checking).
+                try:
+                    rv = env.lookup(recv)[0]
+                except UndefinedName:
+                    rv = None
+                if isinstance(rv, CliParserValue) \
+                        and field in ("flag", "bool_flag", "short",
+                                      "command", "parse"):
+                    name = "cli." + field
+                    args = [rv] + args
+                elif isinstance(rv, CliArgsValue) \
+                        and field in ("get", "get_bool", "command",
+                                      "positionals"):
+                    name = {"command": "cli.get_command"}.get(
+                        field, "cli." + field)
+                    args = [rv] + args
         if name in self.models:
             return self.call_model(self.models[name], args, e)
         if name in self.screens:
@@ -1866,6 +1985,116 @@ class Interpreter:
             return SetValue([x for x in s.items
                              if not any(_misa_eq(x, y)
                                        for y in other.items)])
+        # -- cli: declarative args parsing -----------------------------
+        if name == "cli.parser":
+            if not isinstance(args[0], str) or not isinstance(args[1], str):
+                raise RuntimeError_("cli.parser(Text, Text) needs text args")
+            return CliParserValue(args[0], args[1])
+        if name in ("cli.flag", "cli.bool_flag", "cli.short",
+                    "cli.command"):
+            p = args[0]
+            if not isinstance(p, CliParserValue):
+                raise RuntimeError_(f"{name} needs a CliParser")
+            lc, cc = e.line, e.col
+            if name == "cli.flag":
+                fname, metavar, fhelp = args[1], args[2], args[3]
+                default = args[4] if len(args) > 4 else None
+                if p.find_flag(fname):
+                    raise RuntimeError_(f"duplicate flag '{fname}'",
+                                        line=lc, col=cc)
+                p.flags.append({"name": fname, "metavar": metavar,
+                                "help": fhelp, "is_bool": False,
+                                "default": default, "short": None})
+                return None
+            if name == "cli.bool_flag":
+                fname, fhelp = args[1], args[2]
+                if p.find_flag(fname):
+                    raise RuntimeError_(f"duplicate flag '{fname}'",
+                                        line=lc, col=cc)
+                p.flags.append({"name": fname, "metavar": None,
+                                "help": fhelp, "is_bool": True,
+                                "default": None, "short": None})
+                return None
+            if name == "cli.short":
+                fname, sh = args[1], args[2]
+                f = p.find_flag(fname)
+                if f is None:
+                    raise RuntimeError_(
+                        f"cli.short: no such flag '{fname}'",
+                        line=lc, col=cc)
+                if len(sh) != 1:
+                    raise RuntimeError_(
+                        f"cli.short: short flag must be one character, "
+                        f"got '{sh}'", line=lc, col=cc)
+                if sh == "h":
+                    raise RuntimeError_(
+                        "cli.short: '-h' is reserved for --help",
+                        line=lc, col=cc)
+                o = p.find_short(sh)
+                if o is not None and o is not f:
+                    raise RuntimeError_(
+                        f"cli.short: '-{sh}' is already the short flag "
+                        f"for '--{o['name']}'", line=lc, col=cc)
+                f["short"] = sh
+                return None
+            # cli.command
+            cname, chelp = args[1], args[2]
+            if p.find_command(cname):
+                raise RuntimeError_(f"duplicate command '{cname}'",
+                                    line=lc, col=cc)
+            p.commands.append({"name": cname, "help": chelp})
+            return None
+        if name == "cli.parse":
+            p, argv = args[0], args[1]
+            if not isinstance(p, CliParserValue):
+                raise RuntimeError_("cli.parse needs a CliParser")
+            if not isinstance(argv, list):
+                raise RuntimeError_("cli.parse needs an argv list")
+            return self._cli_parse(p, argv, e)
+        if name in ("cli.get", "cli.get_bool"):
+            a, fname = args[0], args[1]
+            if a is None:
+                raise RuntimeError_(
+                    "no parsed arguments (parse returned nil, "
+                    "likely --help)", line=e.line, col=e.col)
+            if not isinstance(a, CliArgsValue):
+                raise RuntimeError_(f"{name} needs CliArgs")
+            f = a.parser.find_flag(fname)
+            if f is None:
+                raise RuntimeError_(
+                    f"unknown flag '{fname}' (not defined on this parser)",
+                    line=e.line, col=e.col)
+            if name == "cli.get_bool":
+                if not f["is_bool"]:
+                    raise RuntimeError_(
+                        f"flag '{fname}' takes a value; use get, not "
+                        f"get_bool", line=e.line, col=e.col)
+                return fname in a.bools
+            if f["is_bool"]:
+                raise RuntimeError_(
+                    f"flag '{fname}' is a bool flag; use get_bool, not get",
+                    line=e.line, col=e.col)
+            if fname in a.values:
+                return a.values[fname]
+            if f["default"] is not None:
+                return f["default"]
+            raise RuntimeError_(
+                f"flag '--{fname}' was not provided and has no default",
+                line=e.line, col=e.col)
+        if name == "cli.get_command":
+            a = args[0]
+            if a is None:
+                return None
+            if not isinstance(a, CliArgsValue):
+                raise RuntimeError_("cli.get_command needs CliArgs")
+            return a.command
+        if name == "cli.positionals":
+            a = args[0]
+            if a is None:
+                return []
+            if not isinstance(a, CliArgsValue):
+                raise RuntimeError_("cli.positionals needs CliArgs")
+            return list(a.positionals)
         if name in ("map", "filter", "fold", "sort_by"):
             xs = args[0]
             if not isinstance(xs, list):
@@ -2916,6 +3145,117 @@ class Interpreter:
             raise IOError_(f"db.close failed: {ex}",
                            line=node.line, col=node.col)
         return None
+
+    def _cli_parse(self, p: CliParserValue, argv: list,
+                   node: ast.Node):
+        """Parse argv against p. Mirrors misa_cli_parse() in misa_rt.c
+        exactly — same tokens, same errors, same help text. Returns a
+        CliArgsValue, or None (nil) after printing --help."""
+        lc, cc = node.line, node.col
+        args = CliArgsValue(p)
+        n = len(argv)
+        dashdash = False
+        i = 0
+        while i < n:
+            tok = argv[i]
+            if dashdash:
+                args.positionals.append(tok)
+                i += 1
+                continue
+            if tok == "--":
+                dashdash = True
+                i += 1
+                continue
+            if tok == "-" or not tok.startswith("-"):
+                if p.commands and args.command is None:
+                    names = [c["name"] for c in p.commands]
+                    if tok not in names:
+                        raise RuntimeError_(
+                            f"unknown command '{tok}' (expected one of: "
+                            f"{' '.join(names)})", line=lc, col=cc)
+                    args.command = tok
+                else:
+                    args.positionals.append(tok)
+                i += 1
+                continue
+            if tok.startswith("--"):
+                if tok == "--help":
+                    self.out.write(cli_build_help(p))
+                    return None
+                body = tok[2:]
+                if "=" in body:
+                    name, val = body.split("=", 1)
+                    has_eq = True
+                else:
+                    name, val = body, None
+                    has_eq = False
+                if not name:
+                    raise RuntimeError_(f"malformed flag '{tok}'",
+                                        line=lc, col=cc)
+                if name == "help":
+                    self.out.write(cli_build_help(p))
+                    return None
+                f = p.find_flag(name)
+                if f is None:
+                    raise RuntimeError_(
+                        f"unknown flag '--{name}' (run '{p.prog} --help' "
+                        f"for usage)", line=lc, col=cc)
+                if f["is_bool"]:
+                    if has_eq:
+                        raise RuntimeError_(
+                            f"flag '--{name}' takes no value (it's a bool "
+                            f"flag)", line=lc, col=cc)
+                    args.bools[name] = True
+                else:
+                    if not has_eq:
+                        if i + 1 >= n or _cli_is_flaglike(argv[i + 1]):
+                            raise RuntimeError_(
+                                f"flag '--{name}' needs a value",
+                                line=lc, col=cc)
+                        i += 1
+                        val = argv[i]
+                    args.values[name] = val if val is not None else ""
+                i += 1
+                continue
+            # Short flag(s).
+            if tok == "-h":
+                self.out.write(cli_build_help(p))
+                return None
+            rest = tok[1:]
+            if "=" in rest:
+                pre, post = rest.split("=", 1)
+                if len(pre) == 1 and pre != "":
+                    f = p.find_short(pre)
+                    if f is None:
+                        raise RuntimeError_(
+                            f"unknown flag '-{pre}' (run '{p.prog} --help' "
+                            f"for usage)", line=lc, col=cc)
+                    if f["is_bool"]:
+                        raise RuntimeError_(
+                            f"flag '-{pre}' takes no value (it's a bool "
+                            f"flag)", line=lc, col=cc)
+                    args.values[f["name"]] = post
+                    i += 1
+                    continue
+            if len(rest) != 1:
+                raise RuntimeError_(
+                    f"combined short flags like '{tok}' are not supported "
+                    f"(use -a -b -c)", line=lc, col=cc)
+            f = p.find_short(rest)
+            if f is None:
+                raise RuntimeError_(
+                    f"unknown flag '-{rest}' (run '{p.prog} --help' for "
+                    f"usage)", line=lc, col=cc)
+            if not f["is_bool"]:
+                if i + 1 >= n or _cli_is_flaglike(argv[i + 1]):
+                    raise RuntimeError_(
+                        f"flag '-{rest}' needs a value", line=lc, col=cc)
+                i += 1
+                args.values[f["name"]] = argv[i]
+            else:
+                args.bools[f["name"]] = True
+            i += 1
+        return args
 
     def call_builtin(self, name: str, args: list, node: ast.Node) -> Any:
         if name == "state":

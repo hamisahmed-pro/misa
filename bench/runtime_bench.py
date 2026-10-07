@@ -84,7 +84,8 @@ def main():
           "./app")
     bench("tasks.misa", lambda d: build_misa(
         os.path.join(ROOT, "examples/tasks.misa"), d + "/app"),
-        "./app", run_env={"TASKS_CMD": "list", "HOME": tempfile.mkdtemp(dir=tmp)})
+        "./app --db ./t.db list",
+        run_env={"HOME": tempfile.mkdtemp(dir=tmp)})
     bench("diary.misa", lambda d: build_misa(
         os.path.join(ROOT, "examples/diary.misa"), d + "/app"),
         "./app", run_env={"HOME": tempfile.mkdtemp(dir=tmp)})

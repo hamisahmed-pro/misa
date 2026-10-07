@@ -238,6 +238,16 @@ _RT_SIGS = {
     "misa_compress_gunzip_file": (PTR, [PTR, PTR, I32, I32]),
     "misa_fs_temp_dir": (PTR, [I32, I32]),
     "misa_set_new": (PTR, []),
+    "misa_cli_parser": (PTR, [PTR, PTR, I32, I32]),
+    "misa_cli_flag": (ir.VoidType(), [PTR, PTR, PTR, PTR, I32, PTR, I32, I32]),
+    "misa_cli_bool_flag": (ir.VoidType(), [PTR, PTR, PTR, I32, I32]),
+    "misa_cli_short": (ir.VoidType(), [PTR, PTR, PTR, I32, I32]),
+    "misa_cli_command": (ir.VoidType(), [PTR, PTR, PTR, I32, I32]),
+    "misa_cli_parse": (PTR, [PTR, PTR, I32, I32]),
+    "misa_cli_get": (PTR, [PTR, PTR, I32, I32]),
+    "misa_cli_get_bool": (PTR, [PTR, PTR, I32, I32]),
+    "misa_cli_get_command": (PTR, [PTR, I32, I32]),
+    "misa_cli_positionals": (PTR, [PTR, I32, I32]),
     "misa_set_add": (ir.VoidType(), [PTR, PTR, I32, I32]),
     "misa_set_contains": (PTR, [PTR, PTR, I32, I32]),
     "misa_set_remove": (ir.VoidType(), [PTR, PTR, I32, I32]),
@@ -3038,6 +3048,46 @@ class Emitter:
             v = self.call(ctx, "misa_set_len",
                           [arg(0), line, col], e)
             return self.call(ctx, "misa_int", [v], e, check=False)
+        # cli: declarative args parsing.
+        if name == "cli.parser":
+            return self.call(ctx, "misa_cli_parser",
+                             [arg(0), arg(1), line, col], e)
+        if name == "cli.flag":
+            # Optional 5th arg (default); NULL when absent.
+            defv = arg(4) if len(e.args) > 4 else NULL_PTR
+            has_def = self.const_i32(1) if len(e.args) > 4 \
+                else self.const_i32(0)
+            self.call(ctx, "misa_cli_flag",
+                      [arg(0), arg(1), arg(2), arg(3),
+                       has_def, defv, line, col], e)
+            return self.get_nil(ctx)
+        if name == "cli.bool_flag":
+            self.call(ctx, "misa_cli_bool_flag",
+                      [arg(0), arg(1), arg(2), line, col], e)
+            return self.get_nil(ctx)
+        if name == "cli.short":
+            self.call(ctx, "misa_cli_short",
+                      [arg(0), arg(1), arg(2), line, col], e)
+            return self.get_nil(ctx)
+        if name == "cli.command":
+            self.call(ctx, "misa_cli_command",
+                      [arg(0), arg(1), arg(2), line, col], e)
+            return self.get_nil(ctx)
+        if name == "cli.parse":
+            return self.call(ctx, "misa_cli_parse",
+                             [arg(0), arg(1), line, col], e)
+        if name == "cli.get":
+            return self.call(ctx, "misa_cli_get",
+                             [arg(0), arg(1), line, col], e)
+        if name == "cli.get_bool":
+            return self.call(ctx, "misa_cli_get_bool",
+                             [arg(0), arg(1), line, col], e)
+        if name == "cli.get_command":
+            return self.call(ctx, "misa_cli_get_command",
+                             [arg(0), line, col], e)
+        if name == "cli.positionals":
+            return self.call(ctx, "misa_cli_positionals",
+                             [arg(0), line, col], e)
         if name == "map":
             return self.call(ctx, "misa_list_map",
                              [arg(0), arg(1), line, col], e)

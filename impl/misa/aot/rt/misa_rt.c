@@ -58,8 +58,42 @@ struct MVal {
         struct { void *rx; char *pattern; } regex;
         /* Final wave (stdlib): M_TAG_BYTES — raw byte buffer. */
         struct { uint8_t *data; size_t len; } bytes;
+        /* cli: M_TAG_CLIPARSER / M_TAG_CLIARGS — opaque handles. */
+        struct { void *p; } cliparser;
+        struct { void *a; } cliargs;
     } u;
 };
+
+/* cli: declarative args parsing — struct layouts shared by the parser
+ * handle, the parse result, and render_into (defined later). */
+typedef struct {
+    char *name;     /* "db" */
+    char *metavar;  /* "PATH"; NULL for bool flags */
+    char *help;
+    int   is_bool;
+    char *def;      /* default or NULL */
+    char  short_c;  /* 0 if none */
+} CliFlag;
+
+typedef struct {
+    char *name;
+    char *help;
+} CliCmd;
+
+typedef struct {
+    char    *prog;
+    char    *desc;
+    CliFlag *flags; int64_t nflags, cflags;
+    CliCmd  *cmds;  int64_t ncmds, ccmds;
+} MisaCliParser;
+
+typedef struct {
+    MisaCliParser *parser;  /* borrowed */
+    char  **values; /* per-flag explicit value (NULL if unset) */
+    char   *isset;  /* per-flag: explicitly set on the command line */
+    char   *command;/* or NULL */
+    char  **pos; int64_t npos, cpos;
+} MisaCliArgs;
 
 void *misa_alloc(size_t n) {
 #ifdef MISA_USE_GC
@@ -694,6 +728,17 @@ static void render_into(Str *s, MVal *v) {
         char buf[48];
         snprintf(buf, sizeof buf, "<bytes: %zu>", v->u.bytes.len);
         str_puts(s, buf);
+        break;
+    }
+    case M_TAG_CLIPARSER: {
+        MisaCliParser *p = (MisaCliParser *)v->u.cliparser.p;
+        str_puts(s, "<cli-parser: ");
+        str_puts(s, p && p->prog ? p->prog : "?");
+        str_puts(s, ">");
+        break;
+    }
+    case M_TAG_CLIARGS: {
+        str_puts(s, "<cli-args>");
         break;
     }
     default: str_puts(s, "<value>"); break;
@@ -3789,6 +3834,491 @@ MVal *misa_set_to_list(MVal *s, int line, int col) {
 int64_t misa_set_len(MVal *s, int line, int col) {
     if (!set_check(s, line, col, "set.len needs a Set")) return 0;
     return s->u.set.len;
+}
+
+/* -- cli: declarative args parsing ----------------------------------- */
+/* (CliFlag/CliCmd/MisaCliParser/MisaCliArgs are defined near the top,
+ * after the MVal struct, so render_into can see them.) */
+
+static char *cli_strdup(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = (char *)misa_alloc(n);
+    memcpy(p, s, n);
+    return p;
+}
+
+static MisaCliParser *cli_parser_of(MVal *v, int line, int col,
+                                    const char *what) {
+    if (v->tag != M_TAG_CLIPARSER) {
+        misa_raise("E300", what, line, col);
+        return NULL;
+    }
+    return (MisaCliParser *)v->u.cliparser.p;
+}
+
+static MisaCliArgs *cli_args_of(MVal *v, int line, int col,
+                                const char *what) {
+    if (v->tag != M_TAG_CLIARGS) {
+        misa_raise("E300", what, line, col);
+        return NULL;
+    }
+    return (MisaCliArgs *)v->u.cliargs.a;
+}
+
+static int64_t cli_find_flag(MisaCliParser *p, const char *name) {
+    for (int64_t i = 0; i < p->nflags; i++)
+        if (strcmp(p->flags[i].name, name) == 0) return i;
+    return -1;
+}
+
+static int64_t cli_find_short(MisaCliParser *p, char c) {
+    for (int64_t i = 0; i < p->nflags; i++)
+        if (p->flags[i].short_c == c) return i;
+    return -1;
+}
+
+static int64_t cli_find_cmd(MisaCliParser *p, const char *name) {
+    for (int64_t i = 0; i < p->ncmds; i++)
+        if (strcmp(p->cmds[i].name, name) == 0) return i;
+    return -1;
+}
+
+static void cli_flags_grow(MisaCliParser *p) {
+    if (p->nflags < p->cflags) return;
+    int64_t nc = p->cflags ? p->cflags * 2 : 8;
+    CliFlag *nf = (CliFlag *)misa_alloc(nc * sizeof(CliFlag));
+    if (p->flags) memcpy(nf, p->flags, p->nflags * sizeof(CliFlag));
+    p->flags = nf; p->cflags = nc;
+}
+
+static void cli_cmds_grow(MisaCliParser *p) {
+    if (p->ncmds < p->ccmds) return;
+    int64_t nc = p->ccmds ? p->ccmds * 2 : 8;
+    CliCmd *nf = (CliCmd *)misa_alloc(nc * sizeof(CliCmd));
+    if (p->cmds) memcpy(nf, p->cmds, p->ncmds * sizeof(CliCmd));
+    p->cmds = nf; p->ccmds = nc;
+}
+
+static void cli_pos_grow(MisaCliArgs *a) {
+    if (a->npos < a->cpos) return;
+    int64_t nc = a->cpos ? a->cpos * 2 : 8;
+    char **nf = (char **)misa_alloc(nc * sizeof(char *));
+    if (a->pos) memcpy(nf, a->pos, a->npos * sizeof(char *));
+    a->pos = nf; a->cpos = nc;
+}
+
+MVal *misa_cli_parser(MVal *prog, MVal *desc, int line, int col) {
+    (void)line; (void)col;
+    MisaCliParser *p = (MisaCliParser *)misa_alloc(sizeof *p);
+    p->prog = cli_strdup(misa_text_data(prog));
+    p->desc = cli_strdup(misa_text_data(desc));
+    p->flags = NULL; p->nflags = 0; p->cflags = 0;
+    p->cmds = NULL; p->ncmds = 0; p->ccmds = 0;
+    MVal *v = val_new(M_TAG_CLIPARSER);
+    v->u.cliparser.p = p;
+    return v;
+}
+
+void misa_cli_flag(MVal *pv, MVal *name, MVal *metavar, MVal *help,
+                    int32_t has_def, MVal *def, int line, int col) {
+    MisaCliParser *p = cli_parser_of(pv, line, col, "cli.flag needs a CliParser");
+    if (!p) return;
+    const char *nm = misa_text_data(name);
+    if (cli_find_flag(p, nm) >= 0) {
+        misa_raise_fmt("E300", line, col, "duplicate flag '%s'", nm);
+        return;
+    }
+    cli_flags_grow(p);
+    CliFlag *f = &p->flags[p->nflags++];
+    f->name = cli_strdup(nm);
+    f->metavar = cli_strdup(misa_text_data(metavar));
+    f->help = cli_strdup(misa_text_data(help));
+    f->is_bool = 0;
+    f->def = (has_def && def && def->tag == M_TAG_TEXT)
+             ? cli_strdup(misa_text_data(def)) : NULL;
+    f->short_c = 0;
+}
+
+void misa_cli_bool_flag(MVal *pv, MVal *name, MVal *help, int line, int col) {
+    MisaCliParser *p = cli_parser_of(pv, line, col,
+                                     "cli.bool_flag needs a CliParser");
+    if (!p) return;
+    const char *nm = misa_text_data(name);
+    if (cli_find_flag(p, nm) >= 0) {
+        misa_raise_fmt("E300", line, col, "duplicate flag '%s'", nm);
+        return;
+    }
+    cli_flags_grow(p);
+    CliFlag *f = &p->flags[p->nflags++];
+    f->name = cli_strdup(nm);
+    f->metavar = NULL;
+    f->help = cli_strdup(misa_text_data(help));
+    f->is_bool = 1;
+    f->def = NULL;
+    f->short_c = 0;
+}
+
+void misa_cli_short(MVal *pv, MVal *name, MVal *sh, int line, int col) {
+    MisaCliParser *p = cli_parser_of(pv, line, col, "cli.short needs a CliParser");
+    if (!p) return;
+    const char *nm = misa_text_data(name);
+    const char *ss = misa_text_data(sh);
+    int64_t fi = cli_find_flag(p, nm);
+    if (fi < 0) {
+        misa_raise_fmt("E300", line, col,
+                       "cli.short: no such flag '%s'", nm);
+        return;
+    }
+    if (strlen(ss) != 1) {
+        misa_raise_fmt("E300", line, col,
+                       "cli.short: short flag must be one character, got '%s'",
+                       ss);
+        return;
+    }
+    if (ss[0] == 'h') {
+        misa_raise("E300", "cli.short: '-h' is reserved for --help", line, col);
+        return;
+    }
+    int64_t oi = cli_find_short(p, ss[0]);
+    if (oi >= 0 && oi != fi) {
+        misa_raise_fmt("E300", line, col,
+                       "cli.short: '-%c' is already the short flag for '--%s'",
+                       ss[0], p->flags[oi].name);
+        return;
+    }
+    p->flags[fi].short_c = ss[0];
+}
+
+void misa_cli_command(MVal *pv, MVal *name, MVal *help, int line, int col) {
+    MisaCliParser *p = cli_parser_of(pv, line, col,
+                                     "cli.command needs a CliParser");
+    if (!p) return;
+    const char *nm = misa_text_data(name);
+    if (cli_find_cmd(p, nm) >= 0) {
+        misa_raise_fmt("E300", line, col, "duplicate command '%s'", nm);
+        return;
+    }
+    cli_cmds_grow(p);
+    CliCmd *c = &p->cmds[p->ncmds++];
+    c->name = cli_strdup(nm);
+    c->help = cli_strdup(misa_text_data(help));
+}
+
+/* Build the --help text. The interpreter mirrors this function exactly;
+ * keep the two in sync (byte-identical output is asserted by parity). */
+static void cli_help_into(Str *s, MisaCliParser *p) {
+    int64_t i, j;
+    if (p->desc[0]) {
+        str_puts(s, p->prog); str_puts(s, " - "); str_puts(s, p->desc);
+        str_puts(s, "\n\n");
+    } else {
+        str_puts(s, p->prog); str_puts(s, "\n\n");
+    }
+    str_puts(s, "Usage: "); str_puts(s, p->prog); str_puts(s, " [flags]");
+    if (p->ncmds) str_puts(s, " <command> [args]");
+    else str_puts(s, " [args]");
+    str_puts(s, "\n\nFlags:\n");
+    /* Column width = longest flag spec ("-d, --db PATH" / "--verbose"). */
+    size_t width = strlen("-h, --help");
+    for (i = 0; i < p->nflags; i++) {
+        size_t w = 2 + strlen(p->flags[i].name); /* "--name" */
+        if (p->flags[i].short_c) w += 4;        /* "-x, " */
+        if (!p->flags[i].is_bool) w += 1 + strlen(p->flags[i].metavar);
+        if (w > width) width = w;
+    }
+    for (i = 0; i < p->nflags; i++) {
+        CliFlag *f = &p->flags[i];
+        char spec[256];
+        if (f->short_c)
+            snprintf(spec, sizeof spec, "-%c, --%s", f->short_c, f->name);
+        else
+            snprintf(spec, sizeof spec, "--%s", f->name);
+        if (!f->is_bool) {
+            strncat(spec, " ", sizeof(spec) - strlen(spec) - 1);
+            strncat(spec, f->metavar, sizeof(spec) - strlen(spec) - 1);
+        }
+        str_puts(s, "  ");
+        str_puts(s, spec);
+        for (j = strlen(spec); (size_t)j < width; j++) str_puts(s, " ");
+        str_puts(s, "  ");
+        str_puts(s, f->help);
+        if (f->def) {
+            str_puts(s, " (default: ");
+            str_puts(s, f->def);
+            str_puts(s, ")");
+        }
+        str_puts(s, "\n");
+    }
+    str_puts(s, "  -h, --help");
+    for (j = strlen("-h, --help"); (size_t)j < width; j++) str_puts(s, " ");
+    str_puts(s, "  Show this help and exit\n");
+    if (p->ncmds) {
+        str_puts(s, "\nCommands:\n");
+        size_t cwidth = 0;
+        for (i = 0; i < p->ncmds; i++) {
+            size_t w = strlen(p->cmds[i].name);
+            if (w > cwidth) cwidth = w;
+        }
+        for (i = 0; i < p->ncmds; i++) {
+            str_puts(s, "  ");
+            str_puts(s, p->cmds[i].name);
+            for (j = strlen(p->cmds[i].name); (size_t)j < cwidth; j++)
+                str_puts(s, " ");
+            str_puts(s, "  ");
+            str_puts(s, p->cmds[i].help);
+            str_puts(s, "\n");
+        }
+    }
+}
+
+static void cli_show_help(MisaCliParser *p) {
+    Str s = {0};
+    cli_help_into(&s, p);
+    misa_platform_log(s.buf ? s.buf : "", s.len);
+    misa_platform_flush();
+}
+
+static int cli_is_flaglike(const char *t) {
+    return t[0] == '-' && t[1] != '\0' && strcmp(t, "-") != 0;
+}
+
+MVal *misa_cli_parse(MVal *pv, MVal *argv, int line, int col) {
+    MisaCliParser *p = cli_parser_of(pv, line, col, "cli.parse needs a CliParser");
+    if (!p) return NULL;
+    if (argv->tag != M_TAG_LIST) {
+        misa_raise("E300", "cli.parse needs an argv list", line, col);
+        return NULL;
+    }
+    MisaCliArgs *a = (MisaCliArgs *)misa_alloc(sizeof *a);
+    a->parser = p;
+    a->values = p->nflags
+        ? (char **)misa_alloc(p->nflags * sizeof(char *)) : NULL;
+    a->isset = p->nflags
+        ? (char *)misa_alloc(p->nflags * sizeof(char)) : NULL;
+    if (a->values) memset(a->values, 0, p->nflags * sizeof(char *));
+    if (a->isset) memset(a->isset, 0, p->nflags * sizeof(char));
+    a->command = NULL;
+    a->pos = NULL; a->npos = 0; a->cpos = 0;
+
+    int64_t n = misa_list_len(argv);
+    int dashdash = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const char *tok = misa_text_data(misa_list_get(argv, i));
+        if (dashdash) {
+            cli_pos_grow(a);
+            a->pos[a->npos++] = cli_strdup(tok);
+            continue;
+        }
+        if (strcmp(tok, "--") == 0) { dashdash = 1; continue; }
+        if (strcmp(tok, "-") == 0 || tok[0] != '-') {
+            /* Positional: first one is the command when commands exist. */
+            if (p->ncmds && !a->command) {
+                if (cli_find_cmd(p, tok) < 0) {
+                    Str s = {0};
+                    str_puts(&s, "unknown command '");
+                    str_puts(&s, tok);
+                    str_puts(&s, "' (expected one of:");
+                    for (int64_t k = 0; k < p->ncmds; k++) {
+                        str_puts(&s, " ");
+                        str_puts(&s, p->cmds[k].name);
+                    }
+                    str_puts(&s, ")");
+                    misa_raise_fmt("E300", line, col, "%s", s.buf);
+                    return NULL;
+                }
+                a->command = cli_strdup(tok);
+            } else {
+                cli_pos_grow(a);
+                a->pos[a->npos++] = cli_strdup(tok);
+            }
+            continue;
+        }
+        /* Long flag: --name or --name=value. */
+        if (tok[1] == '-') {
+            if (strcmp(tok, "--help") == 0) {
+                cli_show_help(p);
+                return misa_null();
+            }
+            const char *body = tok + 2;
+            const char *eq = strchr(body, '=');
+            char namebuf[128];
+            const char *val = NULL;
+            if (eq) {
+                size_t nl = (size_t)(eq - body);
+                if (nl >= sizeof namebuf) nl = sizeof(namebuf) - 1;
+                memcpy(namebuf, body, nl);
+                namebuf[nl] = '\0';
+                val = eq + 1;
+            } else {
+                strncpy(namebuf, body, sizeof(namebuf) - 1);
+                namebuf[sizeof(namebuf) - 1] = '\0';
+            }
+            if (namebuf[0] == '\0') {
+                misa_raise_fmt("E300", line, col, "malformed flag '%s'", tok);
+                return NULL;
+            }
+            if (strcmp(namebuf, "help") == 0) {
+                cli_show_help(p);
+                return misa_null();
+            }
+            int64_t fi = cli_find_flag(p, namebuf);
+            if (fi < 0) {
+                misa_raise_fmt("E300", line, col,
+                               "unknown flag '--%s' (run '%s --help' for usage)",
+                               namebuf, p->prog);
+                return NULL;
+            }
+            CliFlag *f = &p->flags[fi];
+            if (f->is_bool) {
+                if (val) {
+                    misa_raise_fmt("E300", line, col,
+                                   "flag '--%s' takes no value (it's a bool flag)",
+                                   namebuf);
+                    return NULL;
+                }
+            } else if (!val) {
+                if (i + 1 >= n || cli_is_flaglike(misa_text_data(misa_list_get(argv, i + 1)))) {
+                    misa_raise_fmt("E300", line, col,
+                                   "flag '--%s' needs a value", namebuf);
+                    return NULL;
+                }
+                val = misa_text_data(misa_list_get(argv, ++i));
+            }
+            a->values[fi] = cli_strdup(val ? val : "");
+            a->isset[fi] = 1;
+            continue;
+        }
+        /* Short flag(s): -x, -h, -d PATH, -d=PATH. */
+        if (strcmp(tok, "-h") == 0) {
+            cli_show_help(p);
+            return misa_null();
+        }
+        const char *rest = tok + 1;
+        const char *eq = strchr(rest, '=');
+        if (eq && eq != rest && eq[1] != '\0' && (eq - rest) == 1) {
+            /* -d=PATH form. */
+            int64_t fi = cli_find_short(p, rest[0]);
+            if (fi < 0) {
+                misa_raise_fmt("E300", line, col,
+                               "unknown flag '-%c' (run '%s --help' for usage)",
+                               rest[0], p->prog);
+                return NULL;
+            }
+            CliFlag *f = &p->flags[fi];
+            if (f->is_bool) {
+                misa_raise_fmt("E300", line, col,
+                               "flag '-%c' takes no value (it's a bool flag)",
+                               rest[0]);
+                return NULL;
+            }
+            a->values[fi] = cli_strdup(eq + 1);
+            a->isset[fi] = 1;
+            continue;
+        }
+        if (strlen(rest) != 1) {
+            misa_raise_fmt("E300", line, col,
+                           "combined short flags like '%s' are not supported "
+                           "(use -a -b -c)", tok);
+            return NULL;
+        }
+        int64_t fi = cli_find_short(p, rest[0]);
+        if (fi < 0) {
+            misa_raise_fmt("E300", line, col,
+                           "unknown flag '-%c' (run '%s --help' for usage)",
+                           rest[0], p->prog);
+            return NULL;
+        }
+        CliFlag *f = &p->flags[fi];
+        const char *val = NULL;
+        if (!f->is_bool) {
+            if (i + 1 >= n || cli_is_flaglike(misa_text_data(misa_list_get(argv, i + 1)))) {
+                misa_raise_fmt("E300", line, col,
+                               "flag '-%c' needs a value", rest[0]);
+                return NULL;
+            }
+            val = misa_text_data(misa_list_get(argv, ++i));
+        }
+        a->values[fi] = cli_strdup(val ? val : "");
+        a->isset[fi] = 1;
+    }
+    MVal *v = val_new(M_TAG_CLIARGS);
+    v->u.cliargs.a = a;
+    return v;
+}
+
+static int64_t cli_get_index(MVal *av, MVal *name, int line, int col,
+                             const char *what, int want_bool) {
+    MisaCliArgs *a = cli_args_of(av, line, col, what);
+    if (!a) return -2;
+    const char *nm = misa_text_data(name);
+    int64_t fi = cli_find_flag(a->parser, nm);
+    if (fi < 0) {
+        misa_raise_fmt("E300", line, col,
+                       "unknown flag '%s' (not defined on this parser)", nm);
+        return -2;
+    }
+    CliFlag *f = &a->parser->flags[fi];
+    if (want_bool && !f->is_bool) {
+        misa_raise_fmt("E300", line, col,
+                       "flag '%s' takes a value; use get, not get_bool", nm);
+        return -2;
+    }
+    if (!want_bool && f->is_bool) {
+        misa_raise_fmt("E300", line, col,
+                       "flag '%s' is a bool flag; use get_bool, not get", nm);
+        return -2;
+    }
+    return fi;
+}
+
+MVal *misa_cli_get(MVal *av, MVal *name, int line, int col) {
+    if (av->tag == M_TAG_NULL) {
+        misa_raise("E300", "no parsed arguments (parse returned nil, likely --help)",
+                   line, col);
+        return NULL;
+    }
+    int64_t fi = cli_get_index(av, name, line, col,
+                               "cli.get needs CliArgs", 0);
+    if (fi < 0) return NULL;
+    MisaCliArgs *a = (MisaCliArgs *)av->u.cliargs.a;
+    CliFlag *f = &a->parser->flags[fi];
+    if (a->isset[fi]) return misa_text_cstr(a->values[fi]);
+    if (f->def) return misa_text_cstr(f->def);
+    misa_raise_fmt("E300", line, col,
+                   "flag '--%s' was not provided and has no default",
+                   f->name);
+    return NULL;
+}
+
+MVal *misa_cli_get_bool(MVal *av, MVal *name, int line, int col) {
+    if (av->tag == M_TAG_NULL) {
+        misa_raise("E300", "no parsed arguments (parse returned nil, likely --help)",
+                   line, col);
+        return NULL;
+    }
+    int64_t fi = cli_get_index(av, name, line, col,
+                               "cli.get_bool needs CliArgs", 1);
+    if (fi < 0) return NULL;
+    MisaCliArgs *a = (MisaCliArgs *)av->u.cliargs.a;
+    return misa_bool(a->isset[fi] ? 1 : 0);
+}
+
+MVal *misa_cli_get_command(MVal *av, int line, int col) {
+    (void)line; (void)col;
+    if (av->tag == M_TAG_NULL) return misa_null();
+    MisaCliArgs *a = (MisaCliArgs *)av->u.cliargs.a;
+    if (!a->command) return misa_null();
+    return misa_text_cstr(a->command);
+}
+
+MVal *misa_cli_positionals(MVal *av, int line, int col) {
+    (void)line; (void)col;
+    MVal *out = misa_list_new();
+    if (av->tag == M_TAG_NULL) return out;
+    MisaCliArgs *a = (MisaCliArgs *)av->u.cliargs.a;
+    for (int64_t i = 0; i < a->npos; i++)
+        misa_list_push(out, misa_text_cstr(a->pos[i]));
+    return out;
 }
 
 /* -- calling a Misa closure value from C ---------------------------- */

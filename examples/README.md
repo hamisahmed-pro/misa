@@ -20,7 +20,7 @@ python3 impl/bin/misa build examples/<app>.misa -o /tmp/<app> && /tmp/<app>
 
 | App | What it is | What it demonstrates | How to run it |
 |---|---|---|---|
-| `tasks.misa` | CLI task manager with SQLite storage, JSON export/import | `db.*` + `table` (compile-time checked SQL), sum types, `match`, generics, closures, FFI (`getenv`), `json`, `time`, `str.*` | `TASKS_CMD=add TASKS_ARG="Write report" misa run examples/tasks.misa` (also `list`, `doing`/`done`, `export`, `import`) |
+| `tasks.misa` | CLI task manager with SQLite storage, JSON export/import | `db.*` + `table` (compile-time checked SQL), sum types, `match`, generics, closures, FFI (`getenv`), `json`, `time`, `str.*`, `cli` + `argv()` | `misa run examples/tasks.misa -- add "Write report"` (also `list`, `doing`/`done`, `export`, `import`, `--db PATH`, `--help`) |
 | `diary.misa` | Offline diary — zero network, SQLite-backed | `db.*` + `table`, typed query rows | `misa run examples/diary.misa` |
 | `plantdoc.misa` | AI plant doctor — one codebase to web + Android APK | Typed model calls with budgets, `--mock` provider, screens/UI | `misa run examples/plantdoc.misa --mock examples/plantdoc.mock.json` |
 | `apiclient.misa` | HTTP API client CLI — fetches JSON, prints a report | `http.get` (E304 handling), `json.parse`, sum-type `Result<T>` + `match`, typed records from dynamic JSON | `misa run examples/apiclient.misa` (`API_URL=...` overrides the endpoint) |

@@ -46,6 +46,8 @@ enum {
     M_TAG_SET = 19,    /* Wave 3 (stdlib): Set<T> (insertion-ordered) */
     M_TAG_REGEX = 20,  /* Wave 3 (stdlib): compiled regex (MisaRx*) */
     M_TAG_BYTES = 21,  /* Final wave (stdlib): binary data (compress.*) */
+    M_TAG_CLIPARSER = 22, /* cli: CliParser handle (wraps MisaCliParser*) */
+    M_TAG_CLIARGS = 23,   /* cli: CliArgs handle (wraps MisaCliArgs*) */
 };
 
 /* Media kinds. */
@@ -275,6 +277,21 @@ MVal *misa_list_sort_by(MVal *xs, MVal *f, int line, int col);
 MVal *misa_list_flat(MVal *xss, int line, int col);
 MVal *misa_list_zip(MVal *xs, MVal *ys, int line, int col);
 MVal *misa_list_unique(MVal *xs, int line, int col);
+MVal *misa_cli_parser(MVal *prog, MVal *desc, int line, int col);
+void  misa_cli_flag(MVal *p, MVal *name, MVal *metavar, MVal *help,
+                     int32_t has_def, MVal *def, int line, int col);
+                                                              /* E300 */
+void  misa_cli_bool_flag(MVal *p, MVal *name, MVal *help, int line, int col);
+                                                              /* E300 */
+void  misa_cli_short(MVal *p, MVal *name, MVal *sh, int line, int col);
+                                                              /* E300 */
+void  misa_cli_command(MVal *p, MVal *name, MVal *help, int line, int col);
+                                                              /* E300 */
+MVal *misa_cli_parse(MVal *p, MVal *argv, int line, int col);  /* E300 */
+MVal *misa_cli_get(MVal *a, MVal *name, int line, int col);    /* E300 */
+MVal *misa_cli_get_bool(MVal *a, MVal *name, int line, int col); /* E300 */
+MVal *misa_cli_get_command(MVal *a, int line, int col);
+MVal *misa_cli_positionals(MVal *a, int line, int col);
 MVal *misa_str_join(MVal *xs, MVal *sep, int line, int col);
 MVal *misa_str_replace(MVal *s, MVal *old, MVal *nw, int line, int col);
 MVal *misa_str_to_upper(MVal *s, int line, int col);

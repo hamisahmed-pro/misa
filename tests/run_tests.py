@@ -5170,6 +5170,224 @@ def _():
     assert not errs, errs
 
 
+# ------------------------------------------------------------ cli: declarative args parsing
+
+_CLI_PROG = (
+    'let p = cli.parser("tasks", "A tiny task manager")\n'
+    'p.flag("db", "PATH", "Database path", "/tmp/tasks.db")\n'
+    'p.bool_flag("verbose", "Verbose output")\n'
+    'p.short("db", "d")\n'
+    'p.command("add", "Add a task")\n'
+    'p.command("list", "List tasks")\n'
+)
+
+
+@test("cli: long flags, = form, bool flags, defaults")
+def _():
+    src = _CLI_PROG + (
+        'let args = p.parse(argv())\n'
+        'print(args.get("db"))\n'
+        'print(args.get_bool("verbose"))\n'
+        'print(args.command())\n'
+        'print(args.positionals())\n'
+    )
+    out = run_src_argv(src, ["--db", "/tmp/x.db", "--verbose",
+                             "add", "Buy milk"])
+    eq(out, "/tmp/x.db\ntrue\nadd\n[Buy milk]\n")
+    out = run_src_argv(src, ["--db=/tmp/y.db", "list"])
+    eq(out, "/tmp/y.db\nfalse\nlist\n[]\n")
+    # defaults when flags absent
+    out = run_src_argv(src, ["list"])
+    eq(out, "/tmp/tasks.db\nfalse\nlist\n[]\n")
+
+
+@test("cli: short flags")
+def _():
+    src = _CLI_PROG + (
+        'let args = p.parse(argv())\n'
+        'print(args.get("db"))\n'
+    )
+    eq(run_src_argv(src, ["-d", "/tmp/s.db", "list"]), "/tmp/s.db\n")
+    eq(run_src_argv(src, ["-d=/tmp/e.db", "list"]), "/tmp/e.db\n")
+
+
+@test("cli: -- terminator and lone -")
+def _():
+    src = _CLI_PROG + (
+        'let args = p.parse(argv())\n'
+        'print(args.command())\n'
+        'print(args.positionals())\n'
+    )
+    out = run_src_argv(src, ["--", "--db", "add"])
+    eq(out, "nil\n[--db, add]\n")
+    # lone - is a positional (here: after --, so not a command word)
+    out = run_src_argv(src, ["list", "--", "-"])
+    eq(out, "list\n[-]\n")
+    # ...but as the first word with commands defined it is an
+    # unknown command, like any other invalid command word
+    e = raises_code(lambda: run_src_argv(src, ["-", "list"]), "E300")
+    assert "unknown command '-'" in e.message, e.message
+
+
+@test("cli: --help prints and returns nil")
+def _():
+    src = _CLI_PROG + (
+        'let args = p.parse(argv())\n'
+        'if args == nil {\n'
+        '  print("got nil")\n'
+        '} else {\n'
+        '  print("got args")\n'
+        '}\n'
+    )
+    out = run_src_argv(src, ["--help"])
+    assert "got nil" in out, out
+    help_text = out.split("got nil")[0]
+    eq(help_text,
+       "tasks - A tiny task manager\n"
+       "\n"
+       "Usage: tasks [flags] <command> [args]\n"
+       "\n"
+       "Flags:\n"
+       "  -d, --db PATH  Database path (default: /tmp/tasks.db)\n"
+       "  --verbose      Verbose output\n"
+       "  -h, --help     Show this help and exit\n"
+       "\n"
+       "Commands:\n"
+       "  add   Add a task\n"
+       "  list  List tasks\n")
+    # -h is the short form
+    out = run_src_argv(src, ["-h"])
+    assert "Show this help and exit" in out, out
+    assert "got nil" in out, out
+
+
+@test("cli: no commands -> all positionals")
+def _():
+    src = ('let p = cli.parser("tool", "does things")\n'
+           'p.flag("out", "FILE", "output file")\n'
+           'let args = p.parse(argv())\n'
+           'print(args.command())\n'
+           'print(args.positionals())\n'
+           'print(args.get("out"))\n')
+    out = run_src_argv(src, ["a", "b", "--out", "f.txt"])
+    eq(out, "nil\n[a, b]\nf.txt\n")
+
+
+@test("cli: E300 parse errors")
+def _():
+    prog = _CLI_PROG + 'let args = p.parse(argv())\n'
+    cases = [
+        (["--bogus"], "unknown flag '--bogus'"),
+        (["--db"], "flag '--db' needs a value"),
+        (["--db", "--verbose"], "flag '--db' needs a value"),
+        (["--verbose=x"], "takes no value"),
+        (["-abc"], "combined short flags"),
+        (["-z"], "unknown flag '-z'"),
+        (["frobnicate"], "unknown command 'frobnicate'"),
+    ]
+    for argv, msg in cases:
+        e = raises_code(lambda: run_src_argv(prog, argv), "E300")
+        assert msg in e.message, (argv, e.message)
+
+
+@test("cli: E300 on get/get_bool misuse")
+def _():
+    prog = _CLI_PROG + 'let args = p.parse(argv())\n'
+    e = raises_code(
+        lambda: run_src_argv(prog + 'print(args.get("nope"))\n', ["list"]),
+        "E300")
+    assert "unknown flag 'nope'" in e.message, e.message
+    e = raises_code(
+        lambda: run_src_argv(prog + 'print(args.get("verbose"))\n', ["list"]),
+        "E300")
+    assert "use get_bool" in e.message, e.message
+    e = raises_code(
+        lambda: run_src_argv(prog + 'print(args.get_bool("db"))\n', ["list"]),
+        "E300")
+    assert "use get, not get_bool" in e.message, e.message
+    # required flag (no default) not provided
+    src = ('let p = cli.parser("t", "d")\n'
+           'p.flag("req", "V", "required")\n'
+           'let args = p.parse(argv())\n'
+           'print(args.get("req"))\n')
+    e = raises_code(lambda: run_src_argv(src, []), "E300")
+    assert "was not provided and has no default" in e.message, e.message
+
+
+@test("cli: get on nil args is E300")
+def _():
+    # NOTE: canonical cli.get form — the test harness runs the raw
+    # AST (not the checker-desugared one), and a nil receiver has no
+    # runtime type for the interpreter's method fallback. The real
+    # CLI desugars `args.get(..)` via the checker, same E300.
+    src = _CLI_PROG + ('let args = p.parse(["--help"])\n'
+                       'print(cli.get(args, "db"))\n')
+    e = raises_code(lambda: run_src_argv(src, []), "E300")
+    assert "no parsed arguments" in e.message, e.message
+    # ...but get_command/positionals degrade gracefully on nil
+    src = _CLI_PROG + ('let args = p.parse(["--help"])\n'
+                       'print(cli.get_command(args))\n'
+                       'print(cli.positionals(args))\n')
+    out = run_src_argv(src, [])
+    assert "nil\n[]\n" in out, out
+
+
+@test("cli: duplicate definitions are E300")
+def _():
+    e = raises_code(
+        lambda: run_src_argv(
+            'let p = cli.parser("t", "d")\n'
+            'p.flag("db", "P", "x")\n'
+            'p.flag("db", "P", "y")\n', []),
+        "E300")
+    assert "duplicate flag 'db'" in e.message, e.message
+    e = raises_code(
+        lambda: run_src_argv(
+            'let p = cli.parser("t", "d")\n'
+            'p.flag("db", "P", "x")\n'
+            'p.short("nope", "d")\n', []),
+        "E300")
+    assert "no such flag 'nope'" in e.message, e.message
+
+
+@test("cli: parse/get need throws E300 (E227)")
+def _():
+    errs = check_source('fn f(a: [Text]) -> Void {\n'
+                        '  let p = cli.parser("t", "d")\n'
+                        '  let args = p.parse(a)\n'
+                        '}\n')
+    assert any(e["code"] == "E227" for e in errs), errs
+    errs = check_source('fn f(a: [Text]) -> Void throws E300 {\n'
+                        '  let p = cli.parser("t", "d")\n'
+                        '  let args = p.parse(a)\n'
+                        '  print(args.get("x"))\n'
+                        '}\n')
+    assert not errs, errs
+
+
+@test("cli: check-time E200 for bad literals")
+def _():
+    errs = check_source('let p = cli.parser("t", "d")\n'
+                        'p.flag("", "V", "h")\n')
+    assert any(e["code"] == "E200" for e in errs), errs
+    errs = check_source('let p = cli.parser("t", "d")\n'
+                        'p.flag("db", "V", "h")\n'
+                        'p.short("db", "dd")\n')
+    assert any(e["code"] == "E200" for e in errs), errs
+
+
+@test("cli: method desugar on CliArgs? receiver")
+def _():
+    # args is CliArgs?; method calls must still rewrite to cli.*.
+    errs = check_source(_CLI_PROG +
+                        'let args = p.parse(argv())\n'
+                        'print(args.get("db"))\n'
+                        'print(args.get_bool("verbose"))\n'
+                        'print(args.command())\n'
+                        'print(args.positionals())\n')
+    assert not errs, errs
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

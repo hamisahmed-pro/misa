@@ -23,16 +23,18 @@ presented as measured.
 | 8 | Structured concurrency | Typed, budgeted, no leaked tasks, never-silent errors. Design lead over goroutines. |
 | 9 | Typed model calls with budgets | Unique. |
 | 10 | Unified test runner | `misa test` runs unit tests *and* model evals in one runner with `--json`. Nobody unifies these. |
+| 11 | Typed CLI arg parsing | `cli` module: declarative schema, `throws E300` parse errors with usage hints, generated `--help` (byte-identical both backends), check-time E200 for bad literals. argparse/clap validate at runtime only. |
 
 ---
 
-## Where Misa is at PARITY (20 areas)
+## Where Misa is at PARITY (19 areas)
 
 Interfaces/traits, null safety, pattern-match exhaustiveness, generics,
-sockets/TCP, HTTP server, crypto, compression, random, argv, temp files,
+sockets/TCP, HTTP server, crypto, compression, random, raw argv, temp files,
 datetime (offset-based), collections (map/filter/fold, `Set<T>`),
 unit-test framework, FFI (structs/callbacks/varargs/nested/unions/bitfields),
 build speed vs cargo-with-deps. Full matrix in `bench/GAPS-language.md`.
+(Typed CLI parsing is now a LEAD, above.)
 
 ---
 

@@ -4,7 +4,7 @@
 // A showcase of Misa's Phase 5/7 features in one real, usable program:
 //
 //   SQLite persistence ..... `db.*` + `table tasks` (compile-time checked SQL)
-//   Sum types ............... `Status`, `Cmd`, and generic `Result<T>`
+//   Sum types ............... `Status` and generic `Result<T>`
 //   Pattern matching ........ `match` with exhaustiveness checking
 //   Generics ................ `filter<T>`, `find<T>`, `first<T>`
 //   First-class functions ... lambdas passed to the generic helpers
@@ -13,18 +13,22 @@
 //   Time .................... `time.now()` stamps, `time.format` rendering
 //   Strings ................. `str.trim` / `str.split` / `str.starts_with`
 //                             (now fully supported by the AOT backend too)
+//   CLI parsing ............. the `cli` module: declarative flags, commands,
+//                             auto-generated --help, catchable E300 errors
 //
-// CLI interface via environment variables (Misa v0.2 has no argv; a two-line
-// shell wrapper maps `tasks add "..."` onto these):
+// CLI interface via `cli` + `argv()`:
 //
-//   TASKS_CMD=add     TASKS_ARG="Write the report"   tasks
-//   TASKS_CMD=list                                    tasks
-//   TASKS_CMD=doing   TASKS_ARG=2                     tasks
-//   TASKS_CMD=done    TASKS_ARG=2                     tasks
-//   TASKS_CMD=export                                  tasks
-//   TASKS_CMD=import  TASKS_ARG=backup.json           tasks
+//   tasks add "Write the report"   add a task
+//   tasks list                     list tasks
+//   tasks doing 2                  mark task Doing
+//   tasks done 2                   mark task Done
+//   tasks export                   print tasks as JSON
+//   tasks import backup.json       import tasks from JSON
+//   tasks --db /tmp/t.db list      use a different database
+//   tasks --help                   show generated help
 //
-// The database lives at $HOME/.misa-tasks.db (via FFI getenv).
+// The database lives at $HOME/.misa-tasks.db by default (via FFI getenv),
+// overridable with --db.
 // ============================================================================
 
 // --- FFI: C's getenv() gives us the database path ---------------------------
@@ -36,8 +40,6 @@ extern "c" {
 
 // --- Domain model: sum types ------------------------------------------------
 type Status { Todo, Doing, Done }
-
-type Cmd { Add, List, Doing, Done, Export, Import }
 
 // Generic Result: Ok carries a value, Err carries a message.
 type Result<T> { Ok(T), Err(Text) }
@@ -124,54 +126,12 @@ fn say(msg: Text) -> Void {
   print(msg)
 }
 
-fn get_env_or(name: Text, default: Text) -> Text {
-  var out: Text = default
-  try {
-    out = env(name)
-  } catch e {
-    out = default
-  }
-  return out
-}
-
 fn db_path() -> Text throws E226 {
   let home = getenv("HOME")
   if home == nil {
     return "/tmp/.misa-tasks.db"
   }
   return home + "/.misa-tasks.db"
-}
-
-fn usage() -> Text {
-  return "usage:\n" +
-    "  TASKS_CMD=add     TASKS_ARG=\"<title>\"   add a task\n" +
-    "  TASKS_CMD=list                            list tasks\n" +
-    "  TASKS_CMD=doing   TASKS_ARG=<id>          mark task Doing\n" +
-    "  TASKS_CMD=done    TASKS_ARG=<id>          mark task Done\n" +
-    "  TASKS_CMD=export                          print tasks as JSON\n" +
-    "  TASKS_CMD=import  TASKS_ARG=<file>        import tasks from JSON"
-}
-
-fn parse_cmd(s: Text) -> Result<Cmd> {
-  if s == "add" {
-    return Result.Ok(Cmd.Add)
-  }
-  if s == "list" {
-    return Result.Ok(Cmd.List)
-  }
-  if s == "doing" {
-    return Result.Ok(Cmd.Doing)
-  }
-  if s == "done" {
-    return Result.Ok(Cmd.Done)
-  }
-  if s == "export" {
-    return Result.Ok(Cmd.Export)
-  }
-  if s == "import" {
-    return Result.Ok(Cmd.Import)
-  }
-  return Result.Err("unknown command '" + s + "'")
 }
 
 fn parse_id(s: Text) -> Result<Int> {
@@ -185,8 +145,8 @@ fn parse_id(s: Text) -> Result<Int> {
 }
 
 // --- Database ---------------------------------------------------------------
-fn open_db() -> Db throws E226, E303 {
-  let db = db.open(db_path())
+fn open_db_at(path: Text) -> Db throws E226, E303 {
+  let db = db.open(path)
   db.exec(db, "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL)")
   return db
 }
@@ -222,7 +182,7 @@ fn cmd_add(db: Db, title: Text) -> Void throws E300, E303 {
 fn cmd_list(db: Db) -> Void throws E300, E303 {
   let tasks = load_tasks(db)
   if len(tasks) == 0 {
-    print("No tasks yet. Add one with TASKS_CMD=add TASKS_ARG=\"<title>\"")
+    print("No tasks yet. Add one with: tasks add \"<title>\"")
     return
   }
   for t in tasks {
@@ -311,6 +271,16 @@ fn cmd_import(db: Db, path: Text) -> Result<Int> {
 }
 
 // --- Entry point -------------------------------------------------------------
+// CLI via the `cli` module: declarative flags and commands, auto-generated
+// --help, and catchable E300 parse errors. `parse` returns nil after
+// printing --help, so we just return.
+fn pos0(ps: [Text]) -> Text {
+  if len(ps) > 0 {
+    return ps[0]
+  }
+  return ""
+}
+
 fn report_import(db: Db, arg_text: Text) -> Void {
   match cmd_import(db, arg_text) {
     Result.Ok(n) => say("Imported " + str(n) + " tasks"),
@@ -318,23 +288,37 @@ fn report_import(db: Db, arg_text: Text) -> Void {
   }
 }
 
-fn dispatch(db: Db, c: Cmd, arg_text: Text) -> Void throws E300, E303 {
-  match c {
-    Cmd.Add => cmd_add(db, arg_text),
-    Cmd.List => cmd_list(db),
-    Cmd.Doing => cmd_set_status(db, arg_text, Status.Doing),
-    Cmd.Done => cmd_set_status(db, arg_text, Status.Done),
-    Cmd.Export => cmd_export(db),
-    Cmd.Import => report_import(db, arg_text),
-  }
+let cli_p = cli.parser("tasks", "A tiny task manager")
+cli_p.flag("db", "PATH", "Database path", db_path())
+cli_p.command("add", "Add a task")
+cli_p.command("list", "List tasks")
+cli_p.command("doing", "Mark a task Doing")
+cli_p.command("done", "Mark a task Done")
+cli_p.command("export", "Print tasks as JSON")
+cli_p.command("import", "Import tasks from a JSON backup")
+
+let args = cli_p.parse(argv())
+if args == nil {
+  return
 }
-
-let db = open_db()
-let cmd_text = get_env_or("TASKS_CMD", "")
-let arg_text = get_env_or("TASKS_ARG", "")
-
-match parse_cmd(cmd_text) {
-  Result.Err(e) => say("Error: " + e + "\n" + usage()),
-  Result.Ok(c) => dispatch(db, c, arg_text),
+let db = open_db_at(args.get("db"))
+let ps = args.positionals()
+let cmd = args.command()
+if cmd == "add" {
+  cmd_add(db, str.join(ps, " "))
+} else if cmd == "list" {
+  cmd_list(db)
+} else if cmd == "doing" {
+  cmd_set_status(db, pos0(ps), Status.Doing)
+} else if cmd == "done" {
+  cmd_set_status(db, pos0(ps), Status.Done)
+} else if cmd == "export" {
+  cmd_export(db)
+} else if cmd == "import" {
+  report_import(db, pos0(ps))
+} else {
+  // No command word (e.g. bare `tasks`): show the generated help.
+  // Unreachable otherwise — cli.parse rejects unknown commands.
+  cli_p.parse(["--help"])
 }
 db.close(db)

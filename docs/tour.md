@@ -689,6 +689,50 @@ Args after `--` go to the program; without `--` the program sees `[]`.
 Host AOT binaries receive the real OS argv. On Android/iOS/web there is
 no CLI, so `argv()` is `[]` there.
 
+### Parsing them: the `cli` module
+
+Raw `argv()` is fine for tiny scripts. For real CLIs, declare flags and
+subcommands and let Misa parse, validate, and generate `--help`:
+
+```misa
+let p = cli.parser("greet", "Greet people politely")
+p.flag("name", "NAME", "Who to greet", "world")
+p.bool_flag("loud", "Use ALL CAPS")
+p.command("greet", "Print a greeting")
+let args = p.parse(argv())
+if args == nil { return }              // --help was shown
+let who = args.get("name")
+var msg = "Hello, " + who + "!"
+if args.get_bool("loud") {
+  msg = str.upper(msg)
+}
+print(msg)
+```
+
+```sh
+misa run greet.misa -- greet --name Ada --loud
+# Hello, ADA!
+misa run greet.misa -- --help
+# greet - Greet people politely
+#
+# Usage: greet [flags] <command> [args]
+#
+# Flags:
+#   --name NAME  Who to greet (default: world)
+#   --loud       Use ALL CAPS
+#   -h, --help   Show this help and exit
+#
+# Commands:
+#   greet  Print a greeting
+```
+
+`--flag value`, `--flag=value`, and short aliases (`p.short("name", "n")`
+gives `-n`) all work; `--` ends flag parsing. Mistakes are catchable
+`E300` errors with a usage hint — `unknown flag '--bogus'`,
+`flag '--name' needs a value`, `unknown command 'frobnicate'` — never a
+crash, never a traceback. See `docs/stdlib.md` (`cli`) for the full
+E300 rules and `examples/tasks.misa` for a complete CLI app.
+
 ## What's next
 
 - `docs/stdlib.md` — the full library reference

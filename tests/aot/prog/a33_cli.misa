@@ -1,0 +1,56 @@
+// a33_cli: AOT parity for the cli args-parsing module.
+// Parses hardcoded argv lists (the harness runs with no real argv)
+// and prints results; interpreter and AOT must be byte-identical,
+// including the --help text and E300 messages.
+
+fn show(p: CliParser, argv: [Text]) -> Void throws E300 {
+  let args = p.parse(argv)
+  if args == nil {
+    print("nil")
+    return
+  }
+  print(args.get("db"))
+  print(args.get_bool("verbose"))
+  print(args.command())
+  print(args.positionals())
+}
+
+let p = cli.parser("tasks", "A tiny task manager")
+p.flag("db", "PATH", "Database path", "/tmp/tasks.db")
+p.bool_flag("verbose", "Verbose output")
+p.short("db", "d")
+p.command("add", "Add a task")
+p.command("list", "List tasks")
+
+// long flags + bool + command + positionals
+show(p, ["--db", "/tmp/x.db", "--verbose", "add", "Buy milk"])
+// = form, short =, defaults
+show(p, ["--db=/tmp/y.db", "list"])
+show(p, ["-d", "/tmp/s.db", "list"])
+show(p, ["-d=/tmp/e.db", "list"])
+show(p, ["list"])
+// -- terminator
+show(p, ["--", "--db", "add"])
+// help (prints to stdout, returns nil)
+show(p, ["--help"])
+// E300: unknown flag (caught, message printed without location)
+try {
+  show(p, ["--bogus"])
+} catch e {
+  print("caught {e.code}")
+}
+try {
+  show(p, ["--db"])
+} catch e {
+  print("caught {e.code}")
+}
+try {
+  show(p, ["-abc"])
+} catch e {
+  print("caught {e.code}")
+}
+try {
+  show(p, ["frobnicate"])
+} catch e {
+  print("caught {e.code}")
+}

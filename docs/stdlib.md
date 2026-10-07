@@ -329,6 +329,51 @@ Framing is fully deterministic (fixed header, level 9), so both backends
 emit **byte-identical** output. zlib-backed on host/Android; targets
 without zlib (web) raise `E600`.
 
+## `cli` — declarative args parsing
+
+| Function | Signature |
+|---|---|
+| `cli.parser` | `cli.parser(prog: Text, desc: Text) -> CliParser` |
+| `cli.flag` | `cli.flag(p: CliParser, name: Text, metavar: Text, help: Text[, default: Text]) -> Void throws E300` |
+| `cli.bool_flag` | `cli.bool_flag(p: CliParser, name: Text, help: Text) -> Void throws E300` |
+| `cli.short` | `cli.short(p: CliParser, name: Text, short: Text) -> Void throws E300` |
+| `cli.command` | `cli.command(p: CliParser, name: Text, help: Text) -> Void throws E300` |
+| `cli.parse` | `cli.parse(p: CliParser, argv: [Text]) -> CliArgs? throws E300` |
+| `cli.get` | `cli.get(args: CliArgs?, name: Text) -> Text throws E300` |
+| `cli.get_bool` | `cli.get_bool(args: CliArgs?, name: Text) -> Bool throws E300` |
+| `cli.get_command` | `cli.get_command(args: CliArgs?) -> Text?` |
+| `cli.positionals` | `cli.positionals(args: CliArgs?) -> [Text]` |
+
+```misa
+let p = cli.parser("tasks", "A tiny task manager")
+p.flag("db", "PATH", "Database path", "/tmp/tasks.db")
+p.bool_flag("verbose", "Verbose output")
+p.short("db", "d")
+p.command("add", "Add a task")
+p.command("list", "List tasks")
+let args = p.parse(argv())          // throws E300; nil after --help
+if args == nil { return }
+print(args.get("db"))               // value or default
+print(args.get_bool("verbose"))     // true/false
+print(args.command())               // "add" / "list" / nil
+print(args.positionals())           // [Text], excluding the command word
+```
+
+`--flag value`, `--flag=value`, `-d value`, `-d=value` are all accepted;
+`--` ends flag parsing; a lone `-` is a positional. Bad usage is a
+catchable `E300` with a usage hint (`unknown flag '--bogus'`,
+`flag '--db' needs a value`, `unknown command 'frobnicate'`, combined
+shorts like `-abc` are rejected). `--help`/`-h` prints generated help
+(aligned `Flags:`/`Commands:` sections, byte-identical on both backends)
+and returns `nil`.
+
+Schema mistakes are caught early: duplicate flags/commands/shorts, empty
+flag names, and multi-char shorts are `E300` at definition time (`E200`
+at check time for string literals). `get` on an undefined name, on a
+bool flag, or on an unset flag without a default is `E300`; `get_bool`
+on a value flag is `E300`. All declaring/parsing calls are checked
+throws — a function calling them needs `throws E300` (`E227` otherwise).
+
 ## `random` — seeded PRNG
 
 | Function | Signature |

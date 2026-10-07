@@ -323,6 +323,81 @@ Compressed data lives in the `Bytes` type: an opaque binary buffer.
 Without zlib on the target (e.g. web), all five raise `E600` — never a
 build break. Android links the NDK's zlib.
 
+## 3m. CLI args parsing (`cli` namespace)
+
+Declarative, typed command-line parsing: declare flags and subcommands on
+a `CliParser`, parse `argv()`, and get a typed `CliArgs` back. Parse
+failures are catchable `E300` with a usage hint; `--help`/`-h` prints
+generated help to stdout and returns `nil` (the program checks and
+returns — this keeps `parse` pure-ish and Misa-shaped).
+
+```misa
+let p = cli.parser("tasks", "A tiny task manager")
+p.flag("db", "PATH", "Database path", "/tmp/tasks.db")  // 4th arg = default
+p.bool_flag("verbose", "Verbose output")
+p.short("db", "d")                  // -d as alias for --db
+p.command("add", "Add a task")
+p.command("list", "List tasks")
+let args = p.parse(argv())          // throws E300; nil after --help
+if args == nil { return }
+print(args.get("db"))               // value or default
+print(args.get_bool("verbose"))     // true/false
+print(args.command())               // "add" / "list" / nil
+print(args.positionals())           // [Text], excluding the command word
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `cli.parser` | `cli.parser(prog: Text, desc: Text) -> CliParser` | New argument parser. |
+| `cli.flag` | `cli.flag(p: CliParser, name: Text, metavar: Text, help: Text[, default: Text]) -> Void throws E300` | Value flag `--name <metavar>`; `E300` on duplicate. |
+| `cli.bool_flag` | `cli.bool_flag(p: CliParser, name: Text, help: Text) -> Void throws E300` | Boolean flag `--name`; `E300` on duplicate. |
+| `cli.short` | `cli.short(p: CliParser, name: Text, short: Text) -> Void throws E300` | One-char alias (`-d` for `--db`); `-h` reserved; `E300` on unknown/duplicate/reserved. |
+| `cli.command` | `cli.command(p: CliParser, name: Text, help: Text) -> Void throws E300` | Subcommand; `E300` on duplicate. |
+| `cli.parse` | `cli.parse(p: CliParser, argv: [Text]) -> CliArgs? throws E300` | Parse; `E300` on bad usage (see rules); prints help + returns `nil` on `--help`/`-h`. |
+| `cli.get` | `cli.get(args: CliArgs?, name: Text) -> Text throws E300` | Flag value, explicit or default; `E300` on unknown name, bool-flag misuse, unset-without-default, or nil receiver. |
+| `cli.get_bool` | `cli.get_bool(args: CliArgs?, name: Text) -> Bool throws E300` | `true` iff the bool flag was passed; `E300` on unknown name, value-flag misuse, or nil receiver. |
+| `cli.get_command` | `cli.get_command(args: CliArgs?) -> Text?` | Subcommand word, or `nil` (also `nil` on nil receiver). |
+| `cli.positionals` | `cli.positionals(args: CliArgs?) -> [Text]` | Non-flag args excluding the command word (`[]` on nil receiver). |
+
+**E300 rules** (exact; each message ends with a usage hint naming the program):
+
+- Unknown long flag: `--bogus` → `unknown flag '--bogus'`.
+- Unknown short flag: `-z` → `unknown flag '-z'`.
+- Flag needs a value but the next token is missing or looks like a flag: `--db` (at end) or `--db --verbose` → `flag '--db' needs a value`. (Short form: `-d` → `flag '-d' needs a value`.)
+- Value given to a bool flag: `--verbose=x` → `takes no value (it's a bool flag)`.
+- Malformed flag: `--=x` → `malformed flag '--=x'`.
+- Combined short flags: `-abc` → `not supported (use -a -b -c)`.
+- Unknown command (first positional when commands are defined): `frobnicate` → `unknown command 'frobnicate' (expected one of: add list)`.
+- Schema errors at definition time: duplicate flag/command/short, `short` for an undefined flag, multi-char short, `-h` reservation → `E300` (duplicates and bad literals are additionally `E200` at check time when the name is a string literal).
+- `get` on an undefined flag name → `E300` (`unknown flag 'x'`); on a bool flag → `E300` (`use get_bool`); on an unset flag with no default → `E300` (`was not provided and has no default`). `get_bool` on a value flag → `E300` (`use get, not get_bool`). `get`/`get_bool` on a nil receiver → `E300` (`no parsed arguments (parse returned nil, likely --help)`).
+
+**Token rules:** `--flag value`, `--flag=value`, `-d value`, `-d=value`; `--` ends flag parsing (everything after is positional); a lone `-` is a positional; when commands are defined, the first positional is the command word (a `-` there is an unknown command, like any invalid word); later flags may follow positionals; a repeated flag keeps the last value.
+
+**Help format** (byte-identical on both backends):
+
+```
+tasks - A tiny task manager
+
+Usage: tasks [flags] <command> [args]
+
+Flags:
+  -d, --db PATH  Database path (default: /tmp/tasks.db)
+  --verbose      Verbose output
+  -h, --help     Show this help and exit
+
+Commands:
+  add   Add a task
+  list  List tasks
+```
+
+`--help` is always listed last in `Flags:`. The `Commands:` section appears only when commands are defined. When no commands are defined, `Usage:` ends with `[args]` and every positional lands in `positionals()`.
+
+**Types:** `CliParser` and `CliArgs` are builtin types (method syntax `p.flag(..)` / `args.get(..)` desugars to `cli.*`, like `set.*`). `parse` returns `CliArgs?`, and `get`/`get_bool`/`get_command`/`positionals` accept `CliArgs?`, so the `if args == nil { return }` pattern typechecks without flow-sensitive narrowing.
+
+**Checked throws:** `parse`, `flag`, `bool_flag`, `short`, `command`, `get`, `get_bool` all declare `throws E300` — calling them from a function without `throws E300` is `E227`.
+
+**Overtake note:** check-time `E200` for empty flag names and multi-char shorts on string literals (like regex pattern validation); computed `--help` with aligned columns on both backends (byte-identical, asserted by AOT parity test `a33_cli`).
+
 ## 4. Maps
 
 `Map<K, V>` with `K` = `Text` or `Int`:
