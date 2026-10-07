@@ -81,6 +81,9 @@ NS_BUILTINS = {
     "db.begin": (["Db"], "Void"),
     "db.commit": (["Db"], "Void"),
     "db.rollback": (["Db"], "Void"),
+    # Phase 5 DB2: migrations + query plans.
+    "db.migrate": (["Db", "[record]"], "Int"),
+    "db.explain": (["Db", "Text", "[any]"], "[record]"),
     # Text.Builder methods (method-style `b.append(s)` desugars to these).
     "builder.append": (["Builder", "any"], "Void"),
     "builder.build": (["Builder"], "Text"),
@@ -200,6 +203,7 @@ POLY_BUILTINS = {
 NS_BUILTIN_ARITY = {
     "db.exec": (2, 3),
     "db.query": (2, 3),
+    "db.explain": (2, 3),
     # cli: p.flag(name, metavar, help[, default]).
     "cli.flag": (4, 5),
 }
@@ -253,6 +257,8 @@ BUILTIN_THROWS = {
     "db.begin": frozenset({"E303"}),
     "db.commit": frozenset({"E303"}),
     "db.rollback": frozenset({"E303"}),
+    "db.migrate": frozenset({"E303"}),
+    "db.explain": frozenset({"E303"}),
     # Parsing / conversion (E300 from calls is checked; E300 from
     # operators like `/` and `[i]` is unchecked by design)
     "json.parse": frozenset({"E300"}),
@@ -304,31 +310,8 @@ LEAF_COMPONENTS = {
 }
 ALL_COMPONENTS = LAYOUT_COMPONENTS | LEAF_COMPONENTS
 
-# Phase 5 (DB): minimal SELECT shape for typed db.query validation.
-_DB_SELECT_RE = re.compile(
-    r"^\s*SELECT\s+(?P<cols>.+?)\s+FROM\s+"
-    r"(?P<table>[A-Za-z_][A-Za-z0-9_]*)"
-    r"(?:\s+WHERE\s+(?P<where>.+?))?\s*;?\s*$",
-    re.IGNORECASE | re.DOTALL)
-_DB_WHERE_KW = {"and", "or", "not", "null", "like", "in", "is", "between",
-                "true", "false", "nil", "select", "from", "where"}
 
 
-def _split_top_commas(s: str) -> List[str]:
-    """Split on commas not nested inside parentheses."""
-    parts, depth, cur = [], 0, []
-    for ch in s:
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth = max(0, depth - 1)
-        if ch == "," and depth == 0:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    parts.append("".join(cur))
-    return parts
 
 
 class Checker:
@@ -3148,6 +3131,12 @@ class Checker:
                 typed = self._check_db_query(e, arg_ts)
                 if typed is not None:
                     return typed
+            # Phase 5 DB2: INSERT/UPDATE/DELETE validation in db.exec.
+            if e.name == "db.exec" and len(e.args) >= 2:
+                self._check_db_exec(e, arg_ts)
+            # Phase 5 DB2: placeholder arity for db.exec_many rows.
+            if e.name == "db.exec_many" and len(e.args) >= 3:
+                self._check_db_exec_many(e)
             return ret
         if e.name in BUILTINS:
             lo, hi = BUILTIN_ARITY[e.name]
@@ -3188,102 +3177,525 @@ class Checker:
 
     def _check_db_query(self, e: ast.Call,
                         arg_ts: list) -> Optional[str]:
-        """Validate `db.query(db, sql)` against `table` decls.
+        """Phase 5 DB2: deep static analysis of `db.query(db, sql, args?)`.
 
-        Returns the synthetic result type string (e.g. `[$query_0]`)
-        when the SQL is a plain string literal over a declared table,
-        else None (dynamic `[record]`, no static checking).
-        Unknown tables/columns are E224.
+        Uses the real SQL parser (impl/misa/sqlparse.py). Validates table
+        refs, JOIN scopes, column refs, expression types, and placeholder
+        arity against `table` decls. Returns the synthetic result type
+        string (e.g. `[$query_0]`), or None for dynamic (unchecked) SQL.
         """
+        from misa import sqlparse as _sp
+        sql = self._db_plain_sql(e, 1)
+        if sql is None:
+            return None
+        node = _sp.parse(sql)
+        if not isinstance(node, _sp.Select):
+            return None  # not a SELECT: dynamic
         sql_arg = e.args[1]
-        # Only plain (non-interpolated) string literals are statically
-        # checkable: StrLit.parts is [str] for plain strings.
-        if not isinstance(sql_arg, ast.StrLit) \
-                or len(sql_arg.parts) != 1 \
-                or not isinstance(sql_arg.parts[0], str):
+        self._db_check_placeholders(e, 2, node, sql_arg)
+        cols = self._db_analyze_select(node, sql_arg)
+        if cols is None:
             return None
-        parsed = self._parse_select(sql_arg.parts[0])
-        if parsed is None:
-            return None
-        table_name, cols, where_cols = parsed
-        decl = self.tables.get(table_name)
-        if decl is None:
-            # Undeclared table: dynamic records, not an error.
-            return None
-        col_types = {fn: fte for fn, fte, _ in decl.fields}
-        # Validate WHERE identifiers (v1: name validation only).
-        for wc in where_cols:
-            if wc not in col_types:
-                self.error("E224",
-                           f"unknown column '{wc}' in WHERE clause "
-                           f"(table '{table_name}' has no such column)",
-                           sql_arg.line, sql_arg.col)
-        # Resolve the select list.
-        if cols == ["*"]:
-            sel = [(fn, fte) for fn, fte, _ in decl.fields]
-        else:
-            sel = []
-            for cname, _alias in cols:
-                if cname not in col_types:
-                    self.error("E224",
-                               f"unknown column '{cname}' "
-                               f"(table '{table_name}' has no such column)",
-                               sql_arg.line, sql_arg.col)
-                    continue
-                sel.append((cname, col_types[cname]))
-        # Synthesize a record type for the result rows so field
-        # access type-checks through the existing machinery.
         self._query_seq += 1
         tname = f"$query_{self._query_seq}"
         self.types[tname] = ast.TypeDecl(
             name=tname,
-            fields=[(fn, fte) for fn, fte in sel],
+            fields=[(cn, te) for cn, te in cols],
             line=e.line, col=e.col)
         return f"[{tname}]"
 
-    @staticmethod
-    def _parse_select(sql: str):
-        """Minimal SELECT parser (v1). Returns
-        (table, [(col, alias)], [where_cols]) or None when the SQL
-        isn't a plain `SELECT ... FROM ... [WHERE ...]`."""
-        m = _DB_SELECT_RE.match(sql)
-        if not m:
-            return None
-        table = m.group("table")
-        raw_cols = m.group("cols").strip()
-        if raw_cols == "*":
-            cols = ["*"]
-        else:
-            cols = []
-            for part in _split_top_commas(raw_cols):
-                part = part.strip()
-                if not part:
-                    return None
-                # `t.col`, `col AS alias`, `col alias`
-                toks = part.split()
-                first = toks[0]
-                cname = first.rpartition(".")[2]
-                alias = None
-                if len(toks) >= 3 and toks[1].upper() == "AS":
-                    alias = toks[2]
-                elif len(toks) == 2:
-                    alias = toks[1]
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cname):
-                    return None  # expressions: not v1-checkable
-                cols.append((cname, alias or cname))
-        where_cols = []
-        where = m.group("where")
-        if where:
-            # strip string literals so 'O''Brien' doesn't yield identifiers
-            no_str = re.sub(r"'(?:[^']|'')*'", " ", where)
-            for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", no_str):
-                if tok.lower() not in _DB_WHERE_KW \
-                        and not tok[0].isdigit():
-                    wc = tok.rpartition(".")[2]
-                    if wc not in where_cols:
-                        where_cols.append(wc)
-        return table, cols, where_cols
+    def _check_db_exec(self, e: ast.Call, arg_ts: list) -> None:
+        """Phase 5 DB2: validate INSERT/UPDATE/DELETE in `db.exec`."""
+        from misa import sqlparse as _sp
+        sql = self._db_plain_sql(e, 1)
+        if sql is None:
+            return
+        node = _sp.parse(sql)
+        if node is None:
+            return  # dynamic
+        sql_arg = e.args[1]
+        self._db_check_placeholders(e, 2, node, sql_arg)
+        if isinstance(node, _sp.Insert):
+            self._db_check_insert(node, sql_arg)
+        elif isinstance(node, _sp.Update):
+            self._db_check_update(node, sql_arg)
+        elif isinstance(node, _sp.Delete):
+            self._db_check_delete(node, sql_arg)
 
+    def _check_db_exec_many(self, e: ast.Call) -> None:
+        """Phase 5 DB2: each row in `db.exec_many(db, sql, rows)` must
+        match the placeholder count."""
+        from misa import sqlparse as _sp
+        sql = self._db_plain_sql(e, 1)
+        if sql is None:
+            return
+        node = _sp.parse(sql)
+        if node is None:
+            return
+        n_ph = _sp.count_placeholders(node)
+        rows = e.args[2]
+        if not isinstance(rows, ast.ListLit):
+            return  # dynamic
+        for i, row in enumerate(rows.items):
+            if isinstance(row, ast.ListLit) and \
+                    len(row.items) != n_ph:
+                self.error("E233",
+                           f"db.exec_many row {i} has "
+                           f"{len(row.items)} value(s), SQL needs {n_ph}",
+                           row.line, row.col)
+
+    @staticmethod
+    def _db_plain_sql(e: ast.Call, idx: int) -> Optional[str]:
+        """The SQL string when it is a plain (non-interpolated) literal."""
+        if idx >= len(e.args):
+            return None
+        a = e.args[idx]
+        if isinstance(a, ast.StrLit) and len(a.parts) == 1 \
+                and isinstance(a.parts[0], str):
+            return a.parts[0]
+        return None
+
+    def _db_check_placeholders(self, e: ast.Call, bind_idx: int,
+                               node, sql_arg) -> None:
+        """Phase 5 DB2: `?` count must match the bind-args list length."""
+        from misa import sqlparse as _sp
+        n_ph = _sp.count_placeholders(node)
+        if n_ph == 0:
+            return
+        if bind_idx >= len(e.args):
+            self.error("E233",
+                       f"SQL has {n_ph} placeholder(s) but no bind args "
+                       f"were given",
+                       sql_arg.line, sql_arg.col)
+            return
+        bargs = e.args[bind_idx]
+        if isinstance(bargs, ast.ListLit):
+            n = len(bargs.items)
+            if n != n_ph:
+                self.error("E233",
+                           f"SQL has {n_ph} placeholder(s), got {n} "
+                           f"bind arg(s)",
+                           bargs.line, bargs.col)
+
+    # -- scope ---------------------------------------------------------
+
+    class _DbScopeEntry:
+        __slots__ = ("ref", "cols", "nullable")
+        def __init__(self, ref, cols, nullable=False):
+            self.ref = ref            # alias or table name (original case)
+            self.cols = cols          # {lower_name: (orig_name, TypeExpr)}
+            self.nullable = nullable  # True when from the null side of
+                                      # an outer JOIN
+
+    def _db_table_cols(self, table_name: str):
+        """{lower_col: (orig, TypeExpr)} for a declared table, or None."""
+        decl = self.tables.get(table_name)
+        if decl is None:
+            # case-insensitive fallback (SQL identifiers are)
+            for tn, d in self.tables.items():
+                if tn.lower() == table_name.lower():
+                    decl = d
+                    break
+        if decl is None:
+            return None
+        return {fn.lower(): (fn, fte) for fn, fte, _ in decl.fields}
+
+    def _db_scope(self, from_items, sql_arg):
+        """Build the JOIN scope. Returns [entries] or None (dynamic)."""
+        from misa import sqlparse as _sp
+        scope: list = []
+        for item in from_items:
+            if isinstance(item, _sp.Join):
+                src = item.source
+                entry = self._db_scope_one(src, sql_arg)
+                if entry is None:
+                    return None
+                if item.kind == "left":
+                    entry.nullable = True
+                elif item.kind == "right":
+                    for s in scope:
+                        s.nullable = True
+                elif item.kind == "full":
+                    entry.nullable = True
+                    for s in scope:
+                        s.nullable = True
+                # validate the ON expression against the widened scope
+                wider = scope + [entry]
+                if item.on is not None:
+                    self._db_expr_type(item.on, wider, sql_arg)
+                # USING(col, ...) — the columns must exist on both sides
+                using = getattr(src, "_using", None)
+                if using:
+                    for c in using:
+                        self._db_resolve_col(
+                            _sp.ColRef(None, c), wider, sql_arg)
+                scope.append(entry)
+            else:
+                entry = self._db_scope_one(item, sql_arg)
+                if entry is None:
+                    return None
+                scope.append(entry)
+        return scope
+
+    def _db_scope_one(self, src, sql_arg):
+        """One table factor → _DbScopeEntry, or None (dynamic)."""
+        from misa import sqlparse as _sp
+        if isinstance(src, _sp.SubqueryRef):
+            cols = self._db_analyze_select(src.query, sql_arg)
+            if cols is None:
+                return None
+            cmap = {cn.lower(): (cn, te) for cn, te in cols}
+            return self._DbScopeEntry(src.alias, cmap)
+        cols = self._db_table_cols(src.name)
+        if cols is None:
+            return None  # undeclared table: dynamic, not an error
+        return self._DbScopeEntry(src.alias or src.name, cols)
+
+    def _db_resolve_col(self, col: "ColRef", scope, sql_arg):
+        """Resolve a column ref → (TypeExpr, nullable). Emits E224/E232."""
+        from misa import sqlparse as _sp
+        cname = col.name.lower()
+        if col.qual is not None:
+            q = col.qual.lower()
+            matches = [s for s in scope if s.ref.lower() == q]
+            if not matches:
+                self.error("E232",
+                           f"unknown table alias '{col.qual}' "
+                           f"(not in FROM scope)",
+                           sql_arg.line, sql_arg.col)
+                return None
+            hit = matches[0].cols.get(cname)
+            if hit is None:
+                self.error("E224",
+                           f"unknown column '{col.qual}.{col.name}'",
+                           sql_arg.line, sql_arg.col)
+                return None
+            return hit[1], matches[0].nullable
+        cands = []
+        for s in scope:
+            hit = s.cols.get(cname)
+            if hit is not None:
+                cands.append((s, hit))
+        if not cands:
+            self.error("E224",
+                       f"unknown column '{col.name}'",
+                       sql_arg.line, sql_arg.col)
+            return None
+        if len(cands) > 1:
+            refs = ", ".join(s.ref for s, _ in cands)
+            self.error("E232",
+                       f"ambiguous column '{col.name}' "
+                       f"(in {refs}; qualify it)",
+                       sql_arg.line, sql_arg.col)
+            return None
+        s, hit = cands[0]
+        return hit[1], s.nullable
+
+    # -- expression types ----------------------------------------------
+
+    def _db_expr_type(self, e, scope, sql_arg) -> str:
+        """Type-check a SQL expression → Misa type name.
+
+        Returns one of Int|Float|Text|Bool|Nil|?. Emits E231 on
+        statically detectable mismatches. `?` (placeholder) and Nil
+        are permissive.
+        """
+        from misa import sqlparse as _sp
+        if isinstance(e, _sp.Lit):
+            return e.t
+        if isinstance(e, _sp.PH):
+            return "?"
+        if isinstance(e, _sp.ColRef):
+            r = self._db_resolve_col(e, scope, sql_arg)
+            if r is None:
+                return "?"
+            te, _nullable = r
+            return self._tname(te)
+        if isinstance(e, _sp.IsNullOp):
+            self._db_expr_type(e.e, scope, sql_arg)
+            return "Bool"
+        if isinstance(e, _sp.InOp):
+            lt = self._db_expr_type(e.e, scope, sql_arg)
+            for v in e.vals:
+                rt = self._db_expr_type(v, scope, sql_arg)
+                self._db_comparable(lt, rt, "IN", sql_arg)
+            return "Bool"
+        if isinstance(e, _sp.BetweenOp):
+            lt = self._db_expr_type(e.e, scope, sql_arg)
+            lot = self._db_expr_type(e.lo, scope, sql_arg)
+            hit = self._db_expr_type(e.hi, scope, sql_arg)
+            self._db_comparable(lt, lot, "BETWEEN", sql_arg)
+            self._db_comparable(lt, hit, "BETWEEN", sql_arg)
+            return "Bool"
+        if isinstance(e, _sp.UnOp):
+            t = self._db_expr_type(e.e, scope, sql_arg)
+            if e.op == "not":
+                if t not in ("Bool", "?", "Nil"):
+                    self._db_typerr(f"NOT needs Bool, got {t}", sql_arg)
+                return "Bool"
+            if t not in ("Int", "Float", "?", "Nil"):
+                self._db_typerr(f"unary '{e.op}' needs a number, got {t}",
+                                sql_arg)
+            return t
+        if isinstance(e, _sp.BinOp):
+            lt = self._db_expr_type(e.l, scope, sql_arg)
+            rt = self._db_expr_type(e.r, scope, sql_arg)
+            op = e.op
+            if op in ("and", "or"):
+                for t, side in ((lt, "left"), (rt, "right")):
+                    if t not in ("Bool", "?", "Nil"):
+                        self._db_typerr(
+                            f"'{op.upper()}' needs Bool operands, "
+                            f"{side} is {t}", sql_arg)
+                return "Bool"
+            if op in ("=", "<>", "!="):
+                self._db_comparable(lt, rt, op, sql_arg)
+                return "Bool"
+            if op in ("<", "<=", ">", ">="):
+                self._db_ordered(lt, rt, op, sql_arg)
+                return "Bool"
+            if op in ("+", "-", "*", "/", "%"):
+                if not self._db_numeric(lt) or not self._db_numeric(rt):
+                    self._db_typerr(
+                        f"'{op}' needs numeric operands, "
+                        f"got {lt} and {rt}", sql_arg)
+                    return "?"
+                return "Float" if "Float" in (lt, rt) else "Int"
+            if op == "||":
+                if lt not in ("Text", "?", "Nil") or \
+                        rt not in ("Text", "?", "Nil"):
+                    self._db_typerr(
+                        f"'||' needs Text operands, got {lt} and {rt}",
+                        sql_arg)
+                return "Text"
+            if op in ("like", "glob"):
+                if lt not in ("Text", "?", "Nil") or \
+                        rt not in ("Text", "?", "Nil"):
+                    self._db_typerr(
+                        f"'{op.upper()}' needs Text operands, "
+                        f"got {lt} and {rt}", sql_arg)
+                return "Bool"
+            return "?"
+        if isinstance(e, _sp.Call):
+            return self._db_call_type(e, scope, sql_arg)
+        return "?"
+
+    @staticmethod
+    def _db_numeric(t: str) -> bool:
+        return t in ("Int", "Float", "?", "Nil")
+
+    def _db_comparable(self, lt: str, rt: str, op: str, sql_arg) -> None:
+        if lt in ("?", "Nil") or rt in ("?", "Nil"):
+            return
+        ok = (self._db_numeric(lt) and self._db_numeric(rt)) or lt == rt
+        if not ok:
+            self._db_typerr(
+                f"'{op}' compares incompatible types {lt} and {rt}",
+                sql_arg)
+
+    def _db_ordered(self, lt: str, rt: str, op: str, sql_arg) -> None:
+        if lt in ("?", "Nil") or rt in ("?", "Nil"):
+            return
+        ok = (self._db_numeric(lt) and self._db_numeric(rt)) or \
+            (lt == "Text" and rt == "Text")
+        if not ok:
+            self._db_typerr(
+                f"'{op}' needs numeric or Text operands, "
+                f"got {lt} and {rt}", sql_arg)
+
+    def _db_typerr(self, msg: str, sql_arg) -> None:
+        self.error("E231", f"SQL type error: {msg}",
+                   sql_arg.line, sql_arg.col)
+
+    def _db_call_type(self, e, scope, sql_arg) -> str:
+        """Result type of a SQL function call."""
+        from misa import sqlparse as _sp
+        name = e.name
+        argts = [self._db_expr_type(a, scope, sql_arg) for a in e.args]
+        if name == "count":
+            return "Int"
+        if name in ("sum",):
+            t = argts[0] if argts else "?"
+            if t not in ("Int", "Float", "?", "Nil"):
+                self._db_typerr(f"'{name.upper()}' needs a numeric "
+                                f"argument, got {t}", sql_arg)
+            return "Float" if t == "Float" else "Int"
+        if name == "avg":
+            return "Float"
+        if name in ("min", "max"):
+            return argts[0] if argts else "?"
+        if name in ("length", "upper", "lower", "trim", "ltrim", "rtrim",
+                    "substr", "substring", "replace", "printf"):
+            return "Text"
+        if name == "abs":
+            t = argts[0] if argts else "?"
+            return t if t in ("Int", "Float") else "?"
+        if name == "coalesce" and argts:
+            return argts[0]
+        if name in ("nullif", "ifnull"):
+            return argts[0] if argts else "?"
+        # unknown scalar function: dynamic
+        return "?"
+
+    # -- SELECT analysis ------------------------------------------------
+
+    def _db_analyze_select(self, node, sql_arg):
+        """Returns [(col_name, TypeExpr)] for the result rows, or None
+        when the SELECT is beyond static analysis (dynamic)."""
+        from misa import sqlparse as _sp
+        scope = self._db_scope(node.from_, sql_arg)
+        if scope is None:
+            return None
+        if node.where is not None:
+            t = self._db_expr_type(node.where, scope, sql_arg)
+            if t not in ("Bool", "?", "Nil"):
+                self._db_typerr(f"WHERE must be Bool, got {t}", sql_arg)
+        for g in node.group_by:
+            self._db_expr_type(g, scope, sql_arg)
+        if node.having is not None:
+            t = self._db_expr_type(node.having, scope, sql_arg)
+            if t not in ("Bool", "?", "Nil"):
+                self._db_typerr(f"HAVING must be Bool, got {t}", sql_arg)
+
+        out: list = []
+        seen_agg = False
+        for item in node.items:
+            if item.star is not None:
+                entries = scope if item.star == "*" else [
+                    s for s in scope if s.ref.lower() == item.star.lower()]
+                if item.star != "*" and not entries:
+                    self.error("E232",
+                               f"unknown table alias '{item.star}' in "
+                               f"'{item.star}.*'",
+                               sql_arg.line, sql_arg.col)
+                    continue
+                for s in entries:
+                    for _low, (orig, te) in s.cols.items():
+                        out.append((orig,
+                                    self._db_nullable_te(te, s.nullable)))
+                continue
+            t = self._db_expr_type(item.expr, scope, sql_arg)
+            if isinstance(item.expr, _sp.Call) and \
+                    item.expr.name in ("count", "sum", "avg", "min", "max"):
+                seen_agg = True
+            # output column name
+            if item.alias:
+                cname = item.alias
+            elif isinstance(item.expr, _sp.ColRef):
+                cname = item.expr.name
+            elif isinstance(item.expr, _sp.Call):
+                cname = item.expr.name
+            else:
+                cname = f"col{len(out)}"
+            te = self._db_te(t)
+            # aggregates except COUNT() can return NULL (empty set)
+            if isinstance(item.expr, _sp.Call) and item.expr.name in (
+                    "sum", "avg", "min", "max") and not te.optional:
+                te = self._db_nullable_te(te, True)
+            out.append((cname, te))
+        # ORDER BY may reference select-list aliases (SQL semantics):
+        # a bare name matching an output alias resolves to the alias
+        # first, shadowing any table column of the same name.
+        if node.order_by:
+            alias_types = {cn.lower(): self._tname(te)
+                           for cn, te in out}
+            for o in node.order_by:
+                oe = o.e
+                if isinstance(oe, _sp.ColRef) and oe.qual is None \
+                        and oe.name.lower() in alias_types:
+                    continue  # resolves to the select alias
+                self._db_expr_type(oe, scope, sql_arg)
+        if node.limit is not None:
+            self._db_expr_type(node.limit, scope, sql_arg)
+        return out
+
+    @staticmethod
+    def _db_te(t: str) -> "ast.TypeExpr":
+        base = t if t in ("Int", "Float", "Text", "Bool") else "Text"
+        return ast.TypeExpr(name=base, optional=(t == "Nil" or t == "?"))
+
+    @staticmethod
+    def _db_nullable_te(te: "ast.TypeExpr", nullable: bool):
+        if not nullable or te.optional:
+            return te
+        import copy
+        te2 = copy.copy(te)
+        te2.optional = True
+        return te2
+
+    # -- INSERT / UPDATE / DELETE --------------------------------------
+
+    def _db_check_insert(self, node, sql_arg) -> None:
+        from misa import sqlparse as _sp
+        cols = self._db_table_cols(node.table)
+        if cols is None:
+            return  # undeclared table: dynamic
+        if node.cols:
+            for c in node.cols:
+                if c.lower() not in cols:
+                    self.error("E224",
+                               f"unknown column '{c}' "
+                               f"(table '{node.table}' has no such column)",
+                               sql_arg.line, sql_arg.col)
+            arity = len(node.cols)
+        else:
+            arity = len(cols)
+        for row in node.rows:
+            for e in row:
+                self._db_expr_type(e, [], sql_arg)
+            if len(row) != arity:
+                self.error("E233",
+                           f"INSERT into '{node.table}' needs {arity} "
+                           f"value(s), got {len(row)}",
+                           sql_arg.line, sql_arg.col)
+        if node.select is not None:
+            self._db_analyze_select(node.select, sql_arg)
+
+    def _db_check_update(self, node, sql_arg) -> None:
+        cols = self._db_table_cols(node.table)
+        if cols is None:
+            return  # undeclared table: dynamic
+        from misa import sqlparse as _sp
+        scope = [self._DbScopeEntry(node.alias or node.table, cols)]
+        for cname, e in node.sets:
+            col_hit = cols.get(cname.lower())
+            if col_hit is None:
+                self.error("E224",
+                           f"unknown column '{cname}' "
+                           f"(table '{node.table}' has no such column)",
+                           sql_arg.line, sql_arg.col)
+                self._db_expr_type(e, scope, sql_arg)
+                continue
+            t = self._db_expr_type(e, scope, sql_arg)
+            want = self._tname(col_hit[1])
+            if t not in ("?", "Nil", "unknown") and want != "unknown":
+                # allow Int -> Float widening, anything into Text?
+                # keep it strict except numeric
+                if not (self._db_numeric(t) and self._db_numeric(want)
+                        and t != want):
+                    if t != want and not (
+                            want == "Text" or t == want):
+                        # permissive: only flag clear scalar mismatches
+                        if t in ("Int", "Float", "Bool") and \
+                                want in ("Int", "Float", "Bool") and \
+                                t != want and "Float" not in (t, want):
+                            self._db_typerr(
+                                f"SET '{cname}' wants {want}, got {t}",
+                                sql_arg)
+        if node.where is not None:
+            t = self._db_expr_type(node.where, scope, sql_arg)
+            if t not in ("Bool", "?", "Nil"):
+                self._db_typerr(f"WHERE must be Bool, got {t}", sql_arg)
+
+    def _db_check_delete(self, node, sql_arg) -> None:
+        cols = self._db_table_cols(node.table)
+        if cols is None:
+            return  # undeclared table: dynamic
+        scope = [self._DbScopeEntry(node.table, cols)]
+        if node.where is not None:
+            t = self._db_expr_type(node.where, scope, sql_arg)
+            if t not in ("Bool", "?", "Nil"):
+                self._db_typerr(f"WHERE must be Bool, got {t}", sql_arg)
     # -- Phase 5b: sum types ------------------------------------------
 
     @staticmethod

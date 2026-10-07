@@ -60,8 +60,10 @@ class DbHandle:
     """Phase 5 (DB): an open SQLite connection (opaque `Db` value)."""
     path: str
     conn: Any  # sqlite3.Connection
-    # P-3: explicit-transaction state (db.begin/commit/rollback).
-    in_txn: bool = False
+    # Phase 5 DB2: explicit-transaction nesting depth (db.begin/
+    # commit/rollback). Depth 0 = autocommit; 1 = BEGIN..COMMIT;
+    # N > 1 = SAVEPOINT misa_sp_{N-1}.
+    txn_depth: int = 0
 
 
 @dataclass
@@ -1739,6 +1741,11 @@ class Interpreter:
         if name == "db.query":
             return self.db_query(args[0], args[1],
                                  args[2] if len(args) > 2 else [], e)
+        if name == "db.migrate":
+            return self.db_migrate(args[0], args[1], e)
+        if name == "db.explain":
+            return self.db_explain(args[0], args[1],
+                                   args[2] if len(args) > 2 else [], e)
         if name == "db.close":
             return self.db_close(args[0], e)
         # -- Phase 6 prerequisites: str namespace + process.run ---------
@@ -3100,7 +3107,7 @@ class Interpreter:
         try:
             cur = h.conn.execute(sql, bound)
             # P-3: don't autocommit inside an explicit transaction.
-            if not h.in_txn:
+            if h.txn_depth == 0:
                 h.conn.commit()
             return cur.rowcount if cur.rowcount >= 0 else 0
         except sqlite3.Error as ex:
@@ -3127,7 +3134,7 @@ class Interpreter:
                  for j, a in enumerate(row)])
         try:
             cur = h.conn.executemany(sql, bound_rows)
-            if not h.in_txn:
+            if h.txn_depth == 0:
                 h.conn.commit()
             return cur.rowcount if cur.rowcount >= 0 else 0
         except sqlite3.Error as ex:
@@ -3135,10 +3142,14 @@ class Interpreter:
                            line=node.line, col=node.col)
 
     def db_begin(self, dbv, node: ast.Node) -> None:
+        # Phase 5 DB2: nested transactions via savepoints.
         h = self._db_handle(dbv, "db.begin", node)
         try:
-            h.conn.execute("BEGIN")
-            h.in_txn = True
+            if h.txn_depth == 0:
+                h.conn.execute("BEGIN")
+            else:
+                h.conn.execute(f"SAVEPOINT misa_sp_{h.txn_depth}")
+            h.txn_depth += 1
         except sqlite3.Error as ex:
             raise IOError_(f"db.begin failed: {ex}",
                            line=node.line, col=node.col)
@@ -3146,9 +3157,14 @@ class Interpreter:
 
     def db_commit(self, dbv, node: ast.Node) -> None:
         h = self._db_handle(dbv, "db.commit", node)
+        if h.txn_depth == 0:
+            return  # no explicit transaction: harmless no-op
         try:
-            h.conn.commit()
-            h.in_txn = False
+            h.txn_depth -= 1
+            if h.txn_depth == 0:
+                h.conn.commit()
+            else:
+                h.conn.execute(f"RELEASE misa_sp_{h.txn_depth}")
         except sqlite3.Error as ex:
             raise IOError_(f"db.commit failed: {ex}",
                            line=node.line, col=node.col)
@@ -3156,9 +3172,16 @@ class Interpreter:
 
     def db_rollback(self, dbv, node: ast.Node) -> None:
         h = self._db_handle(dbv, "db.rollback", node)
+        if h.txn_depth == 0:
+            return  # no explicit transaction: harmless no-op
         try:
-            h.conn.rollback()
-            h.in_txn = False
+            h.txn_depth -= 1
+            if h.txn_depth == 0:
+                h.conn.rollback()
+            else:
+                h.conn.execute(
+                    f"ROLLBACK TO SAVEPOINT misa_sp_{h.txn_depth}")
+                h.conn.execute(f"RELEASE misa_sp_{h.txn_depth}")
         except sqlite3.Error as ex:
             raise IOError_(f"db.rollback failed: {ex}",
                            line=node.line, col=node.col)
@@ -3196,6 +3219,87 @@ class Interpreter:
                 "db.query: BLOB columns are not supported in v1",
                 line=node.line, col=node.col)
         return str(val)
+
+    def db_migrate(self, dbv, migrations, node: ast.Node) -> int:
+        """Phase 5 DB2: versioned migrations.
+
+        `migrations` is a list of {version: Int, sql: Text} records.
+        Tracks applied versions in `_misa_migrations`; applies pending
+        ones in ascending version order, each in its own transaction.
+        Returns the number applied.
+        """
+        h = self._db_handle(dbv, "db.migrate", node)
+        if not isinstance(migrations, list):
+            raise RuntimeError_("db.migrate needs a list of "
+                                "{version, sql} records",
+                                line=node.line, col=node.col)
+        seen = {}
+        for i, m in enumerate(migrations):
+            if not isinstance(m, dict) or "version" not in m \
+                    or "sql" not in m:
+                raise RuntimeError_(
+                    f"db.migrate: migration {i} must be "
+                    "{version: Int, sql: Text}",
+                    line=node.line, col=node.col)
+            v, q = m["version"], m["sql"]
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise RuntimeError_(
+                    f"db.migrate: migration {i} has bad version {v!r} "
+                    "(positive Int required)",
+                    line=node.line, col=node.col)
+            if not isinstance(q, str):
+                raise RuntimeError_(
+                    f"db.migrate: migration {i} sql must be Text",
+                    line=node.line, col=node.col)
+            if v in seen:
+                raise RuntimeError_(
+                    f"db.migrate: duplicate version {v}",
+                    line=node.line, col=node.col)
+            seen[v] = q
+        try:
+            h.conn.execute("CREATE TABLE IF NOT EXISTS _misa_migrations "
+                           "(version INTEGER PRIMARY KEY)")
+            applied = {r[0] for r in
+                       h.conn.execute("SELECT version FROM _misa_migrations")}
+            n = 0
+            for v in sorted(seen):
+                if v in applied:
+                    continue
+                # each migration in its own transaction so a failure
+                # leaves earlier ones applied and the failed one not
+                try:
+                    h.conn.execute("BEGIN")
+                    h.conn.executescript(seen[v])
+                    h.conn.execute(
+                        "INSERT INTO _misa_migrations (version) VALUES (?)",
+                        (v,))
+                    h.conn.commit()
+                    n += 1
+                except sqlite3.Error:
+                    h.conn.rollback()
+                    raise
+            if h.txn_depth == 0:
+                h.conn.commit()
+            return n
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.migrate failed: {ex}",
+                           line=node.line, col=node.col)
+
+    def db_explain(self, dbv, sql, args, node: ast.Node) -> list:
+        """Phase 5 DB2: EXPLAIN QUERY PLAN → [{id, parent, detail}]."""
+        h = self._db_handle(dbv, "db.explain", node)
+        if not isinstance(sql, str):
+            raise RuntimeError_("db.explain needs a text SQL statement",
+                                line=node.line, col=node.col)
+        bound = [self._db_bind_arg(a, "db.explain", i + 1, node)
+                 for i, a in enumerate(args)]
+        try:
+            cur = h.conn.execute("EXPLAIN QUERY PLAN " + sql, bound)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+        except sqlite3.Error as ex:
+            raise IOError_(f"db.explain failed: {ex}",
+                           line=node.line, col=node.col)
 
     def db_close(self, dbv, node: ast.Node) -> None:
         h = self._db_handle(dbv, "db.close", node)

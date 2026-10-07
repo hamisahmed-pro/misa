@@ -280,6 +280,9 @@ _RT_SIGS = {
     "misa_db_begin": (PTR, [PTR, I32, I32]),
     "misa_db_commit": (PTR, [PTR, I32, I32]),
     "misa_db_rollback": (PTR, [PTR, I32, I32]),
+    # Phase 5 DB2: migrations + query plans.
+    "misa_db_migrate": (PTR, [PTR, PTR, I32, I32]),
+    "misa_db_explain": (PTR, [PTR, PTR, PTR, I32, I32]),
     # Text.Builder: amortized string building (perf gap P-1).
     "misa_builder_new": (PTR, []),
     "misa_builder_append": (ir.VoidType(), [PTR, PTR, I32, I32]),
@@ -3163,6 +3166,14 @@ class Emitter:
             alist = arg(2) if len(e.args) > 2 else self.call(
                 ctx, "misa_list_new", [], e, check=False)
             return self.call(ctx, "misa_db_query",
+                             [arg(0), arg(1), alist, line, col], e)
+        if name == "db.migrate":
+            return self.call(ctx, "misa_db_migrate",
+                             [arg(0), arg(1), line, col], e)
+        if name == "db.explain":
+            alist = arg(2) if len(e.args) > 2 else self.call(
+                ctx, "misa_list_new", [], e, check=False)
+            return self.call(ctx, "misa_db_explain",
                              [arg(0), arg(1), alist, line, col], e)
         if name == "db.close":
             return self.call(ctx, "misa_db_close", [arg(0), line, col],

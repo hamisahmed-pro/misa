@@ -1,0 +1,68 @@
+// Phase 5 DB2: typed queries, nested transactions, migrations, explain.
+// AOT must agree with the interpreter on every line.
+table users {
+  id: Int @primary,
+  name: Text,
+  email: Text?,
+}
+table orders {
+  id: Int @primary,
+  user_id: Int,
+  total: Float,
+}
+
+fn main() -> Int throws E303 {
+  let db = db.open(":memory:")
+  let n = db.migrate(db, [
+    {version: 1, sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)"},
+    {version: 2, sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, total REAL NOT NULL)"},
+  ])
+  print("migrated: " + str(n))
+  // idempotent rerun
+  let n2 = db.migrate(db, [
+    {version: 1, sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)"},
+    {version: 2, sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, total REAL NOT NULL)"},
+  ])
+  print("remigrated: " + str(n2))
+
+  db.exec_many(db, "INSERT INTO users (name, email) VALUES (?, ?)", [
+    ["Hamis", "hamis@example.com"],
+    ["Ayo", nil],
+  ])
+  db.exec_many(db, "INSERT INTO orders (user_id, total) VALUES (?, ?)", [
+    [1, 25.5],
+    [1, 10.0],
+    [2, 99.99],
+  ])
+
+  // JOIN with aliases, typed results
+  let rows = db.query(db, "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > ? ORDER BY o.total", [20.0])
+  for r in rows {
+    print(r.name + ": " + str(r.total))
+  }
+
+  // LEFT JOIN nullability + aggregates
+  let stats = db.query(db, "SELECT COUNT(*) AS n, AVG(total) AS avg_total FROM orders")
+  for s in stats {
+    print("n=" + str(s.n) + " avg=" + str(s.avg_total))
+  }
+
+  // nested transactions: inner rollback keeps outer
+  db.begin(db)
+  db.exec(db, "INSERT INTO users (name) VALUES (?)", ["temp"])
+  db.begin(db)
+  db.exec(db, "INSERT INTO users (name) VALUES (?)", ["doomed"])
+  db.rollback(db)
+  db.commit(db)
+  let cnt = db.query(db, "SELECT COUNT(*) AS c FROM users")
+  for r in cnt { print("users: " + str(r.c)) }
+
+  // explain
+  let plan = db.explain(db, "SELECT name FROM users WHERE id = ?", [1])
+  print("plan rows: " + str(len(plan)))
+  for p in plan { print("  " + p.detail) }
+
+  db.close(db)
+  return 0
+}
+main()

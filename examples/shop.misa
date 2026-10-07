@@ -1,0 +1,92 @@
+// Misa Phase 5 DB2: a tiny shop — JOINs, migrations, nested transactions.
+// Run: misa run examples/shop.misa
+// Every SQL statement below is statically checked: table/column names,
+// JOIN scopes, expression types, and placeholder counts are verified by
+// `misa check` before the app ever runs.
+
+table products {
+  id: Int @primary,
+  name: Text,
+  price: Float,
+  stock: Int,
+}
+table orders {
+  id: Int @primary,
+  product_id: Int,
+  qty: Int,
+  placed: Text,
+}
+
+fn init(db: Db) -> Int throws E303 {
+  // Versioned schema: reruns apply only pending migrations.
+  return db.migrate(db, [
+    {version: 1, sql: "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL NOT NULL, stock INTEGER NOT NULL)"},
+    {version: 2, sql: "CREATE TABLE orders (id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, qty INTEGER NOT NULL, placed TEXT NOT NULL)"},
+    {version: 3, sql: "CREATE INDEX idx_orders_product ON orders(product_id)"},
+  ])
+}
+
+fn seed(db: Db) -> Void throws E303 {
+  db.exec_many(db, "INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", [
+    ["Keyboard", 49.99, 10],
+    ["Mouse", 25.50, 30],
+    ["Monitor", 199.00, 5],
+  ])
+}
+
+// A sale runs in a nested transaction: the stock decrement and the
+// order insert commit or roll back together, and a failed sale never
+// corrupts an outer transaction.
+fn sell(db: Db, product_id: Int, qty: Int) -> Text throws E303 {
+  db.begin(db)
+  try {
+    let rows = db.query(db, "SELECT stock, price FROM products WHERE id = ?", [product_id])
+    if len(rows) == 0 {
+      db.rollback(db)
+      return "unknown product"
+    }
+    let p = rows[0]
+    if p.stock < qty {
+      db.rollback(db)
+      return "not enough stock"
+    }
+    db.begin(db)  // nested: savepoint
+    db.exec(db, "UPDATE products SET stock = stock - ? WHERE id = ?", [qty, product_id])
+    db.exec(db, "INSERT INTO orders (product_id, qty, placed) VALUES (?, ?, ?)", [product_id, qty, "2026-10-07"])
+    db.commit(db)
+    db.commit(db)
+    return "sold"
+  } catch e {
+    db.rollback(db)
+    return "failed: " + e.message
+  }
+  return "unreachable"
+}
+
+fn report(db: Db) -> Void throws E303 {
+  // JOIN with aliases + aggregates — all checked at compile time.
+  let lines = db.query(db, "SELECT p.name, SUM(o.qty) AS sold, SUM(o.qty * p.price) AS revenue FROM products p JOIN orders o ON o.product_id = p.id GROUP BY p.name ORDER BY revenue DESC")
+  print("== sales report ==")
+  for l in lines {
+    print(l.name + ": " + str(l.sold) + " sold, $" + str(l.revenue))
+  }
+  // What is the query planner doing?
+  let plan = db.explain(db, "SELECT name FROM products WHERE id = ?", [1])
+  for step in plan {
+    print("plan: " + step.detail)
+  }
+}
+
+fn main() -> Int throws E303 {
+  let db = db.open(":memory:")
+  print("migrations applied: " + str(init(db)))
+  print("migrations applied: " + str(init(db)))
+  seed(db)
+  print(sell(db, 1, 2))
+  print(sell(db, 2, 100))  // too many
+  print(sell(db, 99, 1))   // unknown
+  report(db)
+  db.close(db)
+  return 0
+}
+main()

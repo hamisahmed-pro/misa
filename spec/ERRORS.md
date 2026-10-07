@@ -64,6 +64,9 @@ Every Misa diagnostic carries a code. Ranges:
 | E228 | **(Phase 5d)** `where`-constraint violation — a concrete type used for a bounded type variable does not implement a required interface (`type 'Int' does not satisfy bound 'T: Printable' (missing impl of 'Printable' for 'Int')`). |
 | E229 | **(Phase 5d)** Unknown interface in a `where` clause (`unknown interface 'Printabl' in where clause`). |
 | E230 | **(Phase 5d)** Match guard is not `Bool` (`match guard must be Bool, got 'Text'`). |
+| E231 | **(Phase 5 DB2)** SQL expression type error — a statically detectable type mismatch inside a checked SQL statement (`SQL type error: '=' compares incompatible types Int and Text`; `WHERE must be Bool, got Int`). |
+| E232 | **(Phase 5 DB2)** SQL scope error — unknown table alias/qualifier or ambiguous column across a JOIN (`unknown table alias 'x' (not in FROM scope)`; `ambiguous column 'id' (in users, orders; qualify it)`). |
+| E233 | **(Phase 5 DB2)** SQL arity error — placeholder count vs bind args, INSERT VALUES arity, or `db.exec_many` row arity (`SQL has 1 placeholder(s), got 2 bind arg(s)`). |
 
 ## E3xx — runtime
 

@@ -2164,6 +2164,190 @@ def _():
                for e in errs), errs
 
 
+@test("db2: JOIN with aliases type-checks")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'table orders { id: Int @primary, user_id: Int, total: Float }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT u.name, o.total FROM users u '
+           'JOIN orders o ON o.user_id = u.id WHERE o.total > 1.5")\n')
+    eq(check_source(src), [])
+
+
+@test("db2: E232 unknown table alias")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT x.name FROM users u")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E232" and "x" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E232 ambiguous column across JOIN")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'table orders { id: Int @primary, user_id: Int }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id FROM users u '
+           'JOIN orders o ON o.user_id = u.id")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E232" and "ambiguous" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E231 WHERE type mismatch")
+def _():
+    src = ('table users { id: Int @primary, age: Int }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id FROM users '
+           'WHERE age = \'old\'")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E231" for e in errs), errs
+
+
+@test("db2: E231 non-Bool WHERE")
+def _():
+    src = ('table users { id: Int @primary, age: Int }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id FROM users WHERE age")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E231" and "WHERE" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E231 AND on non-Bool")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT id FROM users '
+           'WHERE name AND id > 1")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E231" for e in errs), errs
+
+
+@test("db2: E233 placeholder/arg count mismatch")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT name FROM users WHERE id = ?", '
+           '[1, 2])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E233" and "1 placeholder" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E233 missing bind args")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT name FROM users WHERE id = ?")\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E233" for e in errs), errs
+
+
+@test("db2: E224 INSERT unknown column")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'db.exec(db, "INSERT INTO users (nam) VALUES (?)", ["x"])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E224" and "nam" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E233 INSERT arity mismatch")
+def _():
+    src = ('table users { id: Int @primary, name: Text, age: Int }\n'
+           'let db = db.open(":memory:")\n'
+           'db.exec(db, "INSERT INTO users (name, age) VALUES (?)", ["x"])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E233" for e in errs), errs
+
+
+@test("db2: E224 UPDATE unknown column")
+def _():
+    src = ('table users { id: Int @primary, name: Text }\n'
+           'let db = db.open(":memory:")\n'
+           'db.exec(db, "UPDATE users SET nam = ? WHERE id = ?", ["x", 1])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E224" and "nam" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: E233 exec_many row arity")
+def _():
+    src = ('let db = db.open(":memory:")\n'
+           'db.exec_many(db, "INSERT INTO t VALUES (?, ?)", '
+           '[[1, "a"], [2]])\n')
+    errs = check_source(src)
+    assert any(e["code"] == "E233" and "row 1" in e["message"]
+               for e in errs), errs
+
+
+@test("db2: aggregates infer Int/Float")
+def _():
+    src = ('table orders { id: Int @primary, total: Float }\n'
+           'let db = db.open(":memory:")\n'
+           'let rows = db.query(db, "SELECT COUNT(*) AS n, AVG(total) AS a '
+           'FROM orders")\n'
+           'for r in rows { print(str(r.n) + "/" + str(r.a)) }\n')
+    eq(check_source(src), [])
+
+
+@test("db2: nested transactions via savepoints")
+def _():
+    src = ('fn m() -> Int throws E303 {\n'
+           ' let db = db.open(":memory:")\n'
+           ' db.exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")\n'
+           ' db.begin(db)\n'
+           ' db.exec(db, "INSERT INTO t (v) VALUES (?)", ["outer"])\n'
+           ' db.begin(db)\n'
+           ' db.exec(db, "INSERT INTO t (v) VALUES (?)", ["inner"])\n'
+           ' db.rollback(db)\n'
+           ' db.commit(db)\n'
+           ' let rows = db.query(db, "SELECT v FROM t")\n'
+           ' print(str(len(rows)))\n'
+           ' db.close(db)\n'
+           ' return 0\n}\n'
+           'm()\n')
+    eq(run_src(src), "1\n")
+
+
+@test("db2: db.migrate applies pending only")
+def _():
+    src = ('fn m() -> Int throws E303 {\n'
+           ' let db = db.open(":memory:")\n'
+           ' let a = db.migrate(db, [\n'
+           '   {version: 1, sql: "CREATE TABLE t (id INTEGER)"},\n'
+           '   {version: 2, sql: "ALTER TABLE t ADD COLUMN v TEXT"},\n'
+           ' ])\n'
+           ' print(str(a))\n'
+           ' let b = db.migrate(db, [\n'
+           '   {version: 1, sql: "CREATE TABLE t (id INTEGER)"},\n'
+           '   {version: 2, sql: "ALTER TABLE t ADD COLUMN v TEXT"},\n'
+           '   {version: 3, sql: "CREATE INDEX i ON t(id)"},\n'
+           ' ])\n'
+           ' print(str(b))\n'
+           ' db.close(db)\n'
+           ' return 0\n}\n'
+           'm()\n')
+    eq(run_src(src), "2\n1\n")
+
+
+@test("db2: db.explain returns plan rows")
+def _():
+    src = ('fn m() -> Int throws E303 {\n'
+           ' let db = db.open(":memory:")\n'
+           ' db.exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")\n'
+           ' let plan = db.explain(db, "SELECT v FROM t WHERE id = ?", [1])\n'
+           ' print(str(len(plan)))\n'
+           ' db.close(db)\n'
+           ' return 0\n}\n'
+           'm()\n')
+    eq(run_src(src), "1\n")
+
+
 @test("db: exec_many bulk insert")
 def _():
     src = ('let db = db.open(":memory:")\n'
