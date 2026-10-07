@@ -1884,7 +1884,21 @@ MVal *misa_time_format(MVal *epoch, MVal *fmt, int line, int col) {
 /* Minimal strptime for the formats we document; falls back to the
  * libc strptime where available. */
 static int time_parse_fields(const char *s, const char *fmt, struct tm *tmv) {
-#if defined(_XOPEN_SOURCE) || defined(__linux__) || defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+    /* Emscripten/wasm must not depend on libc strptime. Keep the
+     * portable parser below so the shared runtime has no X/Open time
+     * dependency on the web target. */
+    memset(tmv, 0, sizeof *tmv);
+    int y, mo, d, h = 0, mi = 0, se = 0;
+    if (strcmp(fmt, "%Y-%m-%d") == 0) {
+        if (sscanf(s, "%d-%d-%d", &y, &mo, &d) != 3) return 0;
+    } else if (strcmp(fmt, "%Y-%m-%d %H:%M:%S") == 0) {
+        if (sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
+    } else return 0;
+    tmv->tm_year=y-1900; tmv->tm_mon=mo-1; tmv->tm_mday=d;
+    tmv->tm_hour=h; tmv->tm_min=mi; tmv->tm_sec=se;
+    return 1;
+#elif defined(_XOPEN_SOURCE) || defined(__linux__) || defined(__APPLE__)
     memset(tmv, 0, sizeof *tmv);
     char *r = strptime(s, fmt, tmv);
     return r != NULL && *r == '\0';
