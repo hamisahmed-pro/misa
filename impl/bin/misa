@@ -7,6 +7,7 @@ Usage:
   misa profile <file.misa> [--json] [--mock mocks.json] [--interval-ms N] [-- args...]
   misa repl
   misa check <file.misa> [--json]
+  misa mir <file.misa> [--opt]
   misa fmt <file.misa> [--write]
   misa test [path] [--mock mocks.json] [--json]
   misa build <file.misa> [-o output] [--emit-llvm file.ll] [--target triple] [--preload-file src@dst]... [--json]
@@ -112,6 +113,30 @@ def cmd_check(path, as_json, deny_warnings=False):
     else:
         emit_warnings(warnings, as_json)
         print(f"{path}: OK")
+    return 0
+
+
+def cmd_mir(path, optimize_mir=False):
+    """Lower the checked scalar subset to MIR and print it."""
+    from misa.mir import dump, optimize
+    from misa.mir_lower import lower_program, MIRLowerError
+    merged, load_errors, _, file_of = load_with_imports(path)
+    if merged is None:
+        emit_errors(load_errors, False)
+        return 1
+    checker = Checker()
+    errors = load_errors + checker.check(merged, file_of=file_of)
+    if errors:
+        emit_errors(errors, False)
+        return 1
+    try:
+        mod = lower_program(merged)
+    except MIRLowerError as e:
+        sys.stderr.write(f"misa mir: unsupported program: {e}\n")
+        return 2
+    if optimize_mir:
+        optimize(mod)
+    print(dump(mod))
     return 0
 
 
@@ -665,6 +690,8 @@ def main(argv):
         if len(args) == 1:
             return cmd_check(args[0], as_json, deny_warnings)
         die("usage: misa check <file.misa> [--json] [--deny-warnings]")
+    if cmd == "mir" and 1 <= len(args) <= 2:
+        return cmd_mir(args[0], "--opt" in args)
     if cmd == "fmt" and 1 <= len(args) <= 2:
         return cmd_fmt(args[0], "--write" in args)
     if cmd == "run" and len(args) >= 1:
