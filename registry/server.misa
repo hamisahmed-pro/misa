@@ -166,6 +166,37 @@ fn text_resp(status: Int, ctype: Text, body: Text) -> Resp throws E300 {
   return r
 }
 
+fn html_resp(status: Int, body: Text) -> Resp throws E300 {
+  return text_resp(status, "text/html; charset=utf-8", body)
+}
+
+// v1.1: does `version` satisfy a dependency `range`?
+// Ranges: "1.2.3" (exact), "^1.2.3" (compatible), "~1.2.3" (approx),
+// ">=1.2.3". Anything else matches nothing (safe).
+fn version_satisfies(version: Text, range: Text) -> Bool throws E300 {
+  let r = str.trim(range)
+  let v = parse_semver(version)
+  if str.starts_with(r, "^") {
+    let b = parse_semver(str.slice(r, 1, len(r)))
+    if b[0] != 0 {
+      return v[0] == b[0] and semver_key(version) >= semver_key(str.slice(r, 1, len(r)))
+    }
+    if b[1] != 0 {
+      return v[0] == 0 and v[1] == b[1] and v[2] >= b[2]
+    }
+    return v[0] == 0 and v[1] == 0 and v[2] == b[2]
+  }
+  if str.starts_with(r, "~") {
+    let b = parse_semver(str.slice(r, 1, len(r)))
+    return v[0] == b[0] and v[1] == b[1] and v[2] >= b[2]
+  }
+  if str.starts_with(r, ">=") {
+    return semver_key(version) >= semver_key(str.trim(str.slice(r, 2, len(r))))
+  }
+  // exact
+  return version == r
+}
+
 fn err_resp(status: Int, code: Text, msg: Text) -> Resp throws E300 {
   return jresp(status, jerr(code, msg))
 }
@@ -230,6 +261,8 @@ fn schema_ddl() -> [Text] {
       caps_verified TEXT NOT NULL DEFAULT '[]',
       examples_pass INTEGER NOT NULL DEFAULT 0,
       examples_total INTEGER NOT NULL DEFAULT 0,
+      signature TEXT NOT NULL DEFAULT '',
+      key_fingerprint TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (pkg, version)
     )""",
     r"""CREATE TABLE IF NOT EXISTS dependencies (
@@ -288,7 +321,25 @@ fn schema_ddl() -> [Text] {
       id TEXT PRIMARY KEY,
       handle TEXT NOT NULL,
       created_at INTEGER NOT NULL,
-      pubkey TEXT NOT NULL DEFAULT ''
+      pubkey TEXT NOT NULL DEFAULT '',
+      tier TEXT NOT NULL DEFAULT 'unverified'
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS publisher_keys (
+      handle TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      pubkey TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      revoked INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (handle, fingerprint)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS device_codes (
+      device_code TEXT PRIMARY KEY,
+      user_code TEXT NOT NULL UNIQUE,
+      handle TEXT NOT NULL DEFAULT '',
+      approved INTEGER NOT NULL DEFAULT 0,
+      token_sha TEXT NOT NULL DEFAULT '',
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
     )""",
     r"""CREATE TABLE IF NOT EXISTS tokens (
       token_sha TEXT PRIMARY KEY,
@@ -309,9 +360,25 @@ fn schema_ddl() -> [Text] {
   ]
 }
 
-fn init_schema(dbh: Db) throws E303 {
+fn init_schema(dbh: Db) throws E300, E303 {
   for ddl in schema_ddl() {
     db.exec(dbh, ddl, [])
+  }
+  // v1.1 columns on pre-existing tables (idempotent: only ADD when
+  // the column is not already there).
+  let tables = ["publishers", "versions", "versions"]
+  let columns = ["tier", "signature", "key_fingerprint"]
+  let ddls = ["tier TEXT NOT NULL DEFAULT 'unverified'",
+    "signature TEXT NOT NULL DEFAULT ''",
+    "key_fingerprint TEXT NOT NULL DEFAULT ''"]
+  for i in irange(len(tables)) {
+    let have = db.query(dbh,
+      "SELECT name FROM pragma_table_info(?) WHERE name = ?",
+      [tables[i], columns[i]])
+    if len(have) == 0 {
+      db.exec(dbh,
+        "ALTER TABLE " + tables[i] + " ADD COLUMN " + ddls[i], [])
+    }
   }
 }
 
@@ -1294,6 +1361,22 @@ fn ends_with_dotmisa(m: Text) -> Bool throws E300 {
 // namespace ownership -> sha256 verify -> unpack -> misa check ->
 // signatures -> capability verify -> examples+tests -> breaking diff ->
 // secret scan -> one atomic SQLite transaction -> blob storage.
+// v1.1: optional Ed25519 package signature (verified, badged).
+fn register_publisher_key(dbh: Db, handle: Text, pubkey: Text,
+    fingerprint: Text, now: Int) throws E303 {
+  let ex = db.query(dbh,
+    "SELECT fingerprint FROM publisher_keys WHERE handle = ? AND fingerprint = ?",
+    [handle, fingerprint])
+  if len(ex) == 0 {
+    db.exec(dbh,
+      "INSERT INTO publisher_keys (handle, fingerprint, pubkey, created_at, revoked) VALUES (?, ?, ?, ?, 0)",
+      [handle, fingerprint, pubkey, now])
+  }
+  // keep publishers.pubkey as the latest key
+  db.exec(dbh, "UPDATE publishers SET pubkey = ? WHERE handle = ?",
+    [pubkey, handle])
+}
+
 fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp throws E300, E303 {
   let a = need_auth(dbh, req)
   var body: Text = ""
@@ -1379,6 +1462,52 @@ fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp 
   if str.to_lower(tsha) != got_sha {
     rthrow("R422", "tarball_sha256 mismatch: claimed " + tsha +
       ", actual " + got_sha)
+  }
+
+  // ---- v1.1: Ed25519 package signature (optional, badged) ----
+  // The signed payload is SHA256(namespace + "\0" + name + "\0" +
+  // version + "\0" + tarball_bytes), hex-encoded. The client signs
+  // the hex digest's UTF-8 bytes.
+  var sig_hex: Text = ""
+  var sig_fp: Text = ""
+  var sig_obj: Text = ""
+  try {
+    sig_obj = body.signature
+  } catch e {
+    sig_obj = ""
+  }
+  if sig_obj != "" {
+    var sig_pub: Text = ""
+    var sig_sig: Text = ""
+    try {
+      sig_pub = sig_obj.pubkey
+      sig_sig = sig_obj.sig
+      sig_fp = sig_obj.fingerprint
+    } catch e {
+      rthrow("R400", "body.signature needs pubkey/sig/fingerprint")
+    }
+    // verify the fingerprint matches the pubkey. Protocol:
+    // fingerprint = hex(SHA256(utf8(pubkey_hex))).
+    if crypto.sha256(sig_pub) != str.to_lower(sig_fp) {
+      rthrow("R422", "signature fingerprint does not match pubkey")
+    }
+    // the message is the hex digest of the signed payload
+    let ph = run_json(cfg, ["python3",
+      helpers_dir(cfg) + "/payload_hash.py",
+      ns, m.name, m.version, tmp + "/pkg.tar.gz"])
+    var payload_hash: Text = ""
+    try {
+      payload_hash = ph.payload_hash
+    } catch e {
+      rthrow("R500", "payload hash helper failed")
+    }
+    let ok = crypto.ed25519_verify(sig_pub, payload_hash, sig_sig)
+    if not ok {
+      rthrow("R422", "package signature verification failed")
+    }
+    sig_hex = sig_sig
+    // register the key (TOFU: first publish with a key claims it)
+    register_publisher_key(dbh, a.publisher, sig_pub, sig_fp, now_s())
   }
 
   // ---- unpack: list, validate, extract ----
@@ -1560,9 +1689,9 @@ fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp 
         [m.description, m.homepage, m.repository, full])
     }
     db.exec(dbh,
-      "INSERT INTO versions (pkg, version, semver_key, sha256, tarball_path, published_at, publisher, license, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO versions (pkg, version, semver_key, sha256, tarball_path, published_at, publisher, license, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total, signature, key_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [full, m.version, sk, got_sha, tb_rel, now, a.publisher, m.license,
-        breaking, dcaps_j, caps_j, ex_pass, len(ex_names)])
+        breaking, dcaps_j, caps_j, ex_pass, len(ex_names), sig_hex, sig_fp])
     for i in irange(len(m.dep_names)) {
       db.exec(dbh,
         "INSERT INTO dependencies (pkg, version, dep, range, dev) VALUES (?, ?, ?, ?, ?)",
@@ -1662,6 +1791,20 @@ fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp 
     throw e
   }
 
+  // v1.1: generate hosted docs (best-effort; publish succeeds regardless)
+  var docs_url: Text = ""
+  try {
+    let dp = docs_path(cfg, full, m.version)
+    let dgr = process.run(["python3",
+      helpers_dir(cfg) + "/gen_docs.py",
+      pkgdir, dp, full, m.version])
+    if dgr.code == 0 {
+      docs_url = cfg.registry_url + "/v1/docs/" + full + "/" + m.version + "/"
+    }
+  } catch e {
+    docs_url = ""
+  }
+
   // best-effort scratch cleanup
   try {
     process.run(["rm", "-rf", tmp])
@@ -1678,6 +1821,9 @@ fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp 
     breaking_computed: breaking,
     breaking_notes: diff_notes,
     warnings: warnings,
+    docs_url: docs_url,
+    signed: sig_hex != "",
+    key_fingerprint: sig_fp,
   })
   return jresp(201, resp_body)
 }
@@ -1737,7 +1883,7 @@ fn handle_package(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
   }
   var vs = []
   let vrows = db.query(dbh,
-    "SELECT version, published_at, license, yanked, breaking_computed, caps_verified, examples_pass, examples_total FROM versions WHERE pkg = ? ORDER BY semver_key DESC",
+    "SELECT version, published_at, license, yanked, breaking_computed, caps_verified, examples_pass, examples_total, signature, key_fingerprint, publisher FROM versions WHERE pkg = ? ORDER BY semver_key DESC",
     [full])
   for v in vrows {
     var ver: Text = ""
@@ -1748,6 +1894,9 @@ fn handle_package(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
     var caps_j: Text = "[]"
     var ex_p: Int = 0
     var ex_t: Int = 0
+    var sig: Text = ""
+    var fp: Text = ""
+    var pub: Text = ""
     try {
       ver = v.version
     } catch e {
@@ -1788,11 +1937,37 @@ fn handle_package(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
     } catch e {
       ex_t = 0
     }
+    try {
+      sig = v.signature
+    } catch e {
+      sig = ""
+    }
+    try {
+      fp = v.key_fingerprint
+    } catch e {
+      fp = ""
+    }
+    try {
+      pub = v.publisher
+    } catch e {
+      pub = ""
+    }
     var caps = []
     try {
       caps = json.parse(caps_j)
     } catch e {
       caps = []
+    }
+    // v1.1: publisher tier badge
+    var tier: Text = "unverified"
+    let trows = db.query(dbh,
+      "SELECT tier FROM publishers WHERE id = ? OR handle = ?", [pub, pub])
+    if len(trows) > 0 {
+      try {
+        tier = trows[0].tier
+      } catch e {
+        tier = "unverified"
+      }
     }
     vs = vs + [{
       version: ver,
@@ -1802,6 +1977,9 @@ fn handle_package(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
       breaking_computed: brk,
       capabilities: caps,
       examples: {pass: ex_p, total: ex_t},
+      signed: sig != "",
+      key_fingerprint: fp,
+      publisher_tier: tier,
     }]
   }
   return jresp(200, json.stringify({
@@ -1836,7 +2014,7 @@ fn latest_version(dbh: Db, full: Text) -> Text throws E303 {
 // ---------------- GET /v1/packages/:ns/:name/:version ----------------
 fn handle_version(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
   let vrows = db.query(dbh,
-    "SELECT pkg, version, sha256, tarball_path, published_at, publisher, license, yanked, yank_reason, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total FROM versions WHERE pkg = ? AND version = ?",
+    "SELECT pkg, version, sha256, tarball_path, published_at, publisher, license, yanked, yank_reason, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total, signature, key_fingerprint FROM versions WHERE pkg = ? AND version = ?",
     [full, version])
   if len(vrows) == 0 {
     rthrow("R404", "version not found: " + full + "@" + version)
@@ -1847,6 +2025,35 @@ fn handle_version(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E
   var caps_d = []
   var caps_v = []
   var sigs = []
+  // v1.1 badges
+  var vsig: Text = ""
+  var vfp: Text = ""
+  var vpub: Text = ""
+  try {
+    vsig = v.signature
+  } catch e {
+    vsig = ""
+  }
+  try {
+    vfp = v.key_fingerprint
+  } catch e {
+    vfp = ""
+  }
+  try {
+    vpub = v.publisher
+  } catch e {
+    vpub = ""
+  }
+  var vtier: Text = "unverified"
+  let vtrows = db.query(dbh,
+    "SELECT tier FROM publishers WHERE id = ? OR handle = ?", [vpub, vpub])
+  if len(vtrows) > 0 {
+    try {
+      vtier = vtrows[0].tier
+    } catch e {
+      vtier = "unverified"
+    }
+  }
   try {
     yanked = v.yanked
   } catch e {
@@ -2007,6 +2214,9 @@ fn handle_version(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E
     throws_surface: sigs,
     dependencies: deps,
     examples: {pass: ex_p, total: ex_t},
+    signed: vsig != "",
+    key_fingerprint: vfp,
+    publisher_tier: vtier,
   }))
 }
 
@@ -2184,13 +2394,15 @@ fn ends_with_d(s: Text) -> Bool throws E300 {
 // UTF-8 Text only, so the tarball travels as base64 inside JSON.
 fn handle_tarball(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
   let vrows = db.query(dbh,
-    "SELECT sha256, tarball_path FROM versions WHERE pkg = ? AND version = ?",
+    "SELECT sha256, tarball_path, signature, key_fingerprint FROM versions WHERE pkg = ? AND version = ?",
     [full, version])
   if len(vrows) == 0 {
     rthrow("R404", "version not found: " + full + "@" + version)
   }
   var sha: Text = ""
   var tb_rel: Text = ""
+  var sig: Text = ""
+  var fp: Text = ""
   try {
     sha = vrows[0].sha256
   } catch e {
@@ -2200,6 +2412,16 @@ fn handle_tarball(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E
     tb_rel = vrows[0].tarball_path
   } catch e {
     tb_rel = ""
+  }
+  try {
+    sig = vrows[0].signature
+  } catch e {
+    sig = ""
+  }
+  try {
+    fp = vrows[0].key_fingerprint
+  } catch e {
+    fp = ""
   }
   let path = cfg.data_dir + "/" + tb_rel
   // base64 via helper (binary never enters Misa Text)
@@ -2219,7 +2441,32 @@ fn handle_tarball(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E
   db.exec(dbh,
     "INSERT INTO downloads (pkg, version, day, count) VALUES (?, ?, ?, 1) ON CONFLICT (pkg, version, day) DO UPDATE SET count = count + 1",
     [full, version, day])
-  return jresp(200, json.stringify({sha256: sha, tarball_b64: r.stdout}))
+  // v1.1: include the signature object for client-side verification
+  var sig_obj: Text = "null"
+  if sig != "" {
+    let krows = db.query(dbh,
+      "SELECT pubkey FROM publisher_keys WHERE fingerprint = ? AND revoked = 0 ORDER BY created_at DESC LIMIT 1",
+      [fp])
+    var pubkey: Text = ""
+    if len(krows) > 0 {
+      try {
+        pubkey = krows[0].pubkey
+      } catch e {
+        pubkey = ""
+      }
+    }
+    if pubkey != "" {
+      sig_obj = json.stringify({
+        pubkey: pubkey, sig: sig, fingerprint: fp,
+      })
+    }
+  }
+  // (signature JSON is embedded via string concat to avoid brace issues)
+  let q2: Text = str.chr(34)
+  let resp2 = str.chr(123) + q2 + "sha256" + q2 + ": " + json.stringify(sha) +
+    ", " + q2 + "tarball_b64" + q2 + ": " + json.stringify(r.stdout) +
+    ", " + q2 + "signature" + q2 + ": " + sig_obj + str.chr(125)
+  return jresp(200, resp2)
 }
 
 // ---------------- GET /v1/search (spec §6.1) ----------------
@@ -3367,6 +3614,296 @@ fn strip_tar_gz(v: Text) -> Text throws E300 {
   return v
 }
 
+// ---------------- v1.1: OAuth device flow ----------------
+// `POST /v1/oauth/device/code` issues a device_code + user_code pair.
+// The CLI polls `POST /v1/oauth/device/token`; a human (or the admin
+// API) approves the user_code, and the poll returns a publisher token.
+
+fn handle_device_code(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let gr = process.run(["python3", "-c",
+    "import secrets; print(secrets.token_hex(24))"])
+  if gr.code != 0 {
+    rthrow("R500", "code generation failed")
+  }
+  let device_code: Text = str.trim(gr.stdout)
+  // user_code: 8 chars, unambiguous alphabet, formatted XXXX-XXXX
+  let gr2 = process.run(["python3", "-c",
+    "import secrets; a='ABCDEFGHJKMNPQRSTUVWXYZ23456789'; " +
+    "print(''.join(secrets.choice(a) for _ in range(8)))"])
+  if gr2.code != 0 {
+    rthrow("R500", "code generation failed")
+  }
+  let raw: Text = str.trim(gr2.stdout)
+  let user_code = str.slice(raw, 0, 4) + "-" + str.slice(raw, 4, 8)
+  let now = now_s()
+  db.exec(dbh,
+    "INSERT INTO device_codes (device_code, user_code, handle, approved, token_sha, expires_at, created_at) VALUES (?, ?, '', 0, '', ?, ?)",
+    [device_code, user_code, now + 900, now])
+  return jresp(200, json.stringify({
+    device_code: device_code,
+    user_code: user_code,
+    verification_uri: "https://pkg.misa.website/v1/oauth/device",
+    expires_in: 900,
+    interval: 5,
+  }))
+}
+
+fn handle_device_token(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var dc: Text = ""
+  try {
+    dc = body.device_code
+  } catch e {
+    rthrow("R400", "body.device_code is required")
+  }
+  let rows = db.query(dbh,
+    "SELECT user_code, handle, approved, token_sha, expires_at FROM device_codes WHERE device_code = ?",
+    [dc])
+  if len(rows) == 0 {
+    rthrow("R404", "unknown device_code")
+  }
+  let r = rows[0]
+  if r.expires_at < now_s() {
+    rthrow("R410", "device_code expired; start over with a new code")
+  }
+  if r.approved == 0 {
+    return jresp(200, json.stringify({error: "authorization_pending"}))
+  }
+  // approved: mint the publisher token (stored by sha only)
+  let gr = process.run(["python3", "-c",
+    "import secrets; print(secrets.token_hex(32))"])
+  if gr.code != 0 {
+    rthrow("R500", "token generation failed")
+  }
+  let token: Text = str.trim(gr.stdout)
+  let sha: Text = crypto.sha256(token)
+  let pub_id = "pub_" + str.slice(sha, 0, 12)
+  let now = now_s()
+  // find or create the publisher for this handle
+  let prow = db.query(dbh, "SELECT id FROM publishers WHERE handle = ?",
+    [r.handle])
+  var pid: Text = ""
+  if len(prow) > 0 {
+    pid = prow[0].id
+  } else {
+    pid = pub_id
+    db.exec(dbh,
+      "INSERT INTO publishers (id, handle, created_at) VALUES (?, ?, ?)",
+      [pid, r.handle, now])
+  }
+  db.exec(dbh,
+    "INSERT INTO tokens (token_sha, publisher_id, scopes, created_at, expires_at, revoked) VALUES (?, ?, ?, ?, ?, 0)",
+    [sha, pid, "[\"publish:*\", \"read:*\"]", now, now + 365 * 86400])
+  db.exec(dbh, "DELETE FROM device_codes WHERE device_code = ?", [dc])
+  return jresp(200, json.stringify({
+    token: token,
+    handle: r.handle,
+    warning: "this token is shown once; the server stores only its sha256",
+  }))
+}
+
+fn handle_device_page(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  // Human approval page: enter the user_code shown by the CLI.
+  // Approval itself requires the admin token (paste it into the form).
+  let html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" +
+    "<title>Misa registry — device approval</title></head><body>" +
+    "<h1>Approve a device login</h1>" +
+    "<p>Enter the code shown by <code>misa pkg login</code>, the publisher " +
+    "handle to authorize, and the registry admin token.</p>" +
+    "<form method=\"POST\" action=\"/v1/oauth/device/approve-form\">" +
+    "<label>User code: <input name=\"user_code\" required></label><br>" +
+    "<label>Handle: <input name=\"handle\" required></label><br>" +
+    "<label>Admin token: <input name=\"admin_token\" type=\"password\" required></label><br>" +
+    "<button type=\"submit\">Approve</button></form></body></html>"
+  return html_resp(200, html)
+}
+
+fn handle_device_approve(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  // Admin-only: approve a user_code for a handle.
+  let a = need_auth(dbh, req)
+  need_scope(a, "admin:*")
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var uc: Text = ""
+  var handle: Text = ""
+  try {
+    uc = body.user_code
+    handle = body.handle
+  } catch e {
+    rthrow("R400", "body.user_code and body.handle are required")
+  }
+  if handle == "" {
+    rthrow("R400", "handle must not be empty")
+  }
+  let rows = db.query(dbh,
+    "SELECT device_code FROM device_codes WHERE user_code = ? AND expires_at > ?",
+    [uc, now_s()])
+  if len(rows) == 0 {
+    rthrow("R404", "unknown or expired user_code")
+  }
+  db.exec(dbh,
+    "UPDATE device_codes SET approved = 1, handle = ? WHERE user_code = ?",
+    [handle, uc])
+  return jresp(200, json.stringify({ok: true, handle: handle}))
+}
+
+// ---------------- v1.1: verification tiers ----------------
+
+fn handle_set_tier(dbh: Db, cfg: Cfg, req: Request, handle: Text) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  need_scope(a, "admin:*")
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var tier: Text = ""
+  try {
+    tier = body.tier
+  } catch e {
+    rthrow("R400", "body.tier is required")
+  }
+  if tier != "unverified" and tier != "verified" and tier != "trusted" {
+    rthrow("R422", "tier must be unverified, verified, or trusted")
+  }
+  let rows = db.query(dbh, "SELECT id FROM publishers WHERE handle = ?",
+    [handle])
+  if len(rows) == 0 {
+    rthrow("R404", "unknown publisher handle: " + handle)
+  }
+  db.exec(dbh, "UPDATE publishers SET tier = ? WHERE handle = ?",
+    [tier, handle])
+  return jresp(200, json.stringify({handle: handle, tier: tier}))
+}
+
+// ---------------- v1.1: dependency graph ----------------
+
+fn handle_graph(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
+  // BFS over the dependencies table; returns {nodes, edges}.
+  var seen: Map<Text, Bool> = {}
+  var nodes: [Text] = []
+  var edges: [Text] = []
+  var queue: [Text] = [full + "@" + version]
+  var qi: Int = 0
+  while qi < len(queue) {
+    let cur = queue[qi]
+    qi = qi + 1
+    var already: Bool = false
+    try {
+      already = seen[cur]
+    } catch e {
+      already = false
+    }
+    if not already {
+      seen[cur] = true
+      // cur is "@ns/name@version"; split off the version from the right.
+      // (str.split on "@" gives ["", "ns/name", "version"].)
+      let at_parts = str.split(cur, "@")
+      let pver: Text = at_parts[len(at_parts) - 1]
+      let pname: Text = "@" + at_parts[1]
+      let vrows = db.query(dbh,
+        "SELECT signature, key_fingerprint FROM versions WHERE pkg = ? AND version = ?",
+        [pname, pver])
+      var signed: Bool = false
+      var fp: Text = ""
+      if len(vrows) > 0 {
+        signed = vrows[0].signature != ""
+        fp = vrows[0].key_fingerprint
+      }
+      // publisher tier for the badge
+      var tier: Text = "unverified"
+      let trows = db.query(dbh,
+        "SELECT publishers.tier FROM publishers JOIN versions ON (versions.publisher = publishers.id OR versions.publisher = publishers.handle) WHERE versions.pkg = ? AND versions.version = ?",
+        [pname, pver])
+      if len(trows) > 0 {
+        tier = trows[0].tier
+      }
+      nodes = nodes + [json.stringify({
+        name: pname, version: pver, signed: signed,
+        key_fingerprint: fp, tier: tier,
+      })]
+      let drows = db.query(dbh,
+        "SELECT dep, range FROM dependencies WHERE pkg = ? AND version = ? AND dev = 0",
+        [pname, pver])
+      for d in drows {
+        let cand = db.query(dbh,
+          "SELECT version FROM versions WHERE pkg = ? AND yanked = 0 ORDER BY semver_key DESC",
+          [d.dep])
+        var best: Text = ""
+        for c in cand {
+          if best == "" and version_satisfies(c.version, d.range) {
+            best = c.version
+          }
+        }
+        if best != "" {
+          edges = edges + [json.stringify({from: cur, to: d.dep + "@" + best})]
+          queue = queue + [d.dep + "@" + best]
+        }
+      }
+    }
+  }
+  let ob: Text = str.chr(123)
+  let cb: Text = str.chr(125)
+  let q: Text = str.chr(34)
+  let body: Text = ob + q + "nodes" + q + ": [" + str.join(nodes, ",") +
+    "], " + q + "edges" + q + ": [" + str.join(edges, ",") + "]" + cb
+  return jresp(200, body)
+}
+
+// ---------------- v1.1: hosted docs ----------------
+// Docs are generated at publish time into REGISTRY_DATA/docs/ and
+// served as static HTML. `full` is "@ns/name".
+
+fn docs_path(cfg: Cfg, full: Text, version: Text) -> Text throws E300 {
+  // full = "@ns/name" -> "@ns/name" as a path segment pair
+  let parts = str.split(full, "/")
+  return cfg.data_dir + "/docs/" + parts[0] + "/" + parts[1] +
+    "/" + version + "/index.html"
+}
+
+fn handle_docs(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
+  let vrows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND version = ?",
+    [full, version])
+  if len(vrows) == 0 {
+    rthrow("R404", "unknown package version: " + full + "@" + version)
+  }
+  let p = docs_path(cfg, full, version)
+  var html: Text = ""
+  try {
+    html = fs.read(p)
+  } catch e {
+    rthrow("R404", "no docs for " + full + "@" + version)
+  }
+  return html_resp(200, html)
+}
+
+fn handle_docs_latest(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
+  let vrows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND yanked = 0 ORDER BY semver_key DESC LIMIT 1",
+    [full])
+  if len(vrows) == 0 {
+    rthrow("R404", "unknown package: " + full)
+  }
+  let ver: Text = vrows[0].version
+  let r: Resp = {
+    status: 302,
+    headers: {"Location": "/v1/docs/" + full + "/" + ver + "/"},
+    body: "",
+  }
+  return r
+}
+
 fn route(req: Request, dbh: Db, cfg: Cfg, st: Map<Text, Text>) -> Resp throws E300, E303 {
   let a = authenticate(dbh, req)
   check_rate(req, st, a)
@@ -3390,6 +3927,35 @@ fn route(req: Request, dbh: Db, cfg: Cfg, st: Map<Text, Text>) -> Resp throws E3
       if segs[2] == "advisories" {
         return handle_advisories(dbh, cfg, req)
       }
+      // v1.1: OAuth device approval page (human)
+      if segs[2] == "oauth" {
+        // handled below under n==4
+      }
+    }
+    if n == 4 and segs[1] == "v1" and segs[2] == "oauth" {
+      if segs[3] == "device" {
+        return handle_device_page(dbh, cfg, req)
+      }
+    }
+    if n == 5 and segs[1] == "v1" and segs[2] == "oauth" and segs[3] == "device" {
+      if segs[4] == "code" {
+        // POST only; GET here falls through to 404
+      }
+    }
+    if n >= 6 and n <= 7 and segs[1] == "v1" and segs[2] == "docs" {
+      // /v1/docs/:ns/:name/:version/  (trailing slash tolerated)
+      let full = segs[3] + "/" + segs[4]
+      let ver = segs[5]
+      return handle_docs(dbh, cfg, full, ver)
+    }
+    if n == 5 and segs[1] == "v1" and segs[2] == "docs" {
+      // /v1/docs/:ns/:name -> latest version (redirect)
+      let full = segs[3] + "/" + segs[4]
+      return handle_docs_latest(dbh, cfg, full)
+    }
+    if n == 6 and segs[1] == "v1" and segs[2] == "graph" {
+      let full = segs[3] + "/" + segs[4]
+      return handle_graph(dbh, cfg, full, segs[5])
     }
     if n == 4 and segs[1] == "v1" and segs[2] == "admin" {
       if segs[3] == "backup" {
@@ -3442,6 +4008,18 @@ fn route(req: Request, dbh: Db, cfg: Cfg, st: Map<Text, Text>) -> Resp throws E3
         return handle_advisory_create(dbh, cfg, req)
       }
     }
+    // v1.1: OAuth device flow
+    if n == 5 and segs[1] == "v1" and segs[2] == "oauth" and segs[3] == "device" {
+      if segs[4] == "code" {
+        return handle_device_code(dbh, cfg, req)
+      }
+      if segs[4] == "token" {
+        return handle_device_token(dbh, cfg, req)
+      }
+      if segs[4] == "approve" {
+        return handle_device_approve(dbh, cfg, req)
+      }
+    }
     if n == 4 and segs[1] == "v1" {
       if segs[2] == "tokens" and segs[3] == "revoke" {
         return handle_revoke_token(dbh, cfg, req)
@@ -3452,6 +4030,10 @@ fn route(req: Request, dbh: Db, cfg: Cfg, st: Map<Text, Text>) -> Resp throws E3
       if segs[2] == "admin" and segs[3] == "tokens" {
         return handle_mint_token(dbh, cfg, req)
       }
+    }
+    // v1.1: POST /v1/admin/publishers/:handle/tier
+    if n == 6 and segs[1] == "v1" and segs[2] == "admin" and segs[3] == "publishers" and segs[5] == "tier" {
+      return handle_set_tier(dbh, cfg, req, segs[4])
     }
     rthrow("R404", "not found: " + method + " " + req.path)
   }

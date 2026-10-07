@@ -1832,6 +1832,36 @@ class Interpreter:
             data = args[0].encode("utf-8")
             algo = name.split(".")[1]
             return hashlib.new(algo, data).hexdigest()
+        if name == "crypto.ed25519_keygen":
+            # Phase 5 R1.1: returns {private: Text(hex), public: Text(hex)}.
+            from misa import ed25519 as _ed
+            sk, pk = _ed.keygen()
+            return {"private": sk.hex(), "public": pk.hex(),
+                    "fingerprint": _ed.fingerprint(pk)}
+        if name == "crypto.ed25519_sign":
+            from misa import ed25519 as _ed
+            sk, msg = args[0], args[1]
+            if not isinstance(sk, str) or not isinstance(msg, str):
+                raise RuntimeError_(
+                    "crypto.ed25519_sign(Text, Text) needs text args")
+            try:
+                skb = bytes.fromhex(sk)
+            except ValueError:
+                raise RuntimeError_("crypto.ed25519_sign: bad private key")
+            sig = _ed.sign(skb, msg.encode("utf-8"))
+            return sig.hex()
+        if name == "crypto.ed25519_verify":
+            from misa import ed25519 as _ed
+            pk, msg, sig = args[0], args[1], args[2]
+            if not all(isinstance(a, str) for a in (pk, msg, sig)):
+                raise RuntimeError_(
+                    "crypto.ed25519_verify(Text, Text, Text) needs text args")
+            try:
+                ok = _ed.verify(bytes.fromhex(pk), msg.encode("utf-8"),
+                                bytes.fromhex(sig))
+            except ValueError:
+                return False
+            return ok
         if name == "crypto.hmac_sha256":
             key, msg = args[0], args[1]
             if not isinstance(key, str) or not isinstance(msg, str):

@@ -151,6 +151,11 @@ NS_BUILTINS = {
     "crypto.sha1": (["Text"], "Text"),
     "crypto.md5": (["Text"], "Text"),
     "crypto.hmac_sha256": (["Text", "Text"], "Text"),
+    # Phase 5 R1.1: Ed25519 signing for registry packages. Keys and
+    # signatures travel as hex Text; messages as UTF-8 Text.
+    "crypto.ed25519_keygen": ([], "record"),
+    "crypto.ed25519_sign": (["Text", "Text"], "Text"),
+    "crypto.ed25519_verify": (["Text", "Text", "Text"], "Bool"),
     # Random: splitmix64 (AOT) / random.Random (interp); `random.seed`
     # gives determinism within a backend, not across backends.
     "random.int": (["Int", "Int"], "Int"),

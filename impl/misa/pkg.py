@@ -54,9 +54,10 @@ USAGE = """usage:
   misa pkg install                 install everything in misa.lock
   misa pkg list [--json]           installed packages (+ capabilities)
   misa pkg remove <name>           remove from misa_pkgs/ and misa.lock
-  misa pkg login                   paste a publisher token, store it
+  misa pkg login [--token]         OAuth device flow (default) or paste token
   misa pkg logout [--revoke]       forget the token (optionally revoke it)
-  misa pkg publish [--dry-run]     gates + pack + upload to the registry
+  misa pkg keygen [--rotate]       Ed25519 signing keypair for your handle
+  misa pkg publish [--dry-run]     gates + pack + sign + upload to registry
   misa pkg search <query> [--json] [--kind keyword|semantic]
   misa pkg show @org/pkg[@ver] [--json]
   misa pkg yank @org/pkg@ver --reason "..."
@@ -67,6 +68,7 @@ USAGE = """usage:
   misa pkg update [@org/pkg]       re-resolve ranges, rewrite misa.lock
   misa pkg dependents @org/pkg [--json]
   misa pkg diff @org/pkg OLD NEW   signature diff + minimum bump
+  misa pkg graph [--json]          resolved dependency graph (+sig/tier badges)
 
 global flags: --registry <url>  --offline  --json"""
 
@@ -643,8 +645,10 @@ def cmd_pkg(argv: list) -> int:
             return cmd_list(ctx)
         if sub == "remove" and len(rest) == 1:
             return cmd_remove(rest[0])
-        if sub == "login" and not rest:
-            return cmd_login()
+        if sub == "login":
+            return cmd_login(rest, ctx)
+        if sub == "keygen" and len(rest) <= 1:
+            return cmd_keygen("--rotate" in rest)
         if sub == "logout" and len(rest) <= 1:
             return cmd_logout("--revoke" in rest)
         if sub == "publish" and len(rest) <= 1:
@@ -681,6 +685,8 @@ def cmd_pkg(argv: list) -> int:
             return cmd_dependents(rest[0], ctx)
         if sub == "diff" and len(rest) == 3:
             return cmd_diff(rest[0], rest[1], rest[2], ctx)
+        if sub == "graph" and not rest:
+            return cmd_graph(ctx)
     except PkgCliError as e:
         return _fail(str(e))
     sys.stderr.write(f"misa: error: unknown pkg usage\n{USAGE}\n")
@@ -1133,6 +1139,14 @@ def _fetch_tarball(name: str, version: str, registry: str, ctx: dict,
             raise PkgCliError(
                 f"{name}@{version}: checksum mismatch ({label}): "
                 f"expected {want}, got {actual}")
+    # v1.1: verify the Ed25519 package signature when present.
+    sig_obj = resp.get("signature")
+    if sig_obj:
+        if not _verify_tarball(name, version, data, sig_obj):
+            raise PkgCliError(
+                f"{name}@{version}: SIGNATURE VERIFICATION FAILED — "
+                "the tarball does not match its registered signature. "
+                "Not installing.")
     return data
 
 
@@ -1439,11 +1453,177 @@ def _run_misa(args: list, cwd: str, timeout: int = 300):
                           timeout=timeout)
 
 
+# -- signing keys (v1.1) ------------------------------------------------------
+
+def _keys_dir() -> str:
+    d = os.path.join(os.path.expanduser("~"), ".misa", "keys")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _key_paths(handle: str) -> tuple:
+    d = _keys_dir()
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in handle)
+    return (os.path.join(d, safe + ".key"),
+            os.path.join(d, safe + ".pub"))
+
+
+def cmd_keygen(rotate: bool) -> int:
+    """Generate an Ed25519 signing keypair for a publisher handle."""
+    try:
+        from misa import ed25519 as _ed
+    except ImportError:
+        return _fail("ed25519 module not available")
+    try:
+        _token, handle = _require_token()
+    except PkgCliError:
+        handle = ""
+    if not handle:
+        try:
+            handle = input("handle: ").strip()
+        except EOFError:
+            handle = ""
+    if not handle:
+        return _fail("handle required (login first or pass it here)")
+    key_path, pub_path = _key_paths(handle)
+    if os.path.exists(key_path) and not rotate:
+        return _fail(f"key already exists at {key_path} "
+                      "(use --rotate to replace it)")
+    if rotate and os.path.exists(pub_path):
+        # keep the old public key for verification of old signatures
+        os.replace(pub_path, pub_path + ".old")
+    sk, pk = _ed.keygen()
+    with open(key_path, "w") as f:
+        f.write(sk.hex())
+    os.chmod(key_path, 0o600)
+    with open(pub_path, "w") as f:
+        f.write(pk.hex())
+    fp = hashlib.sha256(pk.hex().encode("utf-8")).hexdigest()
+    print(f"keypair for {handle}:")
+    print(f"  private: {key_path} (0600)")
+    print(f"  public:  {pub_path}")
+    print(f"  fingerprint: {fp[:16]}… ({fp})")
+    print("The public key is registered with the registry on your next "
+          "signed publish.")
+    return 0
+
+
+def _load_signing_key(handle: str):
+    """Returns (sk_hex, pk_hex, fingerprint) or None."""
+    key_path, pub_path = _key_paths(handle)
+    if not os.path.exists(key_path) or not os.path.exists(pub_path):
+        return None
+    with open(key_path) as f:
+        sk = f.read().strip()
+    with open(pub_path) as f:
+        pk = f.read().strip()
+    fp = hashlib.sha256(pk.encode("utf-8")).hexdigest()
+    return sk, pk, fp
+
+
+def _sign_payload(name: str, version: str, tarball: bytes,
+                  sk_hex: str, pk_hex: str) -> dict:
+    """Sign a package tarball. Returns the signature object for publish."""
+    from misa import ed25519 as _ed
+    ns = name.split("/")[0] if "/" in name else ""
+    h = hashlib.sha256()
+    h.update(ns.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(version.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(tarball)
+    payload_hash = h.hexdigest()
+    sig = _ed.sign(bytes.fromhex(sk_hex), payload_hash.encode("utf-8"))
+    fp = hashlib.sha256(pk_hex.encode("utf-8")).hexdigest()
+    return {"pubkey": pk_hex, "sig": sig.hex(), "fingerprint": fp}
+
+
+def _verify_tarball(name: str, version: str, tarball: bytes,
+                    sig_obj: dict) -> bool:
+    """Verify a downloaded tarball against its signature object."""
+    from misa import ed25519 as _ed
+    try:
+        pk_hex = sig_obj["pubkey"]
+        sig_hex = sig_obj["sig"]
+        fp = sig_obj["fingerprint"]
+    except (KeyError, TypeError):
+        return False
+    if hashlib.sha256(pk_hex.encode("utf-8")).hexdigest() != fp.lower():
+        return False
+    ns = name.split("/")[0] if "/" in name else ""
+    h = hashlib.sha256()
+    h.update(ns.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(name.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(version.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(tarball)
+    try:
+        return _ed.verify(bytes.fromhex(pk_hex),
+                          h.hexdigest().encode("utf-8"),
+                          bytes.fromhex(sig_hex))
+    except ValueError:
+        return False
+
+
 # -- login / logout ---------------------------------------------------------
 
-def cmd_login() -> int:
-    print("Paste your publisher token (issued by the registry admin; "
-          "OAuth device flow arrives in v1.1).")
+def cmd_login(rest: list | None = None, ctx: dict | None = None) -> int:
+    """v1.1: OAuth device flow by default; --token for the manual flow."""
+    rest = rest or []
+    ctx = ctx or {}
+    registry = resolve_registry(ctx.get("registry"))
+    if "--token" in rest or not rest:
+        return _cmd_login_token()
+    # Device flow.
+    try:
+        dc = _api_post("/v1/oauth/device/code", registry, {})
+    except PkgCliError as e:
+        return _fail(f"device flow unavailable: {e}")
+    print("Visit this URL and enter the code:")
+    print(f"  {dc.get('verification_uri')}")
+    print(f"  code: {dc.get('user_code')}")
+    print("Waiting for approval", end="", flush=True)
+    import time as _time
+    interval = int(dc.get("interval", 5))
+    expires_in = int(dc.get("expires_in", 900))
+    deadline = _time.time() + expires_in
+    device_code = dc.get("device_code", "")
+    while _time.time() < deadline:
+        _time.sleep(interval)
+        print(".", end="", flush=True)
+        try:
+            tr = _api_post("/v1/oauth/device/token", registry,
+                           {"device_code": device_code})
+        except PkgCliError as e:
+            if "(R404)" in str(e) or "(R410)" in str(e):
+                print()
+                return _fail(str(e))
+            continue
+        if tr.get("error") == "authorization_pending":
+            continue
+        token = tr.get("token", "")
+        handle = tr.get("handle", "")
+        if token and handle:
+            print()
+            try:
+                write_credentials(token, handle)
+            except PkgCliError as e:
+                return _fail(str(e))
+            print(f"logged in as {handle} "
+                  "(token stored in ~/.misa/credentials)")
+            return 0
+        print()
+        return _fail(f"unexpected token response: {tr}")
+    print()
+    return _fail("timed out waiting for approval")
+
+
+def _cmd_login_token() -> int:
+    print("Paste your publisher token (issued by the registry admin).")
     try:
         token = getpass.getpass("token: ").strip()
     except Exception:
@@ -1662,18 +1842,31 @@ def cmd_publish(dry_run: bool, ctx: dict | None = None) -> int:
             print("dry run: all gates passed (not uploaded)")
             return 0
 
-        resp = _api_post("/v1/publish", registry, {
+        # v1.1: sign the tarball when a key exists for this handle.
+        sig_obj = None
+        key = _load_signing_key(_handle)
+        if key is not None:
+            sk_hex, pk_hex, _fp = key
+            sig_obj = _sign_payload(name, version, tarball, sk_hex, pk_hex)
+            print(f"  signed with key {_fp[:16]}…")
+        else:
+            print("  note: no signing key for this handle "
+                  "(`misa pkg keygen`); publishing unsigned")
+        body = {
             "manifest": read_manifest_raw(pkg_dir),
             "tarball_b64": base64.b64encode(tarball).decode("ascii"),
             "tarball_sha256": sha,
             "signatures": sigs,
             "capabilities_declared": sorted(
                 k for k, v in man["capabilities"].items() if v),
-        }, token=token)
+        }
+        if sig_obj is not None:
+            body["signature"] = sig_obj
+        resp = _api_post("/v1/publish", registry, body, token=token)
         _record_publish_local(pkg_dir, sha)
         print(f"published {name}@{version}")
-        # v1.1: the server will return docs_url when per-version HTML
-        # docs (§7.1) land. Don't print a dead link until then.
+        if resp.get("signed"):
+            print(f"signed (key {resp.get('key_fingerprint', '')[:16]}…)")
         if resp.get("docs_url"):
             print(f"docs: {resp['docs_url']}")
         return 0
@@ -1891,6 +2084,68 @@ def cmd_show(spec: str, ctx: dict) -> int:
             print(f"  YANKED: {vmeta.get('yank_reason', '')}")
         if meta.get("deprecated"):
             print(f"  deprecated: {meta['deprecated']}")
+        return 0
+    except PkgCliError as e:
+        return _fail(str(e))
+
+
+def cmd_graph(ctx: dict) -> int:
+    """v1.1: print the resolved dependency graph (from misa.lock)."""
+    ctx = ctx or {}
+    try:
+        if not os.path.isfile(LOCK):
+            raise PkgCliError("no misa.lock (run `misa pkg add` first)")
+        _, lock_registry, entries = read_lock_full()
+        registry = lock_registry or resolve_registry(ctx.get("registry"))
+        nodes = []
+        edges = []
+        seen = set()
+        # seed with direct entries; expand via the registry graph API
+        queue = [(e.get("name", ""), e.get("version", "")) for e in entries
+                 if e.get("source") == "registry"]
+        try:
+            me = read_manifest(os.getcwd())
+            me_name = me.get("name", "")
+        except PkgCliError:
+            me_name = ""
+        while queue:
+            name, version = queue.pop(0)
+            key = name + "@" + version
+            if key in seen or not name:
+                continue
+            seen.add(key)
+            try:
+                g = _api_get(f"/v1/graph/{_qname(name)}/{version}", registry)
+            except PkgCliError:
+                continue
+            for n in g.get("nodes", []):
+                nid = n.get("name", "") + "@" + n.get("version", "")
+                if nid not in seen:
+                    nodes.append(n)
+            for ed in g.get("edges", []):
+                edges.append(ed)
+                t = ed.get("to", "")
+                if "@" in t:
+                    tn, tv = t.rsplit("@", 1)
+                    if tn + "@" + tv not in seen:
+                        queue.append((tn, tv))
+        # local root node
+        if me_name:
+            nodes.insert(0, {"name": me_name, "version": "local",
+                             "signed": False, "tier": "-"})
+        if ctx.get("json"):
+            print(json.dumps({"nodes": nodes, "edges": edges}, indent=2))
+        else:
+            for n in nodes:
+                badge = ""
+                if n.get("signed"):
+                    badge += " [signed]"
+                tier = n.get("tier", "")
+                if tier and tier not in ("unverified", "-"):
+                    badge += f" [{tier}]"
+                print(f"{n.get('name')}@{n.get('version')}{badge}")
+            for ed in edges:
+                print(f"  {ed.get('from')} -> {ed.get('to')}")
         return 0
     except PkgCliError as e:
         return _fail(str(e))
