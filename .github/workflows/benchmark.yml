@@ -1,0 +1,40 @@
+name: benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * 1"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Misa toolchain
+        run: pip install llvmlite==0.50.0
+      - name: Run Misa benchmark suite
+        run: |
+          chmod +x impl/bin/misa
+          python3 impl/bin/misa benchmark --runs 10 --format json -o bench/results/benchmark-ci.json
+      - name: Validate benchmark artifact
+        run: |
+          python3 - <<'PY'
+          import json
+          p="bench/results/benchmark-ci.json"
+          d=json.load(open(p))
+          assert d.get("results"), "benchmark produced no results"
+          for r in d["results"]:
+              if r.get("status") == "ok" and r["name"] not in ("startup","compile"):
+                  assert len(r["misa"]["times"]) == 10
+                  assert len(r["python"]["times"]) == 10
+          print("benchmark artifact valid")
+          PY
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: misa-benchmark
+          path: bench/results/benchmark-ci.json
