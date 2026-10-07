@@ -29,6 +29,12 @@ def main():
     assert optimize(opt.module) >= 1
     assert any(i.op == "const" and i.imm == 5 for i in ob.instructions)
     assert not any(i.op == "unbox" for i in ob.instructions)
+    bad = MIRBuilder()
+    bad_fn = bad.function("bad", [I64], I64)
+    bad_block = bad_fn.blocks[0]
+    bad_float = bad.emit(bad_block, "const", MVAL, imm=1)
+    bad.emit(bad_block, "add", I64, (bad_fn.params[0], bad_float))
+    assert verify(bad.module), "invalid MIR type graph was accepted"
     print("MIR foundation + optimization: PASS")
 if __name__=="__main__":
     main()
