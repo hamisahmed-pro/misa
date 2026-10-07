@@ -82,7 +82,12 @@ void misa_platform_fs_after_write(const char *mapped_path);
 void misa_platform_fs_bootstrap(void);
 
 /* ------------------------------------------------------------------ */
-/* HTTP transport (blocking POST of a JSON body)                      */
+/* HTTP transport (blocking POST of a JSON body). */
+/*
+ * ABI note: platform implementations must expose exactly these
+ * signatures. Keep this header as the canonical C declaration and use
+ * tests/test_platform_abi.py plus compiler builds as enforcement.
+ */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
