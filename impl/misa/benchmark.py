@@ -166,7 +166,7 @@ def bench_startup(misa_bin, runs=5):
         f.write(prog)
     # Build once
     bin_path = "/tmp/bench_hello_bin"
-    wall, out, err, rc = run_cmd([misa_bin, "build", path, "-o", bin_path])
+    wall, out, err, rc, _rss = run_cmd([misa_bin, "build", path, "-o", bin_path])
     if rc != 0:
         return {"status": "build-failed", "error": err[:200]}
     times = []
@@ -239,12 +239,19 @@ def run_benchmarks(runs=5, only=None):
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "methodology": "misa-benchmark-v1: external wall time, AOT built "
-                       "outside timed region, 5 runs median",
         "misa_version": "AOT",
         "host": platform.platform(),
         "cpu": platform.processor(),
-        "methodology": "external wall time; 3 warmups; measured independent processes; median/p95/min/max/stddev; peak RSS; exact stdout equality",
+        "methodology": {
+            "timing": "external wall-clock per independent process",
+            "warmups": 3,
+            "measured_runs": runs,
+            "aot_build": "outside runtime measurements",
+            "statistics": ["median", "p95", "min", "max", "stddev"],
+            "memory": "peak RSS from /usr/bin/time",
+            "correctness": "exact stdout equality across runs and against Python",
+            "checksum": "SHA-256 reported on output mismatch"
+        },
         "python_version": "3.12",
         "results": results,
     }
@@ -256,7 +263,7 @@ def to_markdown(data):
         "# Misa Benchmark Report",
         "",
         f"**Generated:** {data['timestamp']}",
-        f"**Methodology:** {data['methodology']}",
+        f"**Methodology:** {json.dumps(data['methodology'], sort_keys=True)}",
         "",
         "## Compute Benchmarks (vs Python3)",
         "",
