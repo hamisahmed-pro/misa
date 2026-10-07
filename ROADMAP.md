@@ -70,11 +70,15 @@ is coherence, speed, portability, reliability, and provability."
 - [x] 9/10 Benchmarks Game ports
 
 ### 3B. Expand `misa benchmark` (Review §9)
-- [ ] Add PHP and Rust baselines (currently Python3 only)
-- [ ] Add startup time measurement (launch → first output)
-- [ ] Add compilation time measurement (source → executable)
-- [ ] Add peak RSS, binary size reporting
-- [ ] Report median, p95, min, max, stddev (currently median only)
+- [ ] Add Node.js, PHP, Go, and Rust baselines with canonical ports/checksums
+- [x] Startup time measurement (launch → first output)
+- [x] Compilation time measurement (source → executable)
+- [x] Peak RSS reporting
+- [x] Binary size reporting
+- [x] Median, p95, min, max, stddev
+- [x] Warmup phase (3) and 10 default measurements
+- [x] Exact stdout equality/checksum validation
+- [x] Scheduled CI benchmark artifact
 
 ### 3C. Benchmark rules enforcement (Review §38-41)
 - [ ] Warmup: 3 runs before measurement
@@ -149,9 +153,11 @@ is coherence, speed, portability, reliability, and provability."
 **Status:** NOT STARTED. Major milestone.
 
 ### 7A. Design
-- [ ] `spec/mir.md`: MIR specification (typed AST → MIR → optimized MIR → LLVM)
-- [ ] SSA form, type-annotated
-- [ ] Design: how MVal* boxing is represented and eliminated
+- [x] `spec/MIR.md`: MIR specification (typed AST → MIR → optimized MIR → LLVM)
+- [x] Initial typed MIR module with explicit box/unbox values
+- [x] Structural MIR verifier and CI gate
+- [x] SSA-oriented value IDs and basic blocks
+- [x] Design: how MVal* boxing is represented and eliminated
 
 ### 7B. Implementation phases
 - [ ] MIR construction from typed AST
