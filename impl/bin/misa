@@ -619,6 +619,18 @@ def cmd_list_targets():
     return 0
 
 
+def cmd_benchmark(args):
+    """Canonical `misa benchmark` command.
+
+    Runs the Benchmarks Game suite (Misa AOT vs Python3), emits JSON
+    as the source of truth. Markdown/CSV are derived from JSON, never
+    hand-typed. (Implements the Benchmark Review Plan recommendation
+    for a canonical benchmark command.)
+    """
+    from misa.benchmark import main as bench_main
+    return bench_main(args)
+
+
 def main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         sys.stdout.write(__doc__)
@@ -686,6 +698,8 @@ def main(argv):
         if len(rest) > 1:
             die("usage: misa test [path] [--mock mocks.json] [--json]")
         return cmd_test(rest[0] if rest else ".", mock, as_json)
+    if cmd == "benchmark":
+        return cmd_benchmark(args)
     if cmd == "build" and 1 <= len(args) <= 12:
         if "--list-targets" in args:
             return cmd_list_targets()
