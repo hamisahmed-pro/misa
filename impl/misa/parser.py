@@ -225,15 +225,19 @@ class Parser:
         t = self.expect("type", "'type'")
         name = self.expect_ident("type name").value
         # Phase 5c: type parameters, e.g. `type Box<T> { value: T }`.
+        # Phase 5d: inline bounds (`type Box<T: Printable>`) and
+        # `where` clauses (`type C<K, V> where K: Hashable`).
         type_params = []
+        type_param_bounds = {}
         if self.at("<"):
             for pn, bound in self._parse_type_params_decl():
-                if bound is not None:
-                    raise ParseError(
-                        f"interface bounds are only allowed on "
-                        f"functions, not on type '{name}'",
-                        self.peek().line, self.peek().col)
                 type_params.append(pn)
+                if bound is not None:
+                    type_param_bounds[pn] = bound
+        where_bounds = {}
+        if self.at("IDENT") and self.peek().value == "where":
+            where_bounds = self._parse_where_clause(
+                type_params, f"type '{name}'")
         self.expect("{", "'{'")
         fields = []
         variants = []
@@ -273,6 +277,8 @@ class Parser:
         self.expect("}", "'}'")
         return ast.TypeDecl(name=name, fields=fields, is_sum=is_sum,
                             variants=variants, type_params=type_params,
+                            type_param_bounds=type_param_bounds,
+                            where_bounds=where_bounds,
                             line=t.line, col=t.col)
 
     def _finish_variant(self, vname: str) -> ast.VariantDecl:
@@ -848,6 +854,14 @@ class Parser:
         if self.at("->"):
             self.advance()
             ret = self.parse_type_expr()
+        # Phase 5d: `where` clause, e.g.
+        # `fn sort<T>(xs: [T]) -> [T] where T: Comparable`.
+        # Contextual (an IDENT here, not a keyword); parsed before
+        # `throws` so `... -> T where T: X throws E304 {` reads naturally.
+        where_bounds = {}
+        if self.at("IDENT") and self.peek().value == "where":
+            where_bounds = self._parse_where_clause(
+                type_params, f"function '{name}'")
         # Phase 8 (overtake): checked `throws` signatures, e.g.
         # `fn fetch(u: Text) -> Text throws E304, E303`.
         # `throws` is contextual (an IDENT here, not a keyword) so
@@ -868,6 +882,7 @@ class Parser:
         return ast.FnDecl(name=name, params=params, ret=ret, body=body,
                           type_params=type_params,
                           type_param_bounds=type_param_bounds,
+                          where_bounds=where_bounds,
                           throws=throws,
                           throws_line=throws_line, throws_col=throws_col,
                           line=t.line, col=t.col)
@@ -1030,6 +1045,49 @@ class Parser:
                 break
         self.expect_gt()
         return params
+
+    def _parse_where_clause(self, type_params: List[str],
+                            owner: str) -> dict:
+        """Phase 5d: parse `where T: Bound1 + Bound2, K: Bound3`.
+
+        `where` is contextual (an IDENT here, not a keyword) so existing
+        code using `where` as an identifier keeps working. Returns
+        {type_param: [interface, ...]}. Raises ParseError for unknown
+        type parameters or duplicate entries; unknown *interfaces* are
+        the checker's E229 (it knows the declared interfaces)."""
+        self.advance()  # consume 'where'
+        bounds = {}
+        while True:
+            t = self.peek()
+            pn = self.expect_ident("type parameter name").value
+            if pn not in type_params:
+                raise ParseError(
+                    f"where clause: '{pn}' is not a type parameter "
+                    f"of {owner}", t.line, t.col)
+            if pn in bounds:
+                raise ParseError(
+                    f"where clause: duplicate bounds for '{pn}' "
+                    f"in {owner}", t.line, t.col)
+            self.expect(":", "':'")
+            blist = [self.expect_ident("interface bound").value]
+            while self.at("+"):
+                self.advance()
+                b = self.expect_ident("interface bound").value
+                if b in blist:
+                    raise ParseError(
+                        f"where clause: duplicate bound '{b}' for "
+                        f"'{pn}' in {owner}", t.line, t.col)
+                blist.append(b)
+            # The inline `<T: Bound>` (if any) stays in
+            # `type_param_bounds`; the checker merges both forms.
+            # (Kept separate so diagnostics can name the right
+            # syntax: E200 for inline, E228/E229 for `where`.)
+            bounds[pn] = blist
+            if self.at(","):
+                self.advance()
+                continue
+            break
+        return bounds
 
     def _parse_type_args(self) -> List[ast.TypeExpr]:
         """Phase 5c: parse `<E1, E2>` type arguments. Returns TypeExprs."""
@@ -1260,10 +1318,17 @@ class Parser:
                             continue
                         break
                 self.expect(")", "')'")
+        # Phase 5d: optional `if` guard, e.g.
+        # `Shape.Circle(r) if r > 0 => ...` or `_ if ok => ...`.
+        guard = None
+        if self.at("if"):
+            self.advance()
+            guard = self.parse_expr()
         self.expect("=>", "'=>'")
         body = self.parse_expr()
         return ast.MatchArm(type_name=type_name, variant=variant,
                             binds=binds, body=body, wildcard=wildcard,
+                            guard=guard,
                             line=t.line, col=t.col)
 
     def parse_call_args(self) -> list:

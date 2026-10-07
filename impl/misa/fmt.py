@@ -88,10 +88,23 @@ class Formatter:
             self.ind -= 1
             self.w("}")
         elif isinstance(item, ast.TypeDecl):
-            # Phase 5c: type parameters.
-            tp = f"<{', '.join(item.type_params)}>" if item.type_params \
-                else ""
-            self.w(f"type {item.name}{tp} {{")
+            # Phase 5c: type parameters. Phase 5d: inline bounds and
+            # `where`-clause bounds.
+            if item.type_params:
+                tps = []
+                for tp in item.type_params:
+                    b = item.type_param_bounds.get(tp)
+                    tps.append(f"{tp}: {b}" if b else tp)
+                tp = f"<{', '.join(tps)}>"
+            else:
+                tp = ""
+            wh = ""
+            if item.where_bounds:
+                ws = []
+                for wtp, blist in item.where_bounds.items():
+                    ws.append(f"{wtp}: {' + '.join(blist)}")
+                wh = f" where {', '.join(ws)}"
+            self.w(f"type {item.name}{tp}{wh} {{")
             self.ind += 1
             if item.is_sum:
                 # Phase 5b: sum variants.
@@ -201,6 +214,12 @@ class Formatter:
             head = f"fn {item.name}{tp}({params})"
             if item.ret is not None:
                 head += f" -> {self.fmt_type(item.ret)}"
+            # Phase 5d: `where`-clause bounds.
+            if item.where_bounds:
+                ws = []
+                for wtp, blist in item.where_bounds.items():
+                    ws.append(f"{wtp}: {' + '.join(blist)}")
+                head += f" where {', '.join(ws)}"
             # Phase 8 (overtake): checked `throws` signatures.
             if item.throws:
                 head += f" throws {', '.join(item.throws)}"
@@ -525,7 +544,7 @@ class Formatter:
                               for s in e.body)
             return f"spawn {{ {stmts} }}"
         if isinstance(e, ast.Match):
-            # Phase 5b: `match` expression.
+            # Phase 5b: `match` expression. Phase 5d: `if` guards.
             arms = []
             for a in e.arms:
                 if a.wildcard:
@@ -533,6 +552,8 @@ class Formatter:
                 else:
                     bs = f"({', '.join(a.binds)})" if a.binds else ""
                     pat = f"{a.type_name}.{a.variant}{bs}"
+                if a.guard is not None:
+                    pat += f" if {self.fmt_expr(a.guard)}"
                 arms.append(f"{pat} => {self.fmt_expr(a.body)}")
             return (f"match {self.fmt_expr(e.scrutinee)} {{ "
                     + ", ".join(arms) + " }")

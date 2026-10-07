@@ -75,6 +75,12 @@ class TypeDecl(Node):
     variants: List["VariantDecl"] = field(default_factory=list)
     # Phase 5c: type parameters, e.g. `type Box<T> { value: T }`.
     type_params: List[str] = field(default_factory=list)
+    # Phase 5d: interface bounds on type parameters. Inline
+    # (`type Box<T: Printable>`) and `where`-clause
+    # (`type C<K, V> where K: Hashable`) forms; both map a type
+    # parameter name to interface name(s).
+    type_param_bounds: dict = field(default_factory=dict)
+    where_bounds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -175,6 +181,11 @@ class FnDecl(Node):
     # Phase 8 (overtake): interface bounds, e.g. `fn f<T: Drawable>(x: T)`.
     # Maps type parameter name -> interface name.
     type_param_bounds: dict = field(default_factory=dict)
+    # Phase 5d: `where`-clause bounds, e.g.
+    # `fn sort<T>(xs: [T]) -> [T] where T: Comparable + Hashable`.
+    # Maps type parameter name -> list of interface names. Merged with
+    # type_param_bounds by the checker.
+    where_bounds: dict = field(default_factory=dict)
     # Phase 8 (overtake): checked `throws` signatures, e.g.
     # `fn fetch(u: Text) -> Text throws E304`. The declared E-codes
     # (as written); empty = no clause (strict: uncaught codes error).
@@ -456,6 +467,10 @@ class MatchArm(Node):
     binds: List[str] = field(default_factory=list)
     body: Optional[Node] = None
     wildcard: bool = False
+    # Phase 5d: optional `if` guard, e.g.
+    # `Shape.Circle(r) if r > 0 => ...`. Evaluated with the arm's
+    # bindings in scope; the arm only fires when it is true.
+    guard: Optional[Node] = None
 
 
 @dataclass

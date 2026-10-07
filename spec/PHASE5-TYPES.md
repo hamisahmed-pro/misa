@@ -106,6 +106,60 @@ let b: Box<Int> = Box<Int>(42)
 
 ## Deliberately deferred
 
-- `where`-clause constraints, higher-kinded types, variadic generics.
-- Exhaustiveness warnings → errors; pattern guards in `match`.
-- Tail-call optimization (orthogonal).
+- Higher-kinded types, variadic generics.
+- Exhaustiveness warnings → errors (warnings exist: W301).
+
+## Phase 5d — advanced tranche (implemented 2026-10-07)
+
+All three items the original tranche deferred are now implemented,
+in both the interpreter and the AOT backend, with parity tests.
+
+### `where`-clause constraints
+
+```misa
+fn sort<T>(xs: [T]) -> [T] where T: Comparable + Printable
+fn get<K, V>(m: Map<K, V>, k: K) -> V where K: Hashable
+type Cache<K, V> where K: Hashable { /* ... */ }
+```
+
+- Multiple bounds per variable (`T: A + B`), multiple variables per
+  clause, and coexistence with inline `<T: I>` syntax.
+- Inside the body, a `T`-typed value dispatches to any bound
+  interface's methods dynamically (arguments arrive as interface
+  values, keyed by concrete type).
+- Violations are E228 (concrete type missing an impl) and E229
+  (unknown interface name), both at check time.
+
+### Match guards
+
+```misa
+match s {
+  Shape.Circle(r) if r > 10.0 => "big",
+  Shape.Circle(r) => "small",
+  _ => "other"
+}
+```
+
+- Guards are `Bool` expressions (E230 otherwise) evaluated in source
+  order; a failing guard falls through to the next arm.
+- Guarded arms do not count toward exhaustiveness (a guard may fail),
+  matching Rust's semantics — a guardless wildcard/fallback is still
+  required for a total match.
+- AOT emits a linear tag/guard chain (`_emit_match_guarded`); the
+  guardless fast path keeps the tag switch.
+
+### Unreachable-arm warnings (W301)
+
+- Arm after a guardless wildcard, duplicate guardless variant arm, or
+  wildcard after all variants covered → W301 warning.
+- `misa check --deny-warnings` promotes warnings to failures; JSON
+  check output carries a `warnings` array.
+
+### Tail-call optimization (interpreter)
+
+- Direct self-tail calls (`return f(args)`) reuse the call frame via a
+  thread-local loop — 100,000-deep recursion runs in constant stack.
+- `_TailCall` is control flow, not a catchable value: `try/catch`
+  never swallows it. Nested lambdas never reuse an outer frame.
+- AOT relies on LLVM's own tail-call elimination (verified: 100k-deep
+  `sum_to` runs clean in the compiled binary).

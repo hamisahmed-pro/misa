@@ -188,6 +188,22 @@ def _scope_stack() -> list:
     return st
 
 
+def _tco_stack() -> list:
+    """Phase 5d: thread-local stack of in-progress function/lambda
+    invocations for tail-call optimization. Entries are
+    ("fn", FnDecl) from call_fn or ("lam", LambdaValue) from
+    invoke_lambda_value. A `return f(args)` is a tail call only when
+    the top entry is ("fn", decl) for that exact decl — i.e. the
+    return is directly in f's own body, not inside a nested lambda
+    or handler (reusing f's frame there would skip the intermediate
+    frames' post-processing)."""
+    st = getattr(_tls, "tco_stack", None)
+    if st is None:
+        st = []
+        _tls.tco_stack = st
+    return st
+
+
 class TaskHandle:
     """Phase 7 (concurrency): a spawned task (`spawn { }`)."""
 
@@ -1037,6 +1053,22 @@ class Interpreter:
             while self.truthy(self.eval_expr(s.cond, env)):
                 self.exec_block(s.body, Env(env))
         elif isinstance(s, ast.ReturnStmt):
+            # Phase 5d: tail-call optimization — `return f(args)`
+            # directly in f's own body reuses f's frame instead of
+            # recursing (no Python-stack growth). Only when the
+            # innermost frame is f itself (not a nested lambda) and
+            # the call resolves to that exact decl with matching
+            # arity; anything else takes the normal path.
+            if s.value is not None:
+                tco = _tco_stack()
+                if tco and isinstance(s.value, ast.Call) \
+                        and s.value.callee is None:
+                    kind, ent = tco[-1]
+                    if kind == "fn" and self.fns.get(s.value.name) is ent \
+                            and len(s.value.args) == len(ent.params):
+                        argvs = [self.eval_expr(a, env)
+                                 for a in s.value.args]
+                        raise _TailCall(ent, argvs)
             val = self.eval_expr(s.value, env) \
                 if s.value is not None else None
             raise _ReturnSignal(val)
@@ -1044,6 +1076,10 @@ class Interpreter:
             try:
                 self.exec_block(s.body, Env(env))
             except _ReturnSignal:
+                raise
+            except _TailCall:
+                # Phase 5d: TCO is control flow, not an error — never
+                # swallowed by a catch handler.
                 raise
             except RecursionError:
                 # H-5: convert to a catchable E300 so `try/catch` sees a
@@ -1391,6 +1427,16 @@ class Interpreter:
                 child = Env(env)
                 for bname, val in zip(arm.binds, sv.fields):
                     child.define(bname, val, False)
+                # Phase 5d: `if` guard — the arm fires only when the
+                # guard is true; otherwise try the next arm.
+                if arm.guard is not None:
+                    gv = self.eval_expr(arm.guard, child)
+                    if gv is not True and gv is not False:
+                        raise RuntimeError_(
+                            "match guard must evaluate to Bool",
+                            line=arm.guard.line, col=arm.guard.col)
+                    if not gv:
+                        continue
                 return self.eval_expr(arm.body, child)
         raise RuntimeError_(
             f"non-exhaustive match on {sv.type_name}.{sv.variant}")
@@ -2429,13 +2475,27 @@ class Interpreter:
         # Phase 7: function entry pushes a scope; exit pops it and
         # cancels still-running children spawned inside this call.
         self._push_scope()
+        # Phase 5d: TCO — the frame is reused across tail calls.
+        _tco_stack().append(("fn", decl))
         try:
-            self.exec_block(decl.body, local)
-        except _ReturnSignal as r:
-            return r.value
+            while True:
+                try:
+                    self.exec_block(decl.body, local)
+                except _TailCall as tc:
+                    # Only our own frame reuses itself; a _TailCall
+                    # for another decl (impossible by construction,
+                    # but be safe) propagates outward.
+                    if tc.decl is not decl:
+                        raise
+                    for (pn, _), v in zip(decl.params, tc.args):
+                        local.define(pn, v, False)
+                    continue
+                except _ReturnSignal as r:
+                    return r.value
+                return None
         finally:
+            _tco_stack().pop()
             self._pop_scope()
-        return None
 
     def http_get(self, url: str, node: ast.Node) -> str:
         # L-1: thread the call-site position (was <unknown>).
@@ -3902,6 +3962,10 @@ class Interpreter:
         # Phase 7: like call_fn, a lambda call is a scope (spawns inside
         # are children of this invocation).
         self._push_scope()
+        # Phase 5d: mark the lambda frame so a `return f(...)` inside
+        # it is NOT treated as a tail call of an outer f (the lambda
+        # frame has its own post-processing; see _tco_stack).
+        _tco_stack().append(("lam", lam))
         try:
             if lam.expr_body is not None:
                 return self.eval_expr(lam.expr_body, inner)
@@ -3911,9 +3975,20 @@ class Interpreter:
                 return r.value
             return None
         finally:
+            _tco_stack().pop()
             self._pop_scope()
 
 
 class _ReturnSignal(Exception):
     def __init__(self, value):
         self.value = value
+
+
+class _TailCall(Exception):
+    """Phase 5d: tail-call optimization signal. Raised instead of
+    recursing for `return f(args)` directly in f's own body; caught
+    by f's `call_fn` frame, which rebinds the parameters and
+    re-executes the body (no Python-stack growth, no new Env)."""
+    def __init__(self, decl, args):
+        self.decl = decl
+        self.args = args

@@ -1,0 +1,59 @@
+// Misa Phase 5d: advanced types in action.
+// Run: misa run examples/advanced_types.misa
+
+// --- where-clause constrained generics ---
+interface Printable { fn show(self) -> Text }
+interface Comparable { fn rank(self) -> Int }
+
+type Box { v: Int }
+impl Printable for Box {
+  fn show(self) -> Text { return "Box(" + str(self.v) + ")" }
+}
+impl Comparable for Box {
+  fn rank(self) -> Int { return self.v }
+}
+
+// Multiple bounds: T must satisfy BOTH interfaces.
+fn describe<T>(x: T) -> Text where T: Printable + Comparable {
+  return x.show() + " (rank " + str(x.rank()) + ")"
+}
+
+// Multiple type variables, each with its own bound.
+fn pair<A, B>(x: A, y: B) -> Text where A: Printable, B: Printable {
+  return x.show() + " & " + y.show()
+}
+
+// --- match guards ---
+type Shape { Circle(r: Float), Rect(w: Float, h: Float), Point }
+
+fn classify(s: Shape) -> Text {
+  return match s {
+    Shape.Circle(r) if r > 10.0 => "big circle",
+    Shape.Circle(r) if r > 0.0 => "small circle",
+    Shape.Circle(r) => "degenerate circle",
+    Shape.Rect(w, h) if w == h => "square",
+    Shape.Rect(w, h) => "rectangle",
+    _ => "point"
+  }
+}
+
+// --- tail-call optimization: 100k deep, constant stack ---
+fn sum_to(n: Int, acc: Int) -> Int {
+  if n <= 0 { return acc }
+  return sum_to(n - 1, acc + n)
+}
+
+fn main() -> Int {
+  let b: Box = { v: 7 }
+  print(describe(b))
+  print(pair(b, b))
+  print(classify(Shape.Circle(20.0)))
+  print(classify(Shape.Circle(5.0)))
+  print(classify(Shape.Circle(0.0)))
+  print(classify(Shape.Rect(3.0, 3.0)))
+  print(classify(Shape.Rect(3.0, 4.0)))
+  print(classify(Shape.Point()))
+  print("sum(100000) = " + str(sum_to(100000, 0)))
+  return 0
+}
+main()

@@ -3686,6 +3686,13 @@ class Emitter:
                 vmap = {v.name: i for i, v in
                         enumerate(decl.variants)}
                 break
+        # Phase 5d: `if` guards. When any arm has a guard, source order
+        # matters in ways a tag switch cannot express (a guarded arm
+        # may fail and fall through to a LATER arm), so emit a linear
+        # chain of tag checks. The guardless fast path keeps the
+        # switch below.
+        if any(arm.guard is not None for arm in e.arms):
+            return self._emit_match_guarded(e, ctx, vmap, tag, fields)
         arm_blocks = [ctx.fn.append_basic_block(f"match.arm{i}")
                       for i in range(len(e.arms))]
         end_b = ctx.fn.append_basic_block("match.end")
@@ -3729,6 +3736,71 @@ class Emitter:
                 b.branch(end_b)
                 incomings.append((rv, cur))
             ctx.scope = old_scope
+        b.position_at_end(end_b)
+        phi = b.phi(PTR, name="matchv")
+        for rv, blk in incomings:
+            phi.add_incoming(rv, blk)
+        return phi
+
+    def _emit_match_guarded(self, e: A.Match, ctx: FnCtx, vmap: dict,
+                            tag, fields):
+        """Phase 5d: linear match chain for guarded arms. Arm i is
+        tried in source order: the tag must match (unless `_`), then
+        the guard (if any) must be true; otherwise control falls to
+        arm i+1. The checker guarantees exhaustiveness ignoring
+        guards, so falling off the end is unreachable."""
+        b = ctx.builder
+        n = len(e.arms)
+        arm_blocks = [ctx.fn.append_basic_block(f"match.garm{i}")
+                      for i in range(n)]
+        end_b = ctx.fn.append_basic_block("match.gend")
+        dead_b = ctx.fn.append_basic_block("match.gunreachable")
+        # Enter the chain: the entry block falls through to arm 0.
+        if not b.block.is_terminated:
+            b.branch(arm_blocks[0])
+        incomings = []
+        for i, arm in enumerate(e.arms):
+            nxt = arm_blocks[i + 1] if i + 1 < n else dead_b
+            b.position_at_end(arm_blocks[i])
+            old_scope = ctx.scope
+            # Tag check (wildcards skip it).
+            if not arm.wildcard:
+                want = self.const_i64(vmap[arm.variant])
+                is_tag = b.icmp_unsigned("==", tag, want,
+                                         name="matchtag")
+                tag_ok = ctx.fn.append_basic_block(f"match.gtag{i}")
+                b.cbranch(is_tag, tag_ok, nxt)
+                b.position_at_end(tag_ok)
+                child = ctx.scope.child()
+                ctx.scope = child
+                for j, bname in enumerate(arm.binds):
+                    fv = self.call(ctx, "misa_list_get",
+                                   [fields, self.const_i64(j)],
+                                   arm, check=False)
+                    a = self.alloca_var(ctx, bname)
+                    b.store(fv, a)
+                    child.declare(bname, a)
+            # Guard check.
+            if arm.guard is not None:
+                gv = self.emit_expr(arm.guard, ctx)
+                self.check(ctx, arm.guard)
+                gbool = self.call(ctx, "misa_truthy", [gv], arm.guard,
+                                  check=False)
+                is_true = b.icmp_unsigned("==", gbool,
+                                          self.const_i32(1),
+                                          name="matchguard")
+                body_b = ctx.fn.append_basic_block(f"match.gbody{i}")
+                b.cbranch(is_true, body_b, nxt)
+                b.position_at_end(body_b)
+            rv = self.emit_expr(arm.body, ctx)
+            self.check(ctx, arm)
+            if not b.block.is_terminated:
+                cur = b.block
+                b.branch(end_b)
+                incomings.append((rv, cur))
+            ctx.scope = old_scope
+        b.position_at_end(dead_b)
+        b.unreachable()
         b.position_at_end(end_b)
         phi = b.phi(PTR, name="matchv")
         for rv, blk in incomings:

@@ -66,7 +66,18 @@ def emit_errors(errors, as_json):
                 sys.stderr.write(f"  hint: {e['hint']}\n")
 
 
-def cmd_check(path, as_json):
+def emit_warnings(warnings, as_json):
+    if as_json:
+        return  # JSON mode embeds warnings in the payload; see cmd_check
+    for w in warnings:
+        loc = f"{w['line']}:{w['col']}" \
+            if w.get("line") else "<unknown>"
+        sys.stderr.write(f"{loc}: {w['code']}: {w['message']}\n")
+        if w.get("hint"):
+            sys.stderr.write(f"  hint: {w['hint']}\n")
+
+
+def cmd_check(path, as_json, deny_warnings=False):
     # Phase 8 (overtake): keep the Checker so `misa check --json` can
     # also emit the throws graph (declared/inferred E-code sets per
     # function) alongside the diagnostics.
@@ -77,18 +88,29 @@ def cmd_check(path, as_json):
     checker = Checker()
     errors = list(load_errors)
     errors.extend(checker.check(merged, file_of=file_of))
+    warnings = checker.warnings
+    if deny_warnings and warnings:
+        # Phase 5d: `--deny-warnings` promotes warnings to errors.
+        for w in warnings:
+            errors.append({"code": w["code"],
+                           "message": w["message"] + " (--deny-warnings)",
+                           "line": w["line"], "col": w["col"],
+                           "hint": w.get("hint", "")})
+        warnings = []
     if errors:
         if as_json:
             print(json.dumps({"ok": False, "errors": errors,
+                              "warnings": warnings,
                               "throws_graph": checker.throws_graph},
                              indent=2))
         else:
             emit_errors(errors, as_json)
         return 1
     if as_json:
-        print(json.dumps({"ok": True, "errors": [],
+        print(json.dumps({"ok": True, "errors": [], "warnings": warnings,
                           "throws_graph": checker.throws_graph}, indent=2))
     else:
+        emit_warnings(warnings, as_json)
         print(f"{path}: OK")
     return 0
 
@@ -359,8 +381,12 @@ def main(argv):
     # stripping it here would lose the flag before pkg sees it.
     if cmd != "pkg":
         args = [a for a in args if a != "--json"]
-    if cmd == "check" and len(args) == 1:
-        return cmd_check(args[0], as_json)
+    if cmd == "check" and len(args) >= 1:
+        deny_warnings = "--deny-warnings" in args
+        args = [a for a in args if a != "--deny-warnings"]
+        if len(args) == 1:
+            return cmd_check(args[0], as_json, deny_warnings)
+        die("usage: misa check <file.misa> [--json] [--deny-warnings]")
     if cmd == "fmt" and 1 <= len(args) <= 2:
         return cmd_fmt(args[0], "--write" in args)
     if cmd == "run" and len(args) >= 1:

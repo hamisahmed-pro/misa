@@ -1,0 +1,46 @@
+// Phase 5d: match guards, where-clause bounds, and tail calls —
+// AOT must agree with the interpreter on every line.
+type Shape { Circle(r: Float), Rect(w: Float, h: Float), Point }
+
+fn classify(s: Shape) -> Text {
+  return match s {
+    Shape.Circle(r) if r > 10.0 => "big circle",
+    Shape.Circle(r) => "small circle",
+    Shape.Rect(w, h) if w == h => "square",
+    Shape.Rect(w, h) => "rect",
+    _ => "point"
+  }
+}
+
+interface Printable { fn show(self) -> Text }
+type Box { v: Int }
+impl Printable for Box {
+  fn show(self) -> Text { return "Box(" + str(self.v) + ")" }
+}
+
+fn show_it<T>(x: T) -> Text where T: Printable {
+  return x.show()
+}
+
+fn show2<A, B>(x: A, y: B) -> Text where A: Printable, B: Printable {
+  return x.show() + "/" + y.show()
+}
+
+fn sum_to(n: Int, acc: Int) -> Int {
+  if n <= 0 { return acc }
+  return sum_to(n - 1, acc + n)
+}
+
+fn main() -> Int {
+  print(classify(Shape.Circle(20.0)))
+  print(classify(Shape.Circle(5.0)))
+  print(classify(Shape.Rect(3.0, 3.0)))
+  print(classify(Shape.Rect(3.0, 4.0)))
+  print(classify(Shape.Point()))
+  let b: Box = { v: 41 }
+  print(show_it(b))
+  print(show2(b, b))
+  print(str(sum_to(100000, 0)))
+  return 0
+}
+main()

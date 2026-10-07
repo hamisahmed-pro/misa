@@ -5388,6 +5388,518 @@ def _():
     assert not errs, errs
 
 
+# ---------------------------------------------------------------- Phase 5d:
+# advanced types — where clauses, match guards, W301, TCO
+
+WHERE_PREAMBLE = '''
+interface Comparable {
+  fn cmp(self, other: Box) -> Int
+}
+interface Printable {
+  fn show(self) -> Text
+}
+type Box { v: Int }
+impl Comparable for Box {
+  fn cmp(self, other: Box) -> Int { return self.v - other.v }
+}
+impl Printable for Box {
+  fn show(self) -> Text { return "box({self.v})" }
+}
+'''
+
+SUM5D = '''
+type Shape {
+  Circle(radius: Float),
+  Rect(w: Float, h: Float),
+}
+type Opt { None, Some(Int) }
+'''
+
+
+@test("5d parser: where clause single bound")
+def _():
+    prog = parse_source("fn sort<T>(xs: [T]) -> [T] where T: Comparable "
+                        "{ return xs }\n")
+    fn = prog.items[0]
+    eq(fn.where_bounds, {"T": ["Comparable"]})
+
+
+@test("5d parser: where clause multiple bounds and params")
+def _():
+    prog = parse_source("fn f<T, K>(x: T, y: K) -> Int "
+                        "where T: Comparable + Printable, K: Printable "
+                        "{ return 0 }\n")
+    fn = prog.items[0]
+    eq(fn.where_bounds, {"T": ["Comparable", "Printable"],
+                         "K": ["Printable"]})
+
+
+@test("5d parser: where clause on type decl")
+def _():
+    prog = parse_source("type Cache<K, V> where K: Comparable "
+                        "{ k: K }\n")
+    td = prog.items[0]
+    eq(td.where_bounds, {"K": ["Comparable"]})
+
+
+@test("5d parser: where on unknown type param is ParseError")
+def _():
+    try:
+        parse_source("fn f<T>(x: T) -> T where K: Comparable "
+                     "{ return x }\n")
+    except ParseError as e:
+        assert "not a type parameter" in str(e), e
+        return
+    raise AssertionError("expected ParseError")
+
+
+@test("5d parser: where without type params is ParseError")
+def _():
+    try:
+        parse_source("fn f(x: Int) -> Int where T: Comparable "
+                     "{ return x }\n")
+    except ParseError:
+        return
+    raise AssertionError("expected ParseError")
+
+
+@test("5d checker: where bound dispatches in body")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+fn describe<T>(x: T) -> Text where T: Printable {
+  return x.show()
+}
+fn main() -> Int {
+  let b: Box = { v: 3 }
+  print(describe(b))
+  return 0
+}
+main()
+''')
+    eq(errs, [])
+
+
+@test("5d checker: where bound multiple — method from each")
+def _():
+    errs = check_source('''
+interface A { fn am(self) -> Text }
+interface B { fn bm(self) -> Text }
+type T2 { v: Int }
+impl A for T2 { fn am(self) -> Text { return "a" } }
+impl B for T2 { fn bm(self) -> Text { return "b" } }
+fn both<T>(x: T) -> Text where T: A + B {
+  return x.am() + x.bm()
+}
+fn main() -> Int {
+  let t: T2 = { v: 1 }
+  print(both(t))
+  return 0
+}
+main()
+''')
+    eq(errs, [])
+
+
+@test("5d checker: E229 unknown interface in where")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+fn f<T>(x: T) -> T where T: Nope { return x }
+''')
+    assert any(e["code"] == "E229" for e in errs), errs
+
+
+@test("5d checker: E228 where-bound violation at call")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+fn show_it<T>(x: T) -> Text where T: Printable { return x.show() }
+fn main() -> Int {
+  print(show_it(42))
+  return 0
+}
+main()
+''')
+    assert any(e["code"] == "E228" for e in errs), errs
+
+
+@test("5d checker: where-bound satisfied passes")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+fn show_it<T>(x: T) -> Text where T: Printable { return x.show() }
+fn main() -> Int {
+  let b: Box = { v: 1 }
+  print(show_it(b))
+  return 0
+}
+main()
+''')
+    eq(errs, [])
+
+
+@test("5d checker: inline bound and where bound merge")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+fn f<T: Printable>(x: T) -> Text where T: Printable {
+  return x.show()
+}
+''')
+    eq(errs, [])
+
+
+@test("5d checker: where on type decl validates bounds")
+def _():
+    errs = check_source(WHERE_PREAMBLE + '''
+type Cache<K, V> where K: Comparable {
+  k: K,
+  v: V,
+}
+''')
+    eq(errs, [])
+
+
+@test("5d checker: E229 unknown interface in type where")
+def _():
+    errs = check_source('type C<K> where K: Nope { k: K }\n')
+    assert any(e["code"] == "E229" for e in errs), errs
+
+
+@test("5d interp: where-bounded generic end to end")
+def _():
+    _, buf = run_src_checked(WHERE_PREAMBLE + '''
+fn show_it<T>(x: T) -> Text where T: Printable { return x.show() }
+fn main() -> Int {
+  let b: Box = { v: 7 }
+  print(show_it(b))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "box(7)")
+
+
+@test("5d formatter: where clause round-trips")
+def _():
+    src = ("fn sort<T>(xs: [T]) -> [T] where T: Comparable + Printable "
+           "{ return xs }\n")
+    out = format_source(src, "f.misa")
+    assert "where T: Comparable + Printable" in out, out
+    # idempotent
+    eq(format_source(out, "f.misa"), out)
+
+
+@test("5d parser: match guard on variant, bare, wildcard")
+def _():
+    prog = parse_source('fn f(s: Shape) -> Int {\n'
+                        '  return match s {\n'
+                        '    Shape.Circle(r) if r > 0 => 1,\n'
+                        '    Opt.None if ok => 2,\n'
+                        '    _ if ok => 3,\n'
+                        '    _ => 4,\n'
+                        '  }\n'
+                        '}\n')
+    arms = prog.items[0].body[0].value.arms
+    eq([a.guard is not None for a in arms], [True, True, True, False])
+
+
+@test("5d checker: E230 guard must be Bool")
+def _():
+    errs = check_source(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) if r => r,
+    Shape.Circle(r) => 0.0,
+    Shape.Rect(w, h) => 0.0,
+  }
+}
+''')
+    assert any(e["code"] == "E230" for e in errs), errs
+
+
+@test("5d checker: guard sees arm bindings with payload types")
+def _():
+    # r is Float; r > 0 is Bool — clean.
+    errs = check_source(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) if r > 0.0 => r,
+    Shape.Circle(r) => 0.0,
+    Shape.Rect(w, h) => w,
+  }
+}
+''')
+    eq(errs, [])
+
+
+@test("5d checker: guarded arm does not satisfy exhaustiveness")
+def _():
+    errs = check_source(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) if r > 0.0 => r,
+    Shape.Rect(w, h) => w,
+  }
+}
+''')
+    assert any(e["code"] == "E216" for e in errs), errs
+
+
+@test("5d checker: guardless arm after guarded covers")
+def _():
+    errs = check_source(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) if r > 0.0 => r,
+    Shape.Circle(r) => 0.0,
+    Shape.Rect(w, h) => w,
+  }
+}
+''')
+    eq(errs, [])
+
+
+@test("5d interp: guard fallthrough in source order")
+def _():
+    _, buf = run_src_checked(SUM5D + '''
+fn classify(s: Shape) -> Text {
+  return match s {
+    Shape.Circle(r) if r > 10.0 => "big",
+    Shape.Circle(r) if r > 0.0 => "small",
+    Shape.Circle(r) => "degenerate",
+    Shape.Rect(w, h) => "rect",
+  }
+}
+fn main() -> Int {
+  print(classify(Shape.Circle(20.0)))
+  print(classify(Shape.Circle(5.0)))
+  print(classify(Shape.Circle(0.0)))
+  print(classify(Shape.Circle(-1.0)))
+  print(classify(Shape.Rect(1.0, 2.0)))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip().splitlines(),
+       ["big", "small", "degenerate", "degenerate", "rect"])
+
+
+@test("5d interp: guarded wildcard")
+def _():
+    _, buf = run_src_checked(SUM5D + '''
+fn f(o: Opt) -> Text {
+  return match o {
+    Opt.Some(x) if x > 0 => "pos",
+    _ if true => "other",
+    _ => "unreachable",
+  }
+}
+fn main() -> Int {
+  print(f(Opt.Some(3)))
+  print(f(Opt.Some(-3)))
+  print(f(Opt.None))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip().splitlines(),
+       ["pos", "other", "other"])
+
+
+@test("5d formatter: match guard round-trips")
+def _():
+    src = ("fn f(s: Shape) -> Int {\n"
+           "  return match s { Shape.Circle(r) if r > 0 => 1, _ => 2 }\n"
+           "}\n")
+    out = format_source(src, "f.misa")
+    assert "if r > 0 =>" in out, out
+    eq(format_source(out, "f.misa"), out)
+
+
+def _warnings(src):
+    c = Checker()
+    prog = parse_source(src)
+    errs = c.check(prog)
+    assert not errs, errs
+    return c.warnings
+
+
+@test("5d checker: W301 arm after wildcard")
+def _():
+    ws = _warnings(SUM5D + '''
+fn f(s: Shape) -> Int {
+  return match s {
+    _ => 1,
+    Shape.Circle(r) => 2,
+  }
+}
+''')
+    assert any(w["code"] == "W301" for w in ws), ws
+
+
+@test("5d checker: W301 duplicate variant arm")
+def _():
+    ws = _warnings(SUM5D + '''
+fn f(s: Shape) -> Int {
+  return match s {
+    Shape.Circle(r) => 1,
+    Shape.Circle(r) => 2,
+    Shape.Rect(w, h) => 3,
+  }
+}
+''')
+    assert any(w["code"] == "W301" for w in ws), ws
+
+
+@test("5d checker: W301 dead wildcard after full coverage")
+def _():
+    ws = _warnings(SUM5D + '''
+fn f(s: Shape) -> Int {
+  return match s {
+    Shape.Circle(r) => 1,
+    Shape.Rect(w, h) => 2,
+    _ => 3,
+  }
+}
+''')
+    assert any(w["code"] == "W301" for w in ws), ws
+
+
+@test("5d checker: no W301 when earlier arm has guard")
+def _():
+    ws = _warnings(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) if r > 0.0 => r,
+    Shape.Circle(r) => 0.0,
+    Shape.Rect(w, h) => w,
+  }
+}
+''')
+    assert not any(w["code"] == "W301" for w in ws), ws
+
+
+@test("5d checker: no W301 on clean match")
+def _():
+    ws = _warnings(SUM5D + '''
+fn f(s: Shape) -> Float {
+  return match s {
+    Shape.Circle(r) => r,
+    Shape.Rect(w, h) => w,
+  }
+}
+''')
+    eq(ws, [])
+
+
+@test("5d cli: --deny-warnings promotes W301 to error")
+def _():
+    import subprocess, tempfile, os
+    src = SUM5D + '''
+fn f(s: Shape) -> Int {
+  return match s {
+    _ => 1,
+    Shape.Circle(r) => 2,
+  }
+}
+'''
+    with tempfile.NamedTemporaryFile("w", suffix=".misa",
+                                     delete=False) as tf:
+        tf.write(src)
+        path = tf.name
+    try:
+        misa = os.path.join(ROOT, "impl", "bin", "misa")
+        r1 = subprocess.run([misa, "check", path], capture_output=True,
+                            text=True, timeout=60)
+        eq(r1.returncode, 0, r1.stderr)
+        assert "W301" in r1.stderr, r1.stderr
+        r2 = subprocess.run([misa, "check", path, "--deny-warnings"],
+                            capture_output=True, text=True, timeout=60)
+        assert r2.returncode != 0, r2.stdout
+        assert "W301" in r2.stderr, r2.stderr
+    finally:
+        os.unlink(path)
+
+
+@test("5d interp: TCO deep tail recursion")
+def _():
+    _, buf = run_src_checked('''
+fn sum_to(n: Int, acc: Int) -> Int {
+  if n <= 0 {
+    return acc
+  }
+  return sum_to(n - 1, acc + n)
+}
+fn main() -> Int {
+  print(sum_to(100000, 0))
+  return 0
+}
+main()
+''')
+    # 100000 deep would overflow Python's own stack without TCO.
+    eq(buf.getvalue().strip(), "5000050000")
+
+
+@test("5d interp: TCO preserves semantics (countdown)")
+def _():
+    _, buf = run_src_checked('''
+fn count(n: Int) -> Int {
+  if n <= 0 {
+    return 0
+  }
+  return count(n - 1)
+}
+fn main() -> Int {
+  print(count(50000))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "0")
+
+
+@test("5d interp: no TCO inside nested lambda (correctness)")
+def _():
+    _, buf = run_src_checked('''
+fn apply(f: (Int) -> Int, x: Int) -> Int {
+  return f(x)
+}
+fn fact(n: Int) -> Int {
+  if n <= 1 {
+    return 1
+  }
+  let rec = |k: Int| k * fact(k - 1)
+  return apply(rec, n)
+}
+fn main() -> Int {
+  print(fact(10))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "3628800")
+
+
+@test("5d interp: TCO through try/catch is not swallowed")
+def _():
+    _, buf = run_src_checked('''
+fn down(n: Int) -> Int {
+  if n <= 0 {
+    return 0
+  }
+  try {
+    return down(n - 1)
+  } catch e {
+    return -1
+  }
+  return -2
+}
+fn main() -> Int {
+  print(down(20000))
+  return 0
+}
+main()
+''')
+    eq(buf.getvalue().strip(), "0")
+
+
 if __name__ == "__main__":
     # run all @test functions in definition order
     print(f"Misa v0.2 test suite — {len([k for k in list(globals())])} "

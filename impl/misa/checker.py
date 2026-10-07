@@ -334,6 +334,8 @@ def _split_top_commas(s: str) -> List[str]:
 class Checker:
     def __init__(self):
         self.errors: List[dict] = []
+        # Phase 5d: non-fatal diagnostics (W-codes); see warn().
+        self.warnings: List[dict] = []
         self.types: Dict[str, ast.TypeDecl] = {}
         self.models: Dict[str, ast.ModelDecl] = {}
         self.providers: Dict[str, ast.ProviderDecl] = {}
@@ -358,9 +360,10 @@ class Checker:
         self.impls: Dict[tuple, ast.ImplDecl] = {}
         self.iface_method_throws: Dict[tuple, frozenset] = {}
         # Phase 8 (overtake): interface bounds in scope while checking
-        # a generic fn body, e.g. {"T": "Drawable"} for
-        # `fn f<T: Drawable>(x: T)`.
-        self._tparam_bounds: Dict[str, str] = {}
+        # a generic fn body. Phase 5d: each type parameter maps to a
+        # LIST of bound interfaces (inline `<T: A>` plus `where`
+        # clauses, e.g. `where T: A + B`), e.g. {"T": ["Drawable"]}.
+        self._tparam_bounds: Dict[str, List[str]] = {}
         self.app_seen = False
         self._file_of: Optional[Dict[int, str]] = None
         # Phase 4 (M4): id: name -> component kind for the screen whose
@@ -397,6 +400,14 @@ class Checker:
               hint: str = ""):
         self.errors.append({"code": code, "message": message,
                             "line": line, "col": col, "hint": hint})
+
+    # Phase 5d: warnings are non-fatal diagnostics (W-codes). They are
+    # collected like errors but do not fail `misa check` unless
+    # `--deny-warnings` is passed (which promotes them to errors).
+    def warn(self, code: str, message: str, line: int, col: int,
+             hint: str = ""):
+        self.warnings.append({"code": code, "message": message,
+                              "line": line, "col": col, "hint": hint})
 
     # -- entry ----------------------------------------------------------
 
@@ -520,8 +531,37 @@ class Checker:
         """Phase 5c: validate a type decl's field/variant types. For
         generic decls, the type parameters are in scope (unbound names
         are E222); otherwise an unknown field type is E208 (M-2: plain
-        `type T { x: Wat }` must not pass silently)."""
+        `type T { x: Wat }` must not pass silently).
+        Phase 5d: inline `<T: Bound>` and `where`-clause bounds are
+        validated here (E200/E229 for unknown interfaces)."""
         saved_tparams, self._tparams = self._tparams, list(decl.type_params)
+        saved_bounds, self._tparam_bounds = self._tparam_bounds, {}
+        for tp, bound in decl.type_param_bounds.items():
+            if bound not in self.interfaces:
+                self.error("E200",
+                           f"unknown interface bound '{bound}' for type "
+                           f"parameter '{tp}' in type '{decl.name}'",
+                           decl.line, decl.col)
+            else:
+                self._tparam_bounds[tp] = [bound]
+        for tp, blist in decl.where_bounds.items():
+            ok = []
+            for bound in blist:
+                if bound not in self.interfaces:
+                    self.error("E229",
+                               f"unknown interface '{bound}' in where "
+                               f"clause for type parameter '{tp}' in "
+                               f"type '{decl.name}'",
+                               decl.line, decl.col,
+                               hint="bounds must name a declared "
+                                    "`interface`")
+                elif bound not in ok:
+                    ok.append(bound)
+            if ok:
+                self._tparam_bounds.setdefault(tp, [])
+                for b in ok:
+                    if b not in self._tparam_bounds[tp]:
+                        self._tparam_bounds[tp].append(b)
         try:
             if decl.is_sum:
                 for v in decl.variants:
@@ -532,6 +572,7 @@ class Checker:
                     self._check_te(fte, fte.line, fte.col)
         finally:
             self._tparams = saved_tparams
+            self._tparam_bounds = saved_bounds
 
     def _check_table_decl(self, decl: ast.TableDecl):
         """Phase 5 (DB): validate a table decl's column types."""
@@ -777,14 +818,19 @@ class Checker:
                        hint="only the interface's declared methods "
                             "are callable on an interface value")
             return ("error", None, None, None)
-        # 2. Type variable with an interface bound: dynamic dispatch
-        # via the bound.
-        bound = self._tparam_bounds.get(rt)
-        if bound is not None:
-            if field in [m.name for m in self.interfaces[bound].methods]:
-                return ("iface", bound, field, None)
+        # 2. Type variable with interface bound(s): dynamic dispatch
+        # via the bound. Phase 5d: with multiple bounds (`where
+        # T: A + B`), the method may come from any bound interface.
+        bounds = self._tparam_bounds.get(rt)
+        if bounds is not None:
+            for bound in bounds:
+                if field in [m.name for m in
+                             self.interfaces[bound].methods]:
+                    return ("iface", bound, field, None)
             self.error("E200",
-                       f"interface '{bound}' has no method '{field}'",
+                       f"no bound interface of '{rt}' has method "
+                       f"'{field}' (bounds: "
+                       f"{', '.join(bounds)})",
                        line, col)
             return ("error", None, None, None)
         # 3. Concrete type: static dispatch when exactly one impl
@@ -1236,8 +1282,11 @@ class Checker:
         seen_params = set()
         # Phase 5c: type parameters are in scope for the signature.
         saved_tparams, self._tparams = self._tparams, list(fn.type_params)
-        # Phase 8 (overtake): interface bounds, e.g. {"T": "Drawable"}.
-        # Bounds must name declared interfaces (E200 otherwise).
+        # Phase 8 (overtake): inline interface bounds, e.g.
+        # `<T: Drawable>`. Bounds must name declared interfaces
+        # (E200 otherwise).
+        # Phase 5d: `where`-clause bounds merge in (each maps to a
+        # list); unknown interfaces in a `where` clause are E229.
         saved_bounds, self._tparam_bounds = self._tparam_bounds, {}
         for tp, bound in fn.type_param_bounds.items():
             if bound not in self.interfaces:
@@ -1246,7 +1295,25 @@ class Checker:
                            f"parameter '{tp}'",
                            fn.line, fn.col)
             else:
-                self._tparam_bounds[tp] = bound
+                self._tparam_bounds[tp] = [bound]
+        for tp, blist in fn.where_bounds.items():
+            ok = []
+            for bound in blist:
+                if bound not in self.interfaces:
+                    self.error("E229",
+                               f"unknown interface '{bound}' in where "
+                               f"clause for type parameter '{tp}' in "
+                               f"function '{fn.name}'",
+                               fn.line, fn.col,
+                               hint="bounds must name a declared "
+                                    "`interface`")
+                elif bound not in ok:
+                    ok.append(bound)
+            if ok:
+                self._tparam_bounds.setdefault(tp, [])
+                for b in ok:
+                    if b not in self._tparam_bounds[tp]:
+                        self._tparam_bounds[tp].append(b)
         for pn, te in fn.params:
             if pn in seen_params:
                 self.error("E210", f"duplicate parameter '{pn}'",
@@ -2325,7 +2392,8 @@ class Checker:
             # value is E200 — only the interface's methods are visible
             # (use a method call `v.m(...)`, not `v.field`).
             if ot in self.interfaces or ot in self._tparam_bounds:
-                oname = self._tparam_bounds.get(ot, ot)
+                # Phase 5d: bound lists — name the first bound.
+                oname = self._tparam_bounds.get(ot, [ot])[0]
                 self.error("E200",
                            f"cannot access field '.{e.field}' on "
                            f"interface '{oname}' value",
@@ -3368,13 +3436,45 @@ class Checker:
                 pass
             else:
                 bindings = dict(zip(decl.type_params, args))
-        seen = set()
-        has_wildcard = False
+        seen = set()          # variants covered by GUARDLESS arms
+        has_wildcard = False  # a guardless `_` arm was seen
+        all_variants = {v.name for v in decl.variants}
         arm_ts = []
         for arm in e.arms:
+            # Phase 5d: unreachable-arm detection (W301, warning only).
+            # A guardless `_` swallows everything after it; a guardless
+            # variant arm swallows later guardless arms for the same
+            # variant; a guardless `_` after full coverage is dead.
+            # Guarded arms never swallow (their guard may be false).
+            dead_reason = ""
+            if has_wildcard:
+                dead_reason = "a previous `_` arm already matches " \
+                              "every value"
+            elif arm.wildcard and arm.guard is None \
+                    and seen >= all_variants:
+                dead_reason = f"every variant of '{decl.name}' is " \
+                              f"already covered"
+            elif not arm.wildcard and arm.guard is None \
+                    and arm.type_name == decl.name \
+                    and arm.variant in seen:
+                dead_reason = f"'{decl.name}.{arm.variant}' is already " \
+                              f"covered by a previous arm"
+            if dead_reason:
+                self.warn("W301",
+                          f"unreachable match arm — {dead_reason}",
+                          arm.line, arm.col,
+                          hint="delete this arm or add an `if` guard to "
+                               "the earlier arm")
             if arm.wildcard:
-                has_wildcard = True
+                if arm.guard is None:
+                    has_wildcard = True
                 t = self._infer(arm.body, scope)
+                if arm.guard is not None:
+                    gt = self._infer(arm.guard, scope)
+                    if gt != "Bool" and gt != "unknown":
+                        self.error("E230",
+                                   f"match guard must be Bool, got '{gt}'",
+                                   arm.guard.line, arm.guard.col)
                 arm_ts.append(t)
                 continue
             if arm.type_name != decl.name:
@@ -3402,7 +3502,17 @@ class Checker:
                 # Phase 5c: substitute the scrutinee's type arguments.
                 bt = self._tname(self._subst_te(fte, bindings))
                 child[bname] = (bt, False)
-            seen.add(arm.variant)
+            # Phase 5d: the guard sees the arm's bindings and must be
+            # Bool (E230). Guarded arms do NOT count toward
+            # exhaustiveness — the guard may be false at runtime.
+            if arm.guard is not None:
+                gt = self._infer(arm.guard, child)
+                if gt != "Bool" and gt != "unknown":
+                    self.error("E230",
+                               f"match guard must be Bool, got '{gt}'",
+                               arm.guard.line, arm.guard.col)
+            else:
+                seen.add(arm.variant)
             arm_ts.append(self._infer(arm.body, child))
         if not has_wildcard:
             missing = [v.name for v in decl.variants
@@ -3932,7 +4042,9 @@ class Checker:
         e.type_args = [self._parse_tstr(bindings[p]) for p in tparams]
         # Phase 8 (overtake): verify interface bounds — each bounded
         # type var's concrete binding must implement (or be) the bound.
-        if fn.type_param_bounds and not had_conflict:
+        # Phase 5d: `where`-clause bounds are enforced identically;
+        # violations there are E228 (dedicated code for the where form).
+        if (fn.type_param_bounds or fn.where_bounds) and not had_conflict:
             for tp, bound in fn.type_param_bounds.items():
                 concrete = bindings.get(tp)
                 if concrete is None or concrete == "unknown":
@@ -3944,6 +4056,22 @@ class Checker:
                                f"interface '{bound}' (bound on '{tp}' "
                                f"in '{fn.name}')",
                                e.line, e.col)
+            for tp, blist in fn.where_bounds.items():
+                concrete = bindings.get(tp)
+                if concrete is None or concrete == "unknown":
+                    continue
+                for bound in blist:
+                    if concrete == bound \
+                            or (bound, concrete) in self.impls \
+                            or concrete in self._tparam_bounds:
+                        continue
+                    self.error("E228",
+                               f"type '{concrete}' does not implement "
+                               f"interface '{bound}' (where-bound on "
+                               f"'{tp}' in '{fn.name}')",
+                               e.line, e.col,
+                               hint=f"implement '{bound}' for '{concrete}' "
+                                    f"or pass a type that does")
         for i, ((pn, pte), a, at) in enumerate(
                 zip(fn.params, e.args, arg_ts)):
             want_t = self._tname(self._subst_te(pte, bindings))
@@ -3956,10 +4084,16 @@ class Checker:
             # type mentions a bounded type var receives the argument
             # as an interface value — wrap it so method calls inside
             # the generic body dispatch dynamically.
+            # Phase 5d: `where`-clause bounds wrap identically (first
+            # bound names the interface value; dispatch keys off the
+            # concrete type, so any bound works).
             if not had_conflict and at != "unknown" \
-                    and fn.type_param_bounds:
-                view = self._tname(self._subst_te(
-                    pte, fn.type_param_bounds))
+                    and (fn.type_param_bounds or fn.where_bounds):
+                merged_bounds = dict(fn.type_param_bounds)
+                for tp, blist in fn.where_bounds.items():
+                    if tp not in merged_bounds and blist:
+                        merged_bounds[tp] = blist[0]
+                view = self._tname(self._subst_te(pte, merged_bounds))
                 if view != want_t:
                     e.args[i] = self._coerce_iface(view, at, a)
         if fn.ret:
@@ -4097,9 +4231,9 @@ class Checker:
             return True
         # Phase 8 (overtake): a bounded type var is assignable to
         # its bound interface (the value was wrapped at the generic
-        # instantiation site).
+        # instantiation site). Phase 5d: any of the bounds qualifies.
         if want in self.interfaces and got in self._tparam_bounds \
-                and self._tparam_bounds[got] == want:
+                and want in self._tparam_bounds[got]:
             return True
         # H-3: list covariance — [Text] is assignable to [any], etc.
         # (db.exec/db.query bind args accept heterogeneous scalars).

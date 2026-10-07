@@ -61,6 +61,9 @@ Every Misa diagnostic carries a code. Ranges:
 | E225 | **(Phase 7; extended Wave 2)** Invalid `extern` signature — empty library name, type parameters on an extern function, or a parameter/return type that cannot cross the FFI boundary (crossable: `Int`, `Float`, `Text`, `Bool`, `Ptr`, `Void`, declared C structs, and `(A, B) -> R` callback params with scalar parts). Struct fields are `Int`/`Float`/`Bool`/`Ptr` only in v1; callbacks as return types, nested callbacks, and structs in callbacks are E225; >16-byte structs as varargs are E225. Passing a `Task<T>`/`Chan<T>` value to an `extern` function at a call site is also E225. |
 | E226 | **(Phase 7)** FFI failure at load or call time — library cannot be loaded (`cannot load library 'foo': ...`), symbol not found (`library 'm' has no symbol 'bar'`), or the foreign call itself failed. Foreign crashes are NOT caught (same as C). |
 | E227 | **(Phase 8 overtake)** Checked `throws` violation — an unhandled error code at a call/`throw`/`await` site (`unhandled E304 from call to 'fetch' — 'load' must declare 'throws E304' or catch it'), or a malformed code in a `throws` clause. See `spec/PHASE8-THROWS.md`. |
+| E228 | **(Phase 5d)** `where`-constraint violation — a concrete type used for a bounded type variable does not implement a required interface (`type 'Int' does not satisfy bound 'T: Printable' (missing impl of 'Printable' for 'Int')`). |
+| E229 | **(Phase 5d)** Unknown interface in a `where` clause (`unknown interface 'Printabl' in where clause`). |
+| E230 | **(Phase 5d)** Match guard is not `Bool` (`match guard must be Bool, got 'Text'`). |
 
 ## E3xx — runtime
 
@@ -97,6 +100,16 @@ Every Misa diagnostic carries a code. Ranges:
 | Code | Meaning |
 |---|---|
 | E600 | AOT/build failure (link errors, unsupported construct for the target, missing on-device model asset — see E401 for the intentional run/build split). |
+
+## W3xx — warnings (check-time, non-fatal)
+
+Warnings are reported by `misa check` (and surfaced as JSON in the
+`warnings` array) but do not fail the check. `misa check
+--deny-warnings` promotes every warning to a failure (exit non-zero).
+
+| Code | Meaning |
+|---|---|
+| W301 | **(Phase 5d)** Unreachable match arm — an arm after a guardless wildcard, a duplicate guardless variant arm, or a wildcard after all variants are already covered (`unreachable match arm (a previous arm already covers this case)`). |
 
 ## Catching
 
