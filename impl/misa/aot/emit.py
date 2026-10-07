@@ -229,6 +229,13 @@ _RT_SIGS = {
     "misa_time_weekday": (PTR, [PTR, I32, I32]),
     "misa_time_is_leap": (PTR, [PTR, I32, I32]),
     "misa_fs_temp_file": (PTR, [I32, I32]),
+    # Final wave (stdlib): compression.
+    "misa_bytes_new": (PTR, [PTR, I64]),
+    "misa_compress_gzip": (PTR, [PTR, I32, I32]),
+    "misa_compress_gunzip": (PTR, [PTR, I32, I32]),
+    "misa_compress_gunzip_bytes": (PTR, [PTR, I32, I32]),
+    "misa_compress_gzip_file": (PTR, [PTR, PTR, I32, I32]),
+    "misa_compress_gunzip_file": (PTR, [PTR, PTR, I32, I32]),
     "misa_fs_temp_dir": (PTR, [I32, I32]),
     "misa_set_new": (PTR, []),
     "misa_set_add": (ir.VoidType(), [PTR, PTR, I32, I32]),
@@ -465,23 +472,103 @@ class Emitter:
             return fty.as_pointer()
         tname = te.name
         if tname in self.extern_structs:
+            st = self.extern_structs[tname]
+            # Overtake final wave: unions are coerced to their SysV
+            # register classes at the FFI boundary (a byte array
+            # would mislower to the stack).
+            if st.kind == "union":
+                return self._ffi_union_abi_llvm_type(tname)
             return self._ffi_struct_llvm_type(tname)
         return self._ffi_llvm_type(tname)
 
+    def _ffi_union_abi_llvm_type(self, name: str):
+        """The LLVM type used for a union at the FFI boundary (function
+        declarations, call marshalling). A bare byte array mislowers:
+        LLVM passes `[N x i8]` on the stack while C passes small unions
+        in registers. Coerce to the SysV per-eightbyte classes instead
+        (verified against `gcc -S`). Unions over 16 bytes keep the byte
+        array: they travel via byval/sret, where only the size
+        matters."""
+        from misa import ffi_layout
+        classes = ffi_layout.union_chunk_classes(name,
+                                                 self.extern_structs)
+        if len(classes) > 2:
+            return self._ffi_struct_llvm_type(name)
+        tys = [I64 if c == "int" else DBL for c in classes]
+        if len(tys) == 1:
+            return tys[0]
+        return ir.LiteralStructType(tys)
+
     def _ffi_struct_llvm_type(self, name: str):
-        """LLVM struct type for a declared C-layout struct (cached)."""
+        """LLVM type for a declared C-layout aggregate (cached).
+
+        Structs: literal struct of field LLVM types — nested
+        aggregates recurse; each bitfield *unit* becomes one i64
+        element (bitfields sharing a unit share the element).
+        Unions: a byte array of the union size (fields are accessed
+        via bitcast). Layout matches misa.ffi_layout byte-exact.
+        """
         if name not in self._llvm_struct_types:
+            from misa import ffi_layout
             st = self.extern_structs[name]
-            self._llvm_struct_types[name] = ir.LiteralStructType(
-                [self._ffi_llvm_type(fte.name) for _, fte in st.fields],
-                packed=False)
+            if st.kind == "union":
+                size = ffi_layout.aggregate_size(name,
+                                                 self.extern_structs)
+                self._llvm_struct_types[name] = ir.ArrayType(I8, size)
+            else:
+                _, _, fields = ffi_layout.layout_aggregate(
+                    st, self.extern_structs, (name,))
+                elems = []
+                seen_units = set()
+                for _, desc, _, extra in fields:
+                    if desc == "bits":
+                        uoff = extra[0]
+                        if uoff not in seen_units:
+                            seen_units.add(uoff)
+                            elems.append(I64)
+                    elif desc == "scalar":
+                        elems.append(self._ffi_llvm_type(extra))
+                    else:  # "aggr": nested struct/union
+                        elems.append(
+                            self._ffi_struct_llvm_type(extra))
+                self._llvm_struct_types[name] = ir.LiteralStructType(
+                    elems, packed=False)
         return self._llvm_struct_types[name]
+
+    def _ffi_field_llvm_index(self, name: str, fname: str, node):
+        """(llvm_element_index, desc, extra) for a struct field.
+
+        Bitfields sharing a unit share the element index; extra for
+        bits is (bit_offset, width). For scalars extra is the tname;
+        for nested aggregates extra is the aggregate name.
+        """
+        from misa import ffi_layout
+        _, _, fields = ffi_layout.layout_aggregate(
+            self.extern_structs[name], self.extern_structs, (name,))
+        idx = 0
+        seen_units = {}
+        for fn_, desc, _, extra in fields:
+            if desc == "bits":
+                uoff = extra[0]
+                if uoff not in seen_units:
+                    seen_units[uoff] = idx
+                    idx += 1
+                if fn_ == fname:
+                    return (seen_units[uoff], "bits",
+                            (extra[1], extra[2]))
+            else:
+                if fn_ == fname:
+                    return (idx, desc, extra)
+                idx += 1
+        raise AOTError("E101",
+                       f"struct '{name}' has no field '{fname}'",
+                       node.line, node.col)
 
     @staticmethod
     def _ffi_struct_layout(fields) -> tuple:
-        """(size, [(fname, kind)]) with C alignment rules for flat
-        scalar fields. kinds: 'Int'/'Float'/'Bool'/'Ptr'. Exact: every
-        allowed field type has align == size, all powers of two."""
+        """Legacy shim: (size, [(fname, kind)]) for flat scalar field
+        lists. Kept for compatibility; new code uses
+        misa.ffi_layout directly."""
         size_align = {"Int": (8, 8), "Float": (8, 8),
                       "Bool": (4, 4), "Ptr": (8, 8)}
         offset, max_align, kinds = 0, 1, []
@@ -548,10 +635,11 @@ class Emitter:
         return self._ffi_struct_size(name) > 16
 
     def _ffi_struct_size(self, name: str) -> int:
-        size, _ = self._ffi_struct_layout(
-            [(fn_, fte.name)
-             for fn_, fte in self.extern_structs[name].fields])
-        return size
+        from misa import ffi_layout
+        try:
+            return ffi_layout.aggregate_size(name, self.extern_structs)
+        except ffi_layout.LayoutError:
+            return 8  # real error already reported; never crash
 
     def _cb_trampoline(self, te):
         """(trampoline_fn, slot_global) for callback type te."""
@@ -667,6 +755,16 @@ class Emitter:
                        f"cannot map type '{tname}' across FFI",
                        node.line, node.col)
 
+    def _ffi_extern_llvm_type(self, name: str):
+        """LLVM type for an aggregate at the FFI boundary (calls and
+        declarations). Structs use their layout type; unions use the
+        SysV-coerced register-class type (see
+        _ffi_union_abi_llvm_type)."""
+        st = self.extern_structs[name]
+        if st.kind == "union":
+            return self._ffi_union_abi_llvm_type(name)
+        return self._ffi_struct_llvm_type(name)
+
     def _marshal_struct_arg(self, v, st_name: str, node, ctx):
         """Marshal a struct MVal* for a by-value C parameter.
 
@@ -679,7 +777,7 @@ class Emitter:
         v = self._ensure_mval(v, node, ctx)
         raw_ptr = self.call(ctx, "misa_struct_bytes", [v], node,
                             check=False)
-        sty = self._ffi_struct_llvm_type(st_name)
+        sty = self._ffi_extern_llvm_type(st_name)
         sptr = b.bitcast(raw_ptr, sty.as_pointer(),
                          name="_sarg_ptr")
         if self._ffi_struct_indirect(st_name):
@@ -689,12 +787,10 @@ class Emitter:
     def _wrap_struct_ret(self, raw, st_name: str, node, ctx):
         """Box a by-value LLVM struct return into a struct MVal*."""
         b = ctx.builder
-        st = self.extern_structs[st_name]
-        size, _ = self._ffi_struct_layout(
-            [(fn_, fte.name) for fn_, fte in st.fields])
+        size = self._ffi_struct_size(st_name)
         mem = self.call(ctx, "misa_alloc", [self.const_i64(size)],
                         node, check=False)
-        sty = self._ffi_struct_llvm_type(st_name)
+        sty = self._ffi_extern_llvm_type(st_name)
         sptr = b.bitcast(mem, sty.as_pointer(), name="_sret_ptr")
         b.store(raw, sptr)
         return self.call(ctx, "misa_struct_new", [mem], node,
@@ -709,6 +805,18 @@ class Emitter:
             return t if t in self.extern_structs else None
         if isinstance(e, A.StructLit):
             return e.name if e.name in self.extern_structs else None
+        if isinstance(e, A.Field):
+            # Overtake final wave: chained access `o.p.x` — resolve
+            # the inner field's declared aggregate type.
+            inner = self._struct_type_of(e.obj, ctx)
+            if inner is not None:
+                st = self.extern_structs.get(inner)
+                if st is not None:
+                    for fn_, fte in st.fields:
+                        if fn_ == e.field \
+                                and fte.name in self.extern_structs:
+                            return fte.name
+            return None
         if isinstance(e, A.Call) and e.name in self.extern_decls:
             decl = self.extern_decls[e.name]
             if decl.ret is not None \
@@ -747,52 +855,175 @@ class Emitter:
                        "or struct type annotation first",
                        arg_e.line, arg_e.col)
 
+    def _memset0(self, mem, size, ctx):
+        """Zero `size` bytes at `mem` (union literals: unset bytes are
+        zero). Uses the llvm.memset intrinsic; no C runtime change."""
+        b = ctx.builder
+        i8p = ir.PointerType(I8)
+        ms = self.mod.declare_intrinsic('llvm.memset', [i8p, I64])
+        b.call(ms, [b.bitcast(mem, i8p), ir.Constant(I8, 0),
+                    self.const_i64(size), ir.Constant(ir.IntType(1), 0)])
+
+    def _bitfield_checked(self, v, width, fv_node, e, ctx):
+        """MVal* -> i64 for a `:width` bitfield, raising catchable E300
+        when the value is outside the unsigned range 0..2**width-1
+        (bitfields are unsigned, matching C `unsigned long`)."""
+        b = ctx.builder
+        ival = self._marshal_scalar(v, "Int", fv_node, ctx)
+        if width >= 64:
+            bad = b.icmp_signed("<", ival, self.const_i64(0),
+                               name="_bf_neg")
+        else:
+            bad = b.icmp_unsigned(">=", ival,
+                                  self.const_i64(1 << width),
+                                  name="_bf_big")
+        ok_b = ctx.fn.append_basic_block("bf.ok")
+        err_b = ctx.fn.append_basic_block("bf.err")
+        b.cbranch(bad, err_b, ok_b)
+        b.position_at_end(err_b)
+        line, col = self.loc(e)
+        b.call(self.rt["misa_raise"],
+               [self.cstr("E300"),
+                self.cstr(f"bitfield value out of range for :{width}"),
+                line, col])
+        # misa_raise always sets the pending error: branch directly to
+        # the handler (check() would emit a dead, unterminated block).
+        b.branch(ctx.err_stack[-1])
+        b.position_at_end(ok_b)
+        return ival
+
+    def _store_bitfield(self, sptr, idx, extra, v, fv_node, e, ctx):
+        """Read-modify-write a bitfield into its unit (struct case)."""
+        b = ctx.builder
+        bit_off, width = extra
+        uptr = b.gep(sptr, [self.const_i32(0), self.const_i32(idx)],
+                     name="_bf_gep")
+        unit = b.load(uptr, name="_bf_unit")
+        ival = self._bitfield_checked(v, width, fv_node, e, ctx)
+        mask = ((1 << width) - 1) << bit_off
+        cleared = b.and_(unit,
+                         self.const_i64(mask ^ 0xFFFFFFFFFFFFFFFF),
+                         name="_bf_clr")
+        new = b.or_(cleared,
+                    b.shl(ival, self.const_i64(bit_off)),
+                    name="_bf_new")
+        b.store(new, uptr)
+
+    def _marshal_aggr_value(self, v, aggr_name, node, ctx):
+        """MVal* aggregate box -> LLVM aggregate value (nested
+        struct/union field in a literal)."""
+        b = ctx.builder
+        v = self._ensure_mval(v, node, ctx)
+        raw_ptr = self.call(ctx, "misa_struct_bytes", [v], node,
+                            check=False)
+        sty = self._ffi_struct_llvm_type(aggr_name)
+        sptr = b.bitcast(raw_ptr, sty.as_pointer(), name="_aggr_ptr")
+        return b.load(sptr, name="_aggr")
+
+    def _box_aggr_value(self, raw, aggr_name, node, ctx):
+        """Box an LLVM aggregate value into fresh bytes + MVal*."""
+        b = ctx.builder
+        size = self._ffi_struct_size(aggr_name)
+        mem = self.call(ctx, "misa_alloc", [self.const_i64(size)],
+                        node, check=False)
+        sptr = b.bitcast(mem, raw.type.as_pointer(), name="_box_ptr")
+        b.store(raw, sptr)
+        return self.call(ctx, "misa_struct_new", [mem], node,
+                         check=False)
+
     def _emit_struct_lit(self, e: A.StructLit, ctx):
         """`Point { x: 1.0, y: 2.0 }` — build the raw bytes on the
-        heap and box them as a struct MVal*."""
+        heap and box them as a struct MVal*.
+
+        Overtake final wave: nested aggregates (inner MVal* unboxed to
+        its LLVM value), unions (memory zeroed first; any subset of
+        fields), bitfields (unsigned; read-modify-write into the unit;
+        out-of-range values are E300).
+        """
         st = self.extern_structs.get(e.name)
         if st is None:
             raise AOTError("E101", f"unknown struct '{e.name}'",
                            e.line, e.col)
         b = ctx.builder
-        size, _ = self._ffi_struct_layout(
-            [(fn_, fte.name) for fn_, fte in st.fields])
+        size = self._ffi_struct_size(e.name)
         mem = self.call(ctx, "misa_alloc", [self.const_i64(size)], e,
                         check=False)
         sty = self._ffi_struct_llvm_type(e.name)
+        if st.kind == "union":
+            self._memset0(mem, size, ctx)
         sptr = b.bitcast(mem, sty.as_pointer(), name="_slit_ptr")
         have = {fn_: fv for fn_, fv in e.fields}
-        for i, (fn_, fte) in enumerate(st.fields):
-            # The checker guarantees every field is present.
-            v = self.emit_expr(have[fn_], ctx)
-            self.check(ctx, e)
-            raw = self._marshal_scalar(v, fte.name, have[fn_], ctx)
-            fp = b.gep(sptr, [self.const_i32(0), self.const_i32(i)],
-                       name="_slit_gep")
-            b.store(raw, fp)
+        if st.kind == "union":
+            from misa import ffi_layout
+            fmap = ffi_layout.field_map(e.name, self.extern_structs)
+            for fn_, fv in e.fields:
+                desc, _, extra = fmap[fn_]
+                v = self.emit_expr(fv, ctx)
+                self.check(ctx, e)
+                self._store_union_field(sptr, desc, extra, v, fv, e,
+                                        ctx)
+        else:
+            for fn_, fte in st.fields:
+                if fn_ not in have:
+                    continue  # unions only; structs require all fields
+                # The checker guarantees every struct field is present.
+                v = self.emit_expr(have[fn_], ctx)
+                self.check(ctx, e)
+                idx, desc, extra = self._ffi_field_llvm_index(
+                    e.name, fn_, have[fn_])
+                if desc == "bits":
+                    self._store_bitfield(sptr, idx, extra, v,
+                                         have[fn_], e, ctx)
+                elif desc == "aggr":
+                    raw = self._marshal_aggr_value(v, extra,
+                                                   have[fn_], ctx)
+                    fp = b.gep(sptr, [self.const_i32(0),
+                                      self.const_i32(idx)],
+                               name="_slit_gep")
+                    b.store(raw, fp)
+                else:
+                    raw = self._marshal_scalar(v, extra, have[fn_],
+                                               ctx)
+                    fp = b.gep(sptr, [self.const_i32(0),
+                                      self.const_i32(idx)],
+                               name="_slit_gep")
+                    b.store(raw, fp)
         return self.call(ctx, "misa_struct_new", [mem], e,
                          check=False)
 
-    def _emit_struct_field(self, e: A.Field, st_name: str, ctx):
-        """`p.x` on a statically-known struct value: GEP + load,
-        boxed back to an MVal*."""
+    def _store_union_field(self, sptr, desc, extra, v, fv_node, e,
+                           ctx):
+        """Store one field of a union literal (memory already zeroed).
+        sptr points at the union's byte array."""
         b = ctx.builder
-        obj = self.emit_expr(e.obj, ctx)
-        self.check(ctx, e)
-        obj = self._ensure_mval(obj, e.obj, ctx)
-        st = self.extern_structs[st_name]
-        idx = next(i for i, (fn_, _) in enumerate(st.fields)
-                   if fn_ == e.field)
-        _, fte = st.fields[idx]
-        raw_ptr = self.call(ctx, "misa_struct_bytes", [obj], e,
-                            check=False)
-        sty = self._ffi_struct_llvm_type(st_name)
-        sptr = b.bitcast(raw_ptr, sty.as_pointer(),
-                         name="_sfield_ptr")
-        fp = b.gep(sptr, [self.const_i32(0), self.const_i32(idx)],
-                   name="_sfield_gep")
-        raw = b.load(fp, name="_sfield")
-        ft = fte.name
+        raw_ptr = b.bitcast(sptr, ir.PointerType(I8), name="_uf_base")
+        if desc == "bits":
+            bit_off, width = extra[1], extra[2]
+            uptr = b.bitcast(raw_ptr, ir.PointerType(I64),
+                             name="_uf_ptr")
+            unit = b.load(uptr, name="_uf_unit")
+            ival = self._bitfield_checked(v, width, fv_node, e, ctx)
+            mask = ((1 << width) - 1) << bit_off
+            cleared = b.and_(
+                unit, self.const_i64(mask ^ 0xFFFFFFFFFFFFFFFF),
+                name="_uf_clr")
+            new = b.or_(cleared, b.shl(ival, self.const_i64(bit_off)),
+                        name="_uf_new")
+            b.store(new, uptr)
+        elif desc == "aggr":
+            nty = self._ffi_struct_llvm_type(extra)
+            fptr = b.bitcast(raw_ptr, nty.as_pointer(),
+                             name="_uf_ptr")
+            raw = self._marshal_aggr_value(v, extra, fv_node, ctx)
+            b.store(raw, fptr)
+        else:  # scalar
+            fty = self._ffi_llvm_type(extra)
+            fptr = b.bitcast(raw_ptr, fty.as_pointer(),
+                             name="_uf_ptr")
+            raw = self._marshal_scalar(v, extra, fv_node, ctx)
+            b.store(raw, fptr)
+
+    def _box_scalar(self, raw, ft, e, ctx):
         if ft == "Int":
             return self.call(ctx, "misa_int", [raw], e, check=False)
         if ft == "Float":
@@ -804,6 +1035,69 @@ class Emitter:
         raise AOTError("E225",
                        f"cannot read struct field of type '{ft}'",
                        e.line, e.col)
+
+    def _emit_struct_field(self, e: A.Field, st_name: str, ctx):
+        """`p.x` on a statically-known aggregate value: GEP + load
+        (structs), bitcast + load (unions), or bit extract
+        (bitfields) — boxed back to an MVal*."""
+        b = ctx.builder
+        obj = self.emit_expr(e.obj, ctx)
+        self.check(ctx, e)
+        obj = self._ensure_mval(obj, e.obj, ctx)
+        st = self.extern_structs[st_name]
+        raw_ptr = self.call(ctx, "misa_struct_bytes", [obj], e,
+                            check=False)
+        sty = self._ffi_struct_llvm_type(st_name)
+        sptr = b.bitcast(raw_ptr, sty.as_pointer(),
+                         name="_sfield_ptr")
+        if st.kind == "union":
+            return self._load_union_field(sptr, st_name, e, ctx)
+        idx, desc, extra = self._ffi_field_llvm_index(st_name, e.field,
+                                                      e)
+        if desc == "bits":
+            bit_off, width = extra
+            uptr = b.gep(sptr, [self.const_i32(0),
+                                self.const_i32(idx)],
+                         name="_bf_gep")
+            unit = b.load(uptr, name="_bf_unit")
+            shr = b.lshr(unit, self.const_i64(bit_off), name="_bf_shr")
+            val = b.and_(shr, self.const_i64((1 << width) - 1),
+                         name="_bf_val")
+            return self.call(ctx, "misa_int", [val], e, check=False)
+        fp = b.gep(sptr, [self.const_i32(0), self.const_i32(idx)],
+                   name="_sfield_gep")
+        raw = b.load(fp, name="_sfield")
+        if desc == "aggr":
+            return self._box_aggr_value(raw, extra, e, ctx)
+        return self._box_scalar(raw, extra, e, ctx)
+
+    def _load_union_field(self, sptr, st_name: str, e: A.Field, ctx):
+        """Field read on a union value (byte array): bitcast to the
+        field type and load; bitfields extract from the unit."""
+        from misa import ffi_layout
+        b = ctx.builder
+        fmap = ffi_layout.field_map(st_name, self.extern_structs)
+        desc, _, extra = fmap[e.field]
+        raw_ptr = b.bitcast(sptr, ir.PointerType(I8), name="_uf_base")
+        if desc == "bits":
+            bit_off, width = extra[1], extra[2]
+            uptr = b.bitcast(raw_ptr, ir.PointerType(I64),
+                             name="_uf_ptr")
+            unit = b.load(uptr, name="_uf_unit")
+            shr = b.lshr(unit, self.const_i64(bit_off), name="_uf_shr")
+            val = b.and_(shr, self.const_i64((1 << width) - 1),
+                         name="_uf_val")
+            return self.call(ctx, "misa_int", [val], e, check=False)
+        if desc == "aggr":
+            nty = self._ffi_struct_llvm_type(extra)
+            fptr = b.bitcast(raw_ptr, nty.as_pointer(),
+                             name="_uf_ptr")
+            return self._box_aggr_value(b.load(fptr, name="_uf"), extra,
+                                        e, ctx)
+        fty = self._ffi_llvm_type(extra)
+        fptr = b.bitcast(raw_ptr, fty.as_pointer(), name="_uf_ptr")
+        return self._box_scalar(b.load(fptr, name="_uf"), extra, e,
+                                ctx)
 
     def emit_extern_call(self, e: A.Call, ctx, name: str):
         """Phase 7: call an extern (FFI) function. Marshals MVal*
@@ -860,9 +1154,7 @@ class Emitter:
         sret_mem = None
         if ret_t in self.extern_structs \
                 and self._ffi_struct_needs_sret(ret_t):
-            st = self.extern_structs[ret_t]
-            size, _ = self._ffi_struct_layout(
-                [(fn_, fte.name) for fn_, fte in st.fields])
+            size = self._ffi_struct_size(ret_t)
             sret_mem = self.call(ctx, "misa_alloc",
                                  [self.const_i64(size)], e, check=False)
             sty = self._ffi_struct_llvm_type(ret_t)
@@ -1590,6 +1882,8 @@ class Emitter:
                     # Phase 5a: heap cell (1-elem list) shared with closures.
                     cell = self.call(ctx, "misa_list_new", [], s,
                                      check=False)
+                    # P-2: box raw i64 for the cell (cells hold MVal*).
+                    v = self._ensure_mval(v, val_node, ctx)
                     self.call(ctx, "misa_list_push", [cell, v], s,
                               check=False)
                     b.store(cell, a)
@@ -2202,7 +2496,10 @@ class Emitter:
                        else "integer modulo by zero")
                 b.call(self.rt["misa_raise"],
                        [self.cstr("E300"), self.cstr(msg), line, col])
-                self.check(ctx, e)
+                # misa_raise always sets the pending error: branch
+                # directly to the handler. (check() would emit a dead,
+                # unterminated "cont" block here — invalid IR.)
+                b.branch(ctx.err_stack[-1])
                 b.position_at_end(c_b)
                 return (b.sdiv if e.op == "/" else b.srem)(
                     l, r, name="iop")
@@ -2695,6 +2992,22 @@ class Emitter:
         if name == "fs.temp_dir":
             return self.call(ctx, "misa_fs_temp_dir",
                              [line, col], e)
+        # Final wave (stdlib): compression.
+        if name == "compress.gzip":
+            return self.call(ctx, "misa_compress_gzip",
+                             [arg(0), line, col], e)
+        if name == "compress.gunzip":
+            return self.call(ctx, "misa_compress_gunzip",
+                             [arg(0), line, col], e)
+        if name == "compress.gunzip_bytes":
+            return self.call(ctx, "misa_compress_gunzip_bytes",
+                             [arg(0), line, col], e)
+        if name == "compress.gzip_file":
+            return self.call(ctx, "misa_compress_gzip_file",
+                             [arg(0), arg(1), line, col], e)
+        if name == "compress.gunzip_file":
+            return self.call(ctx, "misa_compress_gunzip_file",
+                             [arg(0), arg(1), line, col], e)
         if name == "set":
             return self.call(ctx, "misa_set_new", [], e, check=False)
         if name == "set.add":
@@ -3027,6 +3340,8 @@ class Emitter:
         for a in e.args:
             v = self.emit_expr(a, ctx)
             self.check(ctx, e)
+            # P-2: box raw i64 args (closure frames hold MVal*).
+            v = self._ensure_mval(v, a, ctx)
             self.call(ctx, "misa_list_push", [args_list, v], e,
                       check=False)
         fnty = ir.FunctionType(PTR, [PTR, PTR])
@@ -3146,6 +3461,8 @@ class Emitter:
                            e.line, e.col)
         payload = self.emit_expr(e.expr, ctx)
         self.check(ctx, e)
+        # P-2: box raw i64 payloads (interface records hold MVal*).
+        payload = self._ensure_mval(payload, e.expr, ctx)
         r = self.call(ctx, "misa_record_new", [], e, check=False)
         tagv = self.call(ctx, "misa_int", [self.const_i64(tag)], e,
                          check=False)
@@ -3278,6 +3595,8 @@ class Emitter:
         for a in e.args:
             av = self.emit_expr(a, ctx)
             self.check(ctx, e)
+            # P-2: box raw i64 variant args (list payload holds MVal*).
+            av = self._ensure_mval(av, a, ctx)
             self.call(ctx, "misa_list_push", [l, av], e, check=False)
         self.call(ctx, "misa_record_set_cstr",
                   [r, self.cstr(self.SUM_FIELDS), l], e, check=False)

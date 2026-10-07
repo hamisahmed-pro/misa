@@ -435,6 +435,10 @@ def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
             libs.append(os.path.join(gc_dir, "lib", "libgc.a"))
         defines.append("-DMISA_USE_JNI_HTTP")
         libs += ["-llog", "-landroid", "-lm"]  # misa_rt.c uses <math.h>
+        # Final wave (stdlib): the NDK ships zlib, so compress.* works
+        # on Android too (linked at .so link time like -llog).
+        defines.append("-DMISA_USE_ZLIB")
+        libs.append("-lz")
         return defines, cflags + SECTION_CFLAGS, libs
     if target == host_triple():
         vendored_gc_h = os.path.join(DEPS_INCLUDE, "gc.h")
@@ -454,6 +458,13 @@ def runtime_flags(target: str = "", with_ort: bool = False) -> tuple:
         elif _have_header("/usr/include/curl/curl.h"):
             defines.append("-DMISA_USE_CURL")
             libs.append("-lcurl")
+        # Final wave (stdlib): zlib for compress.*. Same graceful
+        # pattern as curl: define + link when the header exists;
+        # otherwise the builtins raise E600 (never a build break).
+        if _have_header("/usr/include/zlib.h"):
+            defines.append("-DMISA_USE_ZLIB")
+            zlib_lib = _find_lib("libz.so*", target)
+            libs.append(zlib_lib if zlib_lib else "-lz")
         # Phase 5 (M2): ONNX Runtime for on-device .onnx inference.
         # The .so is staged next to the output binary; $ORIGIN rpath
         # finds it there at runtime. Only when the program uses it.

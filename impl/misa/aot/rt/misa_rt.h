@@ -45,6 +45,7 @@ enum {
     M_TAG_LISTENER = 18, /* Wave 3: TCP listener (wraps MisaSock*) */
     M_TAG_SET = 19,    /* Wave 3 (stdlib): Set<T> (insertion-ordered) */
     M_TAG_REGEX = 20,  /* Wave 3 (stdlib): compiled regex (MisaRx*) */
+    M_TAG_BYTES = 21,  /* Final wave (stdlib): binary data (compress.*) */
 };
 
 /* Media kinds. */
@@ -248,6 +249,16 @@ MVal *misa_time_weekday(MVal *t, int line, int col);
 MVal *misa_time_is_leap(MVal *y, int line, int col);
 MVal *misa_fs_temp_file(int line, int col);                 /* E303 */
 MVal *misa_fs_temp_dir(int line, int col);                  /* E303 */
+/* Final wave (stdlib): compression. Without zlib (no MISA_USE_ZLIB)
+ * these raise E600; corrupt input is E300, I/O failures E303. */
+MVal *misa_bytes_new(const uint8_t *data, size_t len);
+MVal *misa_compress_gzip(MVal *text, int line, int col);
+MVal *misa_compress_gunzip(MVal *bytes, int line, int col);      /* E300 */
+MVal *misa_compress_gunzip_bytes(MVal *bytes, int line, int col); /* E300 */
+MVal *misa_compress_gzip_file(MVal *path, MVal *out, int line, int col);
+                                                                 /* E303 */
+MVal *misa_compress_gunzip_file(MVal *path, MVal *out, int line, int col);
+                                                                 /* E303/E300 */
 MVal *misa_set_new(void);
 void  misa_set_add(MVal *s, MVal *x, int line, int col);
 MVal *misa_set_contains(MVal *s, MVal *x, int line, int col);

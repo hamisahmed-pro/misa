@@ -218,10 +218,17 @@ class Formatter:
             self.w(f'extern "{item.lib}" {{')
             self.ind += 1
             for st in item.structs:
+                # Overtake final wave: unions and bitfield widths.
+                def _ffmt(fte):
+                    s = self.fmt_type(fte)
+                    if fte.bitfield_width is not None:
+                        s += f":{fte.bitfield_width}"
+                    return s
                 fields = ", ".join(
-                    f"{fn_}: {self.fmt_type(fte)}"
+                    f"{fn_}: {_ffmt(fte)}"
                     for fn_, fte in st.fields)
-                self.w(f"struct {st.name} {{ {fields} }},")
+                kw = "union" if st.kind == "union" else "struct"
+                self.w(f"{kw} {st.name} {{ {fields} }},")
             for fn in item.fns:
                 params = ", ".join(
                     f"{pn}: {self.fmt_type(te)}" for pn, te in fn.params)

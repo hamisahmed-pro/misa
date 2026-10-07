@@ -19,7 +19,9 @@ SPECIAL = {"TokenStream", "Embedding", "Db", "Builder",
            # Wave 3 (networking): TCP socket handles + HTTP types.
            "Socket", "Listener", "Request", "Response",
            # Wave 3 (stdlib): compiled regex handle.
-           "Regex"}
+           "Regex",
+           # Final wave (stdlib): opaque binary data (compress.*).
+           "Bytes"}
 # Phase 7 (concurrency): builtin generic type names, exactly 1 type
 # argument (like List<T>). `Task<Text>`, `Chan<Int>` are valid
 # annotations; bare `Task`/`Chan` is an error (E221, suggesting the
@@ -98,6 +100,14 @@ NS_BUILTINS = {
     "socket.recv": (["Socket", "Int"], "Text"),
     "socket.close": (["Socket"], "Void"),
     "socket.set_timeout": (["Socket", "Int"], "Void"),
+    # Final wave (stdlib): compression. gzip framing is deterministic
+    # (fixed header, level 9) so both backends emit byte-identical
+    # output. gunzip validates UTF-8 (gunzip_bytes for raw bytes).
+    "compress.gzip": (["Text"], "Bytes"),
+    "compress.gunzip": (["Bytes"], "Text"),
+    "compress.gunzip_bytes": (["Bytes"], "Bytes"),
+    "compress.gzip_file": (["Text", "Text"], "Int"),
+    "compress.gunzip_file": (["Text", "Text"], "Int"),
     "http.serve": (["Int", "any"], "Void"),
     "time.now": ([], "Int"),
     "time.now_ms": ([], "Int"),
@@ -198,6 +208,12 @@ BUILTIN_THROWS = {
     "socket.close": frozenset({"E304"}),
     "socket.set_timeout": frozenset({"E304"}),
     "http.serve": frozenset({"E304"}),
+    # Final wave (stdlib): compression. gunzip throws E300 on corrupt
+    # input or non-UTF-8 output; the _file variants add E303 for I/O.
+    "compress.gunzip": frozenset({"E300"}),
+    "compress.gunzip_bytes": frozenset({"E300"}),
+    "compress.gzip_file": frozenset({"E303"}),
+    "compress.gunzip_file": frozenset({"E303", "E300"}),
     # I/O
     "fs.read": frozenset({"E303"}),
     "fs.write": frozenset({"E303"}),
@@ -880,28 +896,67 @@ class Checker:
         return expr
 
     def _check_extern_struct(self, st: ast.StructDecl):
-        """Overtake Wave 2: validate a C-layout struct declaration."""
+        """Overtake Wave 2: validate a C-layout struct declaration.
+
+        Overtake final wave: also validates unions, nested aggregates,
+        and bitfields. Field types may be C scalars (Int, Float, Bool,
+        Ptr) or the name of another declared struct/union. Bitfields
+        (`a: Int:3`) require width 1..64 on an Int field. Cyclic
+        nesting is E225 (C requires complete by-value field types).
+        """
+        from misa import ffi_layout
+        kind = st.kind  # "struct" or "union"
         if st.name in self.fns or st.name in self.externs \
                 or st.name in self.types:
             self.error("E210",
-                       f"extern struct '{st.name}' collides with an "
+                       f"extern {kind} '{st.name}' collides with an "
                        f"existing declaration", st.line, st.col)
+            return
+        if kind == "union" and not st.fields:
+            self.error("E225",
+                       f"extern union '{st.name}' must declare at least "
+                       f"one field", st.line, st.col)
             return
         seen = set()
         for fname, fte in st.fields:
             if fname in seen:
                 self.error("E210",
-                           f"extern struct '{st.name}' has duplicate "
+                           f"extern {kind} '{st.name}' has duplicate "
                            f"field '{fname}'", fte.line, fte.col)
                 continue
             seen.add(fname)
             t = self._tname(fte)
-            if t not in ("Int", "Float", "Bool", "Ptr"):
+            width = fte.bitfield_width
+            if width is not None:
+                if t != "Int":
+                    self.error("E225",
+                               f"extern {kind} '{st.name}': bitfield "
+                               f"'{fname}' must be declared as Int "
+                               f"(got '{t}')", fte.line, fte.col)
+                    continue
+                if not (1 <= width <= 64):
+                    self.error("E225",
+                               f"extern {kind} '{st.name}': bitfield "
+                               f"'{fname}' width must be 1..64 "
+                               f"(got {width})", fte.line, fte.col)
+                    continue
+            elif t not in ("Int", "Float", "Bool", "Ptr") \
+                    and t not in self.extern_structs:
                 self.error("E225",
-                           f"extern struct '{st.name}': field '{fname}' "
-                           f"has type '{t}', which cannot be a C struct "
-                           f"field in v1 (only Int, Float, Bool, Ptr)",
+                           f"extern {kind} '{st.name}': field '{fname}' "
+                           f"has type '{t}', which cannot be a C {kind} "
+                           f"field (only Int, Float, Bool, Ptr, and "
+                           f"declared structs/unions)",
                            fte.line, fte.col)
+                continue
+        # Compute the C layout now: catches unknown nested types and
+        # cyclic nesting with one clean E225 (never a crash later).
+        try:
+            ffi_layout.layout_aggregate(st, self.extern_structs, (st.name,))
+        except ffi_layout.LayoutError as ex:
+            self.error("E225",
+                       f"extern {kind} '{st.name}': {ex}",
+                       st.line, st.col)
 
     def _check_ffi_type(self, te: ast.TypeExpr, fn_name: str,
                         where: str, param: bool = True):
@@ -1135,17 +1190,16 @@ class Checker:
 
     @staticmethod
     def _ffi_struct_size(name: str, structs: dict) -> int:
-        """C layout size for a flat-scalar struct (v1 fields only)."""
-        size_align = {"Int": (8, 8), "Float": (8, 8),
-                      "Bool": (4, 4), "Ptr": (8, 8)}
-        offset, max_align = 0, 1
-        st = structs[name]
-        for _, fte in st.fields:
-            sz, al = size_align[fte.name]
-            offset = (offset + al - 1) // al * al
-            offset += sz
-            max_align = max(max_align, al)
-        return (offset + max_align - 1) // max_align * max_align
+        """C layout size for a struct/union (recursive: nested
+        aggregates, unions, bitfields). Delegates to the canonical
+        layout in misa.ffi_layout (byte-exact vs GCC)."""
+        from misa import ffi_layout
+        try:
+            return ffi_layout.aggregate_size(name, structs)
+        except ffi_layout.LayoutError:
+            # The real error was already reported by
+            # _check_extern_struct; never crash the checker.
+            return 8
 
     def _check_fn(self, fn: ast.FnDecl):
         seen_params = set()
@@ -3327,7 +3381,13 @@ class Checker:
     def _infer_struct_lit(self, e: ast.StructLit, scope: dict) -> str:
         """Overtake Wave 2: check `Point { x: 1.0, y: 2.0 }`. All
         declared fields are required (E211); unknown fields are E101;
-        mistyped fields are E211."""
+        mistyped fields are E211.
+
+        Overtake final wave: union literals may set any subset of
+        fields (writing one union member is the point; unset bytes are
+        zero). Nested aggregate fields take nested literals
+        (`Outer { p: Point { x: 1.0, y: 2.0 }, n: 5 }`).
+        """
         st = self.extern_structs.get(e.name)
         if st is None:
             self.error("E101", f"unknown struct '{e.name}'",
@@ -3338,25 +3398,26 @@ class Checker:
         for fname, fv in e.fields:
             if fname not in want:
                 self.error("E101",
-                           f"struct '{e.name}' has no field '{fname}'",
+                           f"{st.kind} '{e.name}' has no field '{fname}'",
                            fv.line, fv.col)
                 continue
             if fname in seen:
                 self.error("E210",
-                           f"duplicate field '{fname}' in struct "
+                           f"duplicate field '{fname}' in {st.kind} "
                            f"'{e.name}' literal", fv.line, fv.col)
                 continue
             seen.add(fname)
             vt = self._infer(fv, scope)
             if vt != "unknown" and not self._assignable(want[fname], vt):
                 self.error("E211",
-                           f"struct '{e.name}' field '{fname}' wants "
+                           f"{st.kind} '{e.name}' field '{fname}' wants "
                            f"{want[fname]}, got {vt}", fv.line, fv.col)
-        for fname in want:
-            if fname not in seen:
-                self.error("E211",
-                           f"struct '{e.name}' literal is missing field "
-                           f"'{fname}'", e.line, e.col)
+        if st.kind != "union":
+            for fname in want:
+                if fname not in seen:
+                    self.error("E211",
+                               f"struct '{e.name}' literal is missing field "
+                               f"'{fname}'", e.line, e.col)
         return e.name
 
     def _known_type(self, te: Optional[ast.TypeExpr]) -> bool:

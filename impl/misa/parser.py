@@ -879,6 +879,10 @@ class Parser:
         (`struct Point { x: Float, y: Float }`, contextual keyword —
         `struct` stays a plain identifier everywhere else), and
         function signatures may end params with `...` for C varargs.
+
+        Overtake final wave: `union Value { i: Int, f: Float }`
+        (same contextual-keyword treatment) and bitfield widths
+        (`a: Int:3`) on struct/union fields.
         """
         t = self.expect("extern", "'extern'")
         lib_tok = self.expect("STRING", "library name string")
@@ -889,9 +893,10 @@ class Parser:
         self.skip_semis()
         while not self.at("}"):
             pk = self.peek()
-            if pk.kind == "IDENT" and pk.value == "struct" \
+            if pk.kind == "IDENT" and pk.value in ("struct", "union") \
                     and self.peek(1).kind == "IDENT":
-                structs.append(self.parse_extern_struct())
+                structs.append(self.parse_extern_struct(
+                    union=(pk.value == "union")))
             else:
                 fns.append(self.parse_extern_fn())
             if self.at(","):
@@ -933,10 +938,15 @@ class Parser:
         return ast.StructLit(name=name, fields=fields,
                              line=t.line, col=t.col)
 
-    def parse_extern_struct(self) -> ast.StructDecl:
-        """`struct Point { x: Float, y: Float }` inside an extern block."""
-        t = self.expect_ident("'struct'")
-        name = self.expect_ident("struct name").value
+    def parse_extern_struct(self, union=False) -> ast.StructDecl:
+        """`struct Point { x: Float, y: Float }` inside an extern block.
+
+        Overtake final wave: `union Value { i: Int, f: Float }` when
+        union=True, and bitfield widths (`a: Int:3`) on fields.
+        """
+        kw = "union" if union else "struct"
+        t = self.expect_ident("'%s'" % kw)
+        name = self.expect_ident("aggregate name").value
         self.expect("{", "'{'")
         fields = []
         self.skip_semis()
@@ -944,12 +954,24 @@ class Parser:
             fn_tok = self.expect_ident("field name")
             self.expect(":", "':'")
             te = self.parse_type_expr()
+            # Overtake final wave: optional bitfield width `a: Int:3`.
+            # After a type expression, `:` here can only start a width
+            # (the next field begins with an identifier).
+            if self.at(":"):
+                self.advance()
+                wtok = self.expect("INT", "bitfield width")
+                try:
+                    te.bitfield_width = int(wtok.value)
+                except ValueError:
+                    raise ParseError("bitfield width must be an integer",
+                                     wtok.line, wtok.col)
             fields.append((fn_tok.value, te))
             if self.at(","):
                 self.advance()
             self.skip_semis()
         self.expect("}", "'}'")
         return ast.StructDecl(name=name, fields=fields,
+                              kind=("union" if union else "struct"),
                               line=t.line, col=t.col)
 
     def parse_extern_fn(self) -> ast.FnDecl:

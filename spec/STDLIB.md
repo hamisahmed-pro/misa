@@ -301,6 +301,28 @@ identical on both backends.
 | `set.to_list` | `set.to_list(s: Set<T>) -> [T]` | Elements in insertion order. |
 | `set.len` | `set.len(s: Set<T>) -> Int` | Element count. `len(s)` also works. |
 
+## 3l. Compression (`compress` namespace) — Final wave
+
+gzip compression backed by zlib (AOT) / `zlib` (interpreter). Framing is
+fully deterministic — fixed 10-byte header (`mtime=0`), raw deflate at
+level 9, CRC32 + ISIZE trailer — so both backends emit **byte-identical**
+output (verified: `gzip.compress(..., compresslevel=9, mtime=0)` parity).
+
+Compressed data lives in the `Bytes` type: an opaque binary buffer.
+`Bytes` supports `len(b)`, `==`/`!=` (byte-wise), and renders as
+`<bytes: N>`. There is deliberately no indexing/slicing in v1.
+
+| Function | Signature | Description |
+|---|---|---|
+| `compress.gzip` | `compress.gzip(data: Text) -> Bytes` | gzip the UTF-8 bytes of `data`. |
+| `compress.gunzip` | `compress.gunzip(data: Bytes) -> Text throws E300` | Decompress; `E300` on corrupt input or non-UTF-8 output (use `gunzip_bytes` for binary). |
+| `compress.gunzip_bytes` | `compress.gunzip_bytes(data: Bytes) -> Bytes throws E300` | Decompress to raw bytes; `E300` on corrupt input. |
+| `compress.gzip_file` | `compress.gzip_file(path: Text, out: Text) -> Int throws E303` | Stream-compress file to file (constant memory); returns compressed size. |
+| `compress.gunzip_file` | `compress.gunzip_file(path: Text, out: Text) -> Int throws E303, E300` | Stream-decompress file to file; returns decompressed size. |
+
+Without zlib on the target (e.g. web), all five raise `E600` — never a
+build break. Android links the NDK's zlib.
+
 ## 4. Maps
 
 `Map<K, V>` with `K` = `Text` or `Int`:

@@ -56,6 +56,8 @@ struct MVal {
         struct { MVal **items; int64_t len, cap; } set;
         /* Wave 3 (stdlib): M_TAG_REGEX — compiled pattern + source. */
         struct { void *rx; char *pattern; } regex;
+        /* Final wave (stdlib): M_TAG_BYTES — raw byte buffer. */
+        struct { uint8_t *data; size_t len; } bytes;
     } u;
 };
 
@@ -687,6 +689,13 @@ static void render_into(Str *s, MVal *v) {
         str_puts(s, ">");
         break;
     }
+    case M_TAG_BYTES: {
+        /* Render like the interpreter: <bytes: N>. */
+        char buf[48];
+        snprintf(buf, sizeof buf, "<bytes: %zu>", v->u.bytes.len);
+        str_puts(s, buf);
+        break;
+    }
     default: str_puts(s, "<value>"); break;
     }
 }
@@ -908,6 +917,10 @@ static int val_equal(MVal *a, MVal *b) {
     case M_TAG_TEXT:
         return a->u.text.len == b->u.text.len &&
                memcmp(a->u.text.data, b->u.text.data, a->u.text.len) == 0;
+    case M_TAG_BYTES:
+        return a->u.bytes.len == b->u.bytes.len &&
+               memcmp(a->u.bytes.data, b->u.bytes.data,
+                      a->u.bytes.len) == 0;
     case M_TAG_LIST: {
         if (a->u.list.len != b->u.list.len) return 0;
         for (int64_t i = 0; i < a->u.list.len; i++)
@@ -1007,8 +1020,10 @@ int64_t misa_len(MVal *v, int line, int col) {
     case M_TAG_MAP:    return v->u.map.len;
     case M_TAG_RECORD: return v->u.record.len;
     case M_TAG_SET:    return v->u.set.len;
+    case M_TAG_BYTES:  return (int64_t)v->u.bytes.len;
     default:
-        misa_raise("E300", "len() needs text, list, map, set, or record", line, col);
+        misa_raise("E300", "len() needs text, list, map, set, bytes, "
+                           "or record", line, col);
         return 0;
     }
 }
@@ -3234,6 +3249,449 @@ MVal *misa_fs_temp_dir(int line, int col) {
     }
     return misa_text_cstr(tmpl);
 }
+
+/* -- Compression: gzip via zlib ------------------------------------
+ *
+ * Framing is manual (raw deflate + explicit header/trailer) so every
+ * byte is deterministic: header 1f 8b 08 00 00000000 02 03
+ * (mtime=0, XFL=max, OS=Unix), level 9. This is byte-identical to the
+ * interpreter (`gzip.compress(..., compresslevel=9, mtime=0)`).
+ * Without MISA_USE_ZLIB the entry points raise E600 (clean, like the
+ * web target's other unavailable natives).
+ */
+
+MVal *misa_bytes_new(const uint8_t *data, size_t len) {
+    MVal *v = val_new(M_TAG_BYTES);
+    uint8_t *buf = (uint8_t *)misa_alloc(len ? len : 1);
+    if (len) memcpy(buf, data, len);
+    v->u.bytes.data = buf;
+    v->u.bytes.len = len;
+    return v;
+}
+
+#ifdef MISA_USE_ZLIB
+#include <zlib.h>
+
+/* Fixed 10-byte gzip header: magic, CM=deflate, FLG=0, MTIME=0,
+ * XFL=2 (max compression), OS=3 (Unix). */
+static const uint8_t GZ_HDR[10] =
+    {0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03};
+
+static void put_u32le(uint8_t *p, uint32_t x) {
+    p[0] = (uint8_t)x;         p[1] = (uint8_t)(x >> 8);
+    p[2] = (uint8_t)(x >> 16); p[3] = (uint8_t)(x >> 24);
+}
+
+/* Strict UTF-8 validation (matches Python's bytes.decode('utf-8')). */
+static int utf8_validate(const uint8_t *d, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = d[i];
+        uint32_t cp;
+        size_t w;
+        if (c < 0x80) { w = 1; }
+        else if ((c & 0xE0) == 0xC0) { w = 2; }
+        else if ((c & 0xF0) == 0xE0) { w = 3; }
+        else if ((c & 0xF8) == 0xF0) { w = 4; }
+        else return 0;
+        if (i + w > n) return 0;
+        for (size_t k = 1; k < w; k++)
+            if ((d[i + k] & 0xC0) != 0x80) return 0;
+        cp = c & (w == 1 ? 0x7F : w == 2 ? 0x1F : w == 3 ? 0x0F : 0x07);
+        for (size_t k = 1; k < w; k++)
+            cp = (cp << 6) | (d[i + k] & 0x3F);
+        if ((w == 2 && cp < 0x80) || (w == 3 && cp < 0x800) ||
+            (w == 4 && cp < 0x10000) || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
+        i += w;
+    }
+    return 1;
+}
+
+/* Streaming gzip encoder: manual header, raw deflate, CRC32+ISIZE
+ * trailer. Output goes through a sink so file variants stream. */
+typedef struct {
+    z_stream strm;
+    void *sink_ctx;
+    void (*sink)(void *ctx, const uint8_t *data, size_t len);
+    uint32_t crc;
+    uint32_t isize;
+    int line, col;
+    int ok;
+} GzEnc;
+
+static void gzenc_init(GzEnc *g, void *sink_ctx,
+                       void (*sink)(void *, const uint8_t *, size_t),
+                       int line, int col) {
+    memset(g, 0, sizeof *g);
+    g->sink_ctx = sink_ctx;
+    g->sink = sink;
+    g->line = line; g->col = col;
+    g->ok = 1;
+    g->crc = crc32(0L, Z_NULL, 0);
+    sink(sink_ctx, GZ_HDR, sizeof GZ_HDR);
+    if (deflateInit2(&g->strm, Z_BEST_COMPRESSION, Z_DEFLATED,
+                     -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        misa_raise("E300", "compress.gzip failed: deflate init error",
+                   line, col);
+        g->ok = 0;
+    }
+}
+
+static void gzenc_write(GzEnc *g, const uint8_t *data, size_t len) {
+    uint8_t buf[65536];
+    if (!g->ok) return;
+    while (len > 0) {
+        uInt chunk = len > 65536 ? 65536 : (uInt)len;
+        g->crc = crc32(g->crc, data, chunk);
+        g->isize += chunk;
+        g->strm.next_in = (Bytef *)data;
+        g->strm.avail_in = chunk;
+        data += chunk;
+        len -= chunk;
+        int ret;
+        do {
+            g->strm.next_out = buf;
+            g->strm.avail_out = sizeof buf;
+            ret = deflate(&g->strm, Z_NO_FLUSH);
+            if (ret != Z_OK) {
+                deflateEnd(&g->strm);
+                misa_raise("E300", "compress.gzip failed: deflate error",
+                           g->line, g->col);
+                g->ok = 0;
+                return;
+            }
+            g->sink(g->sink_ctx, buf, sizeof buf - g->strm.avail_out);
+        } while (g->strm.avail_out == 0);
+    }
+}
+
+static void gzenc_finish(GzEnc *g) {
+    uint8_t buf[65536];
+    uint8_t trailer[8];
+    int ret;
+    if (!g->ok) return;
+    do {
+        g->strm.next_out = buf;
+        g->strm.avail_out = sizeof buf;
+        ret = deflate(&g->strm, Z_FINISH);
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            deflateEnd(&g->strm);
+            misa_raise("E300", "compress.gzip failed: deflate error",
+                       g->line, g->col);
+            g->ok = 0;
+            return;
+        }
+        g->sink(g->sink_ctx, buf, sizeof buf - g->strm.avail_out);
+    } while (ret != Z_STREAM_END);
+    deflateEnd(&g->strm);
+    put_u32le(trailer, g->crc);
+    put_u32le(trailer + 4, g->isize);
+    g->sink(g->sink_ctx, trailer, sizeof trailer);
+}
+
+static void str_sink(void *ctx, const uint8_t *data, size_t len) {
+    str_putn((Str *)ctx, (const char *)data, len);
+}
+
+/* Inflate a gzip (or zlib) stream into `out`. Returns 1 on success. */
+static int gz_inflate_all(const uint8_t *in, size_t len, Str *out,
+                          const char *what, int line, int col) {
+    z_stream strm;
+    uint8_t buf[65536];
+    size_t off = 0;
+    int ret;
+    memset(&strm, 0, sizeof strm);
+    /* 47 = auto-detect gzip/zlib wrapper. */
+    if (inflateInit2(&strm, 47) != Z_OK) {
+        misa_raise("E300", "decompression failed: inflate init error",
+                   line, col);
+        return 0;
+    }
+    ret = Z_OK;
+    while (ret == Z_OK) {
+        if (strm.avail_in == 0 && off < len) {
+            uInt chunk =
+                (len - off) > 65536 ? 65536 : (uInt)(len - off);
+            strm.next_in = (Bytef *)(in + off);
+            strm.avail_in = chunk;
+            off += chunk;
+        }
+        strm.next_out = buf;
+        strm.avail_out = sizeof buf;
+        ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            inflateEnd(&strm);
+            misa_raise_fmt("E300", line, col,
+                           "%s failed: corrupt gzip data (%s)", what,
+                           strm.msg ? strm.msg : "inflate error");
+            return 0;
+        }
+        str_putn(out, (char *)buf, sizeof buf - strm.avail_out);
+        if (ret == Z_STREAM_END) break;
+        if (strm.avail_in == 0 && off >= len) {
+            inflateEnd(&strm);
+            misa_raise_fmt("E300", line, col,
+                           "%s failed: truncated gzip data", what);
+            return 0;
+        }
+    }
+    inflateEnd(&strm);
+    return 1;
+}
+
+MVal *misa_compress_gzip(MVal *text, int line, int col) {
+    Str out = {0};
+    GzEnc g;
+    if (text->tag != M_TAG_TEXT) {
+        misa_raise("E200", "compress.gzip(Text) needs a text arg",
+                   line, col);
+        return NULL;
+    }
+    gzenc_init(&g, &out, str_sink, line, col);
+    gzenc_write(&g, (const uint8_t *)text->u.text.data,
+                text->u.text.len);
+    gzenc_finish(&g);
+    if (!g.ok) return NULL;
+    return misa_bytes_new((const uint8_t *)out.buf, out.len);
+}
+
+MVal *misa_compress_gunzip(MVal *bytes, int line, int col) {
+    Str out = {0};
+    if (bytes->tag != M_TAG_BYTES) {
+        misa_raise("E200", "compress.gunzip(Bytes) needs a bytes arg",
+                   line, col);
+        return NULL;
+    }
+    if (!gz_inflate_all(bytes->u.bytes.data, bytes->u.bytes.len, &out,
+                        "compress.gunzip", line, col))
+        return NULL;
+    if (!utf8_validate((const uint8_t *)out.buf, out.len)) {
+        misa_raise("E300", "compress.gunzip failed: output is not UTF-8 "
+                           "text (use compress.gunzip_bytes for binary "
+                           "data)", line, col);
+        return NULL;
+    }
+    return misa_text(out.buf ? out.buf : "", out.len);
+}
+
+MVal *misa_compress_gunzip_bytes(MVal *bytes, int line, int col) {
+    Str out = {0};
+    if (bytes->tag != M_TAG_BYTES) {
+        misa_raise("E200",
+                   "compress.gunzip_bytes(Bytes) needs a bytes arg",
+                   line, col);
+        return NULL;
+    }
+    if (!gz_inflate_all(bytes->u.bytes.data, bytes->u.bytes.len, &out,
+                        "compress.gunzip_bytes", line, col))
+        return NULL;
+    return misa_bytes_new((const uint8_t *)out.buf, out.len);
+}
+
+static void file_sink(void *ctx, const uint8_t *data, size_t len) {
+    fwrite(data, 1, len, (FILE *)ctx);
+}
+
+MVal *misa_compress_gzip_file(MVal *path, MVal *outpath,
+                              int line, int col) {
+    uint8_t buf[65536];
+    size_t n;
+    long total = 0;
+    FILE *fin, *fout;
+    GzEnc g;
+    char mp[4096], mo[4096];
+    if (path->tag != M_TAG_TEXT || outpath->tag != M_TAG_TEXT) {
+        misa_raise("E200",
+                   "compress.gzip_file(Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    if (!misa_platform_fs_path(misa_text_z(path), mp, sizeof mp) ||
+        !misa_platform_fs_path(misa_text_z(outpath), mo, sizeof mo)) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gzip_file failed: cannot map path");
+        return NULL;
+    }
+    fin = fopen(mp, "rb");
+    if (!fin) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gzip_file failed: cannot open '%s'",
+                       misa_text_z(path));
+        return NULL;
+    }
+    fout = fopen(mo, "wb");
+    if (!fout) {
+        fclose(fin);
+        misa_raise_fmt("E303", line, col,
+                       "compress.gzip_file failed: cannot open '%s'",
+                       misa_text_z(outpath));
+        return NULL;
+    }
+    gzenc_init(&g, fout, file_sink, line, col);
+    while (g.ok && (n = fread(buf, 1, sizeof buf, fin)) > 0)
+        gzenc_write(&g, buf, n);
+    if (g.ok && ferror(fin)) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gzip_file failed: error reading '%s'",
+                       misa_text_z(path));
+        g.ok = 0;
+    }
+    gzenc_finish(&g);
+    if (g.ok && ferror(fout)) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gzip_file failed: error writing '%s'",
+                       misa_text_z(outpath));
+        g.ok = 0;
+    }
+    fclose(fin);
+    fclose(fout);
+    if (!g.ok) return NULL;
+    fout = fopen(mo, "rb");
+    if (fout) {
+        fseek(fout, 0, SEEK_END);
+        total = ftell(fout);
+        fclose(fout);
+    }
+    return misa_int(total);
+}
+
+MVal *misa_compress_gunzip_file(MVal *path, MVal *outpath,
+                                int line, int col) {
+    uint8_t inbuf[65536], outbuf[65536];
+    size_t n;
+    long total = 0;
+    FILE *fin, *fout;
+    z_stream strm;
+    int ret = Z_OK;
+    char mp[4096], mo[4096];
+    if (path->tag != M_TAG_TEXT || outpath->tag != M_TAG_TEXT) {
+        misa_raise("E200",
+                   "compress.gunzip_file(Text, Text) needs text args",
+                   line, col);
+        return NULL;
+    }
+    if (!misa_platform_fs_path(misa_text_z(path), mp, sizeof mp) ||
+        !misa_platform_fs_path(misa_text_z(outpath), mo, sizeof mo)) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gunzip_file failed: cannot map path");
+        return NULL;
+    }
+    fin = fopen(mp, "rb");
+    if (!fin) {
+        misa_raise_fmt("E303", line, col,
+                       "compress.gunzip_file failed: cannot open '%s'",
+                       misa_text_z(path));
+        return NULL;
+    }
+    fout = fopen(mo, "wb");
+    if (!fout) {
+        fclose(fin);
+        misa_raise_fmt("E303", line, col,
+                       "compress.gunzip_file failed: cannot open '%s'",
+                       misa_text_z(outpath));
+        return NULL;
+    }
+    memset(&strm, 0, sizeof strm);
+    if (inflateInit2(&strm, 47) != Z_OK) {
+        fclose(fin);
+        fclose(fout);
+        misa_raise("E300",
+                   "compress.gunzip_file failed: inflate init error",
+                   line, col);
+        return NULL;
+    }
+    while (ret == Z_OK) {
+        if (strm.avail_in == 0) {
+            n = fread(inbuf, 1, sizeof inbuf, fin);
+            if (ferror(fin)) {
+                inflateEnd(&strm);
+                fclose(fin);
+                fclose(fout);
+                misa_raise_fmt("E303", line, col,
+                               "compress.gunzip_file failed: error "
+                               "reading '%s'", misa_text_z(path));
+                return NULL;
+            }
+            if (n == 0) break;
+            strm.next_in = inbuf;
+            strm.avail_in = (uInt)n;
+        }
+        strm.next_out = outbuf;
+        strm.avail_out = sizeof outbuf;
+        ret = inflate(&strm, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) {
+            inflateEnd(&strm);
+            fclose(fin);
+            fclose(fout);
+            misa_raise_fmt("E300", line, col,
+                           "compress.gunzip_file failed: corrupt gzip "
+                           "data (%s)",
+                           strm.msg ? strm.msg : "inflate error");
+            return NULL;
+        }
+        if (sizeof outbuf - strm.avail_out > 0) {
+            fwrite(outbuf, 1, sizeof outbuf - strm.avail_out, fout);
+            total += (long)(sizeof outbuf - strm.avail_out);
+        }
+        if (ret == Z_STREAM_END) break;
+    }
+    if (ret != Z_STREAM_END) {
+        inflateEnd(&strm);
+        fclose(fin);
+        fclose(fout);
+        misa_raise_fmt("E300", line, col,
+                       "compress.gunzip_file failed: truncated gzip data");
+        return NULL;
+    }
+    inflateEnd(&strm);
+    if (ferror(fout)) {
+        fclose(fin);
+        fclose(fout);
+        misa_raise_fmt("E303", line, col,
+                       "compress.gunzip_file failed: error writing '%s'",
+                       misa_text_z(outpath));
+        return NULL;
+    }
+    fclose(fin);
+    fclose(fout);
+    return misa_int(total);
+}
+
+#else /* !MISA_USE_ZLIB */
+
+MVal *misa_compress_gzip(MVal *t, int line, int col) {
+    (void)t;
+    misa_raise("E600", "compress.gzip needs zlib "
+                       "(not available on this target)", line, col);
+    return NULL;
+}
+MVal *misa_compress_gunzip(MVal *b, int line, int col) {
+    (void)b;
+    misa_raise("E600", "compress.gunzip needs zlib "
+                       "(not available on this target)", line, col);
+    return NULL;
+}
+MVal *misa_compress_gunzip_bytes(MVal *b, int line, int col) {
+    (void)b;
+    misa_raise("E600", "compress.gunzip_bytes needs zlib "
+                       "(not available on this target)", line, col);
+    return NULL;
+}
+MVal *misa_compress_gzip_file(MVal *p, MVal *o, int line, int col) {
+    (void)p; (void)o;
+    misa_raise("E600", "compress.gzip_file needs zlib "
+                       "(not available on this target)", line, col);
+    return NULL;
+}
+MVal *misa_compress_gunzip_file(MVal *p, MVal *o, int line, int col) {
+    (void)p; (void)o;
+    misa_raise("E600", "compress.gunzip_file needs zlib "
+                       "(not available on this target)", line, col);
+    return NULL;
+}
+
+#endif /* MISA_USE_ZLIB */
 
 /* -- Set<T>: insertion-ordered, val_equal membership (v1: O(n)) ----- */
 

@@ -1,0 +1,32 @@
+// a30_compress.misa — Final wave compression parity.
+// Both backends must print byte-identical output. gzip framing is
+// deterministic (fixed header, level 9), so compressed lengths and
+// round-trips agree exactly.
+let b = compress.gzip("hello world")
+print(len(b))
+print(b)
+print(compress.gunzip(b))
+print(compress.gzip("hello world") == b)
+print(compress.gzip("hello world") != b)
+
+fn rt() -> Text throws E300 {
+  let t = "The quick brown fox. The quick brown fox."
+  let c = compress.gzip(t)
+  print(len(c))
+  print(compress.gunzip(c) == t)
+  print(len(compress.gunzip_bytes(c)))
+  return compress.gunzip(c)
+}
+print(rt())
+
+// corrupt input: gunzip_bytes(gzip("hi")) is raw b"hi", not gzip.
+fn bad() -> Text throws E300 {
+  let raw = compress.gunzip_bytes(compress.gzip("hi"))
+  return compress.gunzip(raw)
+}
+try {
+  print(bad())
+} catch e {
+  print("caught: " + e.code)
+}
+print("done")

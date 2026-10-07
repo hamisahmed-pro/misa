@@ -1,0 +1,52 @@
+// a30_ffi3: Overtake final wave FFI — nested structs, unions, bitfields.
+// Byte-identical on interpreter vs `misa build` (host).
+// Requires /tmp/misa_ffi_helpers.so (compiled by run_aot_tests.py
+// from tests/ffi_helpers.c).
+extern "/tmp/misa_ffi_helpers.so" {
+  struct Point { x: Int, y: Int },
+  struct Outer { tag: Bool, p: Point, n: Int },
+  union Value { i: Int, f: Float },
+  struct Bits { a: Int:3, b: Int:5, c: Int:20, d: Int, e: Int:9 },
+  fn ffi_outer_add(o: Outer, k: Int) -> Outer,
+  fn ffi_outer_tag(o: Outer) -> Int,
+  fn ffi_value_as_f(v: Value) -> Float,
+  fn ffi_value_as_i(v: Value) -> Int,
+  fn ffi_value_from_i(i: Int) -> Value,
+  fn ffi_bits_sum(b: Bits) -> Int,
+  fn ffi_bits_d(b: Bits) -> Int,
+  fn ffi_bits_e(b: Bits) -> Int,
+  fn ffi_bits_word0(b: Bits) -> Int,
+}
+
+// Nested struct: literal, chained field access, padding layout.
+let o = Outer { tag: true, p: Point { x: 3, y: 4 }, n: 5 }
+print(o.p.x)
+print(o.p.y)
+print(o.n)
+print(o.tag)
+
+// Nested struct by value through C (padding-sensitive: tag is 4 bytes,
+// Point must start at offset 8).
+let o2 = ffi_outer_add(o, 10)
+print("{o2.p.x} {o2.p.y} {o2.n}")
+print(ffi_outer_tag(o2))
+
+// Union: write one member, read another (reinterpretation).
+let v = Value { i: 42 }
+print(v.i)
+print(ffi_value_as_i(v))
+let vf = ffi_value_from_i(4609434218613702656)
+print(vf.f)
+print(ffi_value_as_f(Value { f: 2.5 }))
+
+// Bitfields: pack/unpack, cross-checked against C.
+let b = Bits { a: 5, b: 17, c: 703710, d: -7, e: 511 }
+print(b.a)
+print(b.b)
+print(b.c)
+print(b.d)
+print(b.e)
+print(ffi_bits_sum(b))
+print(ffi_bits_d(b))
+print(ffi_bits_e(b))
+print(ffi_bits_word0(b))

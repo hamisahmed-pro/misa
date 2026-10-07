@@ -300,6 +300,35 @@ print(crypto.sha256("hello"))  // 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa742
 Self-contained C in the AOT runtime (no OpenSSL); `hashlib` in the
 interpreter. Digests agree bit-for-bit. All platforms ✅.
 
+## `compress` — gzip
+
+| Function | Signature |
+|---|---|
+| `compress.gzip` | `compress.gzip(data: Text) -> Bytes` |
+| `compress.gunzip` | `compress.gunzip(data: Bytes) -> Text throws E300` |
+| `compress.gunzip_bytes` | `compress.gunzip_bytes(data: Bytes) -> Bytes throws E300` |
+| `compress.gzip_file` | `compress.gzip_file(path: Text, out: Text) -> Int throws E303` |
+| `compress.gunzip_file` | `compress.gunzip_file(path: Text, out: Text) -> Int throws E303, E300` |
+
+```misa
+let b = compress.gzip("hello world")  // <bytes: 31>
+print(len(b))                          // 31
+print(compress.gunzip(b))              // hello world
+
+// files stream in constant memory; returns byte counts
+let n = compress.gzip_file("big.txt", "big.txt.gz")
+let m = compress.gunzip_file("big.txt.gz", "big.back.txt")
+```
+
+Compressed data lives in the `Bytes` type: an opaque binary buffer with
+`len(b)`, `==`/`!=` (byte-wise), rendering as `<bytes: N>`. Corrupt input
+is a catchable `E300` (never a crash); `gunzip` additionally requires
+UTF-8 output (`E300` otherwise — use `gunzip_bytes` for binary data).
+
+Framing is fully deterministic (fixed header, level 9), so both backends
+emit **byte-identical** output. zlib-backed on host/Android; targets
+without zlib (web) raise `E600`.
+
 ## `random` — seeded PRNG
 
 | Function | Signature |

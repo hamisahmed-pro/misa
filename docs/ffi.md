@@ -73,10 +73,11 @@ print(p.x)                          // 3.0 — field read
 print(hypot(p.x, p.y))              // 5.0
 ```
 
-- Field types in v1: `Int`, `Float`, `Bool`, `Ptr` only (anything
-  else is E225). In particular `Int` fields are C `long` (64-bit) —
-  a C struct with 32-bit `int` fields does **not** match; write a
-  shim with `int64_t` fields or pass the struct by pointer.
+- Field types: `Int`, `Float`, `Bool`, `Ptr`, plus **nested
+  structs/unions** and **`Int` bitfields** (`a: Int:3`). In particular
+  `Int` fields are C `long` (64-bit) — a C struct with 32-bit `int`
+  fields does **not** match; write a shim with `int64_t` fields or
+  pass the struct by pointer.
 - Construction requires every field (`Point { x: 1.0 }` is E211);
   unknown fields are E101; mistyped fields are E211.
 - Structs cross by value with the platform C ABI (≤16-byte structs
@@ -85,6 +86,70 @@ print(hypot(p.x, p.y))              // 5.0
 - The library string may be a direct shared-object path
   (`extern "/tmp/mylib.so" { ... }`), which the interpreter loads
   with `dlopen` and AOT links directly — handy for test shims.
+
+### Nested structs
+
+A struct field may be another `extern` struct — layout follows C
+rules exactly (alignment padding included), verified byte-for-byte
+against GCC in the test suite:
+
+```misa
+extern "c" {
+    struct Point { x: Int, y: Int },
+    struct Outer { tag: Bool, p: Point, n: Int },
+}
+
+let o = Outer { tag: true, p: Point { x: 3, y: 4 }, n: 5 }
+print(o.p.x)   // 3 — chained field access
+```
+
+Cyclic nesting (`struct A { b: B }` / `struct B { a: A }`) is E225 —
+C requires complete by-value types.
+
+### Unions
+
+`union` declares a C union: every field starts at offset 0, and all
+fields share the same memory. Writing one field and reading another
+reinterprets the bits, exactly like C:
+
+```misa
+extern "c" {
+    union Value { i: Int, f: Float },
+}
+
+let v = Value { i: 42 }
+print(v.i)   // 42
+```
+
+- A union literal may set **any subset** of fields (`Value { i: 1 }`;
+  unset bytes are zero).
+- Reading a field reinterprets whatever was last written — including
+  values returned from C.
+- At the FFI boundary, unions are coerced to the platform's register
+  classes (verified against `gcc -S`: an `{Int, Float}` union crosses
+  in one integer register, an all-`Float` union in an SSE register).
+
+### Bitfields
+
+`field: Int:N` (1 ≤ N ≤ 64) declares an unsigned C bitfield. Fields
+pack into 8-byte units, little-endian (bit 0 = LSB), never straddling
+a unit — the same rules GCC uses, verified bit-for-bit in the test
+suite:
+
+```misa
+extern "c" {
+    struct Flags { a: Int:3, b: Int:5, mode: Int },
+}
+
+let f = Flags { a: 5, b: 17, mode: 1 }
+print(f.a)   // 5
+```
+
+- Bitfields are **unsigned**: values range `0 .. 2^N - 1`. An
+  out-of-range construction value is a catchable **E300** (both
+  backends); widths outside 1–64 and non-`Int` bitfields are E225.
+- Bitfields are little-endian only in v1 (all Misa targets are
+  little-endian: x86-64, AArch64, ARMv7, wasm32).
 
 ## Callbacks: Misa closures as C function pointers
 
@@ -194,8 +259,8 @@ backends, but it *will* bite you if you test `< 0` or compare with
 ## Limitations
 
 - No C++ name mangling, no automatic header binding.
-- Struct fields: `Int`/`Float`/`Bool`/`Ptr` only in v1 (no `Text`
-  fields, no nested structs — E225).
+- Struct fields: `Int`/`Float`/`Bool`/`Ptr`, nested structs/unions,
+  and `Int` bitfields (no `Text` fields — E225).
 - Callbacks: scalar signatures only in v1; valid only during the
   extern call; errors inside callbacks abort.
 - Varargs: structs over 16 bytes are E225.

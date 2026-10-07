@@ -15,7 +15,71 @@ Comparison artifacts live in `bench/compare/`:
 
 ---
 
-## 1. Misa vs Python
+## Post-overtake update (2026-10-07)
+
+All numbers below re-measured 2026-10-07 on the current tree (404/404 +
+33/33). Sections 1–5 are the original 2026-10-06 comparisons, kept as
+the historical record.
+
+### vs Python — the compute story flipped
+
+| Benchmark (best of 3) | Misa AOT | Python 3.12 | Verdict |
+|---|---|---|---|
+| fib(35) | **0.221 s** | 1.95 s | **Misa 8.8× faster** (was 8.5× slower) |
+| 10M-int loop | **0.268 s** | 1.35 s | **Misa 5.0× faster** (was 3.7× slower) |
+| 100k concat (`Text.Builder`) | 0.045 s | 0.036 s (`"".join`) | **Parity** (1.25× slower; was 75× slower) |
+| JSON parse+traverse | **0.051 s** | 0.058 s | **Misa 1.14× faster** (was 1.2× slower) |
+| SQLite 10k inserts | **0.032 s** | 0.049 s | **Misa 1.5× faster** (was 12–26× slower) |
+| startup | **9 ms** | 25 ms | **Misa ~3× faster** |
+
+Misa now beats Python on 4 of 6 compute benchmarks and ties on the
+fifth. The two honest caveats: naive `s = s + "x"` is still 35× slower
+than Python's `+=` (the idiom is `Text.Builder`, not the operator), and
+§1's agent-velocity result stands — Python is still 4.7× faster for an
+agent writing a CLI from scratch (training data, not compute).
+
+### vs Rust — smaller binaries hold, new weapons
+
+Binary sizes re-measured: Misa hello **177 KB** vs Rust **337 KB**
+(stripped); Misa JSON CLI **189 KB** vs Rust **440 KB**. Tree-shaking
+holds with the bigger Wave-3 runtime (+2.6%). Misa's new answers to
+Rust's strengths: checked `throws` (error *codes* in signatures —
+Rust's `Result` doesn't name errors), interfaces with static+dynamic
+dispatch, and an agent-native debugger. Rust still wins raw compute
+(~3× on fib), memory control, and the crates ecosystem by miles.
+**New verdict:** for systems programming, still Rust. For agent-written
+systems-adjacent tools, Misa now has a real argument: smaller binaries,
+faster clean builds than cargo-with-deps, and errors the compiler
+tracks by code.
+
+### vs Go — the gap narrowed, Go still leads compute
+
+Go fib **0.080 s** vs Misa 0.221 s (2.8×); Go loop **0.009 s** vs 0.268 s
+(30×). Misa JSON CLI **189 KB** vs Go **2.9 MB**; Misa clean build
+2.4 s vs Go cold 10.6 s, but Go incremental (133 ms) still crushes
+Misa's warm rebuild (0.70 s). Misa's new answers: `http.serve` (Go's
+`net/http` territory), TCP sockets, structured concurrency (no leaked
+goroutines — a design lead), and checked throws vs ignored `err`
+returns. **New verdict:** for network services, still Go. Misa is now
+the better choice where binary size, startup, or phone targets matter —
+and the only one of the two an agent can debug with typed state dumps.
+
+### vs React — the screen-state gap is closed
+
+§4's "genuine gap" (no `useState` equivalent; E600/E101 on handler
+captures) is **fixed**: `state()` gives screens ephemeral per-instance
+state with re-render on assign, on all targets. React still wins the
+web ecosystem by miles. Misa still wins one-codebase native reach.
+The state-ergonomics gap is gone; the ecosystem gap is not.
+
+### vs Java — unchanged
+
+§5 stands as written. No new measurements; the Android story is
+unchanged (ecosystem + APK size vs one-codebase authoring).
+
+---
+
+## 1. Misa vs Python (original 2026-10-06 — historical)
 
 **Source:** `bench/FINDINGS.md` (benchmark 1: CLI task manager, 3+3 agent
 trials; benchmark 2: CLI + Android APK, 3+3 trials). Zero human help,

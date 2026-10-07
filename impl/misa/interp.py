@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import calendar
 import functools
+import gzip
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import zlib
 import threading
 import time
 import urllib.request
@@ -265,6 +267,43 @@ class SetValue:
         return f"SetValue({self.items!r})"
 
 
+class BytesValue:
+    """Final wave (stdlib): opaque binary data (`Bytes`).
+
+    Produced by `compress.gzip` / `compress.gunzip_bytes`; wraps a
+    Python `bytes` (mirrors the AOT `M_TAG_BYTES` payload exactly).
+    """
+
+    def __init__(self, data: bytes):
+        self.data: bytes = bytes(data)
+
+    def __eq__(self, other):
+        return isinstance(other, BytesValue) and self.data == other.data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"BytesValue({len(self.data)} bytes)"
+
+
+# Final wave (stdlib): fixed gzip header (mtime=0, XFL=max, OS=Unix)
+# shared by the manual framing below and mirrored in the AOT runtime.
+_GZ_HDR = bytes([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+                 0x02, 0x03])
+
+
+def _gzip_framed(data: bytes) -> bytes:
+    """Deterministic gzip of `data`: fixed header, raw deflate at
+    level 9, CRC32 + ISIZE (LE) trailer. Byte-identical to the AOT
+    backend's `misa_compress_gzip` by construction."""
+    comp = zlib.compressobj(9, zlib.DEFLATED, -15)
+    body = comp.compress(data) + comp.flush()
+    trailer = ((zlib.crc32(data) & 0xFFFFFFFF).to_bytes(4, "little") +
+               (len(data) & 0xFFFFFFFF).to_bytes(4, "little"))
+    return _GZ_HDR + body + trailer
+
+
 def _misa_eq(a: Any, b: Any) -> bool:
     """Misa value equality, mirroring C `val_equal`.
 
@@ -287,6 +326,8 @@ def _misa_eq(a: Any, b: Any) -> bool:
     if isinstance(a, SetValue) and isinstance(b, SetValue):
         return len(a.items) == len(b.items) and all(
             any(_misa_eq(x, y) for y in b.items) for x in a.items)
+    if isinstance(a, BytesValue) and isinstance(b, BytesValue):
+        return a.data == b.data
     return type(a) is type(b) and a == b
 
 
@@ -360,6 +401,9 @@ def render_value(v: Any) -> str:
         return f"<regex: {v.pattern}>"
     if isinstance(v, SetValue):
         return "{" + ", ".join(render_value(i) for i in v.items) + "}"
+    # Final wave (stdlib): opaque bytes render as their length.
+    if isinstance(v, BytesValue):
+        return f"<bytes: {len(v.data)}>"
     if isinstance(v, LambdaValue):
         return "<lambda>"
     if isinstance(v, FnValue):
@@ -553,11 +597,58 @@ class Interpreter:
         import ctypes
         if tname in self.extern_struct_ctypes:
             return self.extern_struct_ctypes[tname]
+        if tname in self.extern_struct_decls:
+            # Overtake final wave: lazily build the ctypes class
+            # (handles nested aggregates and cross-block references).
+            return self._build_aggr_ctype(tname, ())
         return {"Int": ctypes.c_long,
                 "Float": ctypes.c_double,
                 "Text": ctypes.c_char_p,
                 "Bool": ctypes.c_int,
                 "Ptr": ctypes.c_void_p}[tname]
+
+    def _build_aggr_ctype(self, name: str, seen: tuple):
+        """Build (and memoize) the ctypes class for a declared
+        struct/union. Recursive for nested aggregates; bitfields use
+        unsigned-long units (values are unsigned, 0..2**w-1)."""
+        import ctypes
+        if name in self.extern_struct_ctypes:
+            return self.extern_struct_ctypes[name]
+        if name in seen:
+            raise FFIError(f"cyclic nesting through '{name}'",
+                           line=0, col=0)
+        decl = self.extern_struct_decls.get(name)
+        if decl is None:
+            raise FFIError(f"unknown extern aggregate '{name}'",
+                           line=0, col=0)
+        base = (ctypes.Union if decl.kind == "union"
+                else ctypes.Structure)
+        fields = []
+        for fname, fte in decl.fields:
+            ft = fte.name
+            width = fte.bitfield_width
+            if width is not None:
+                # Bitfield values are unsigned (C `unsigned long`
+                # semantics); out-of-range is a clean error at
+                # construction.
+                fields.append((fname, ctypes.c_ulong, width))
+            elif ft in ("Int", "Float", "Bool", "Ptr"):
+                ctype = {"Int": ctypes.c_long,
+                         "Float": ctypes.c_double,
+                         "Bool": ctypes.c_int,
+                         "Ptr": ctypes.c_void_p}[ft]
+                fields.append((fname, ctype))
+            elif ft in self.extern_struct_decls:
+                fields.append(
+                    (fname, self._build_aggr_ctype(ft, seen + (name,))))
+            else:
+                raise FFIError(
+                    f"extern {decl.kind} '{name}': field '{fname}' has "
+                    f"unknown type '{ft}'", line=0, col=0)
+        cls = type("MisaAggr_" + name, (base,),
+                   {"_fields_": fields, "_misa_name": name})
+        self.extern_struct_ctypes[name] = cls
+        return cls
 
     def _ffi_restype(self, tname: str):
         if tname == "Void":
@@ -598,18 +689,11 @@ class Interpreter:
                            line=decl.line, col=decl.col)
         # Overtake Wave 2: build a ctypes.Structure subclass per
         # declared C-layout struct (v1 fields: Int/Float/Bool/Ptr).
+        # Overtake final wave: classes are built lazily by _ffi_ctype
+        # (recursive: nested structs/unions, bitfields), so only the
+        # declarations are recorded here. A struct may reference an
+        # aggregate declared in a later extern block.
         for st in decl.structs:
-            fields = []
-            for fname, fte in st.fields:
-                ft = fte.name
-                ctype = {"Int": ctypes.c_long,
-                         "Float": ctypes.c_double,
-                         "Bool": ctypes.c_int,
-                         "Ptr": ctypes.c_void_p}[ft]
-                fields.append((fname, ctype))
-            cls = type("MisaStruct_" + st.name, (ctypes.Structure,),
-                       {"_fields_": fields, "_misa_name": st.name})
-            self.extern_struct_ctypes[st.name] = cls
             self.extern_struct_decls[st.name] = st
         for fn in decl.fns:
             try:
@@ -651,9 +735,9 @@ class Interpreter:
                 c_args.append(a.addr if isinstance(a, PtrValue) else 0)
             elif t == "Bool":
                 c_args.append(1 if a else 0)
-            elif t in self.extern_struct_ctypes:
-                # Struct by value: the value already is a ctypes
-                # Structure instance (built by StructLit eval).
+            elif t in self.extern_struct_decls:
+                # Aggregate by value: the value already is a ctypes
+                # Structure/Union instance (built by StructLit eval).
                 c_args.append(a)
             else:
                 c_args.append(a)
@@ -672,7 +756,7 @@ class Interpreter:
                 elif at == "Ptr":
                     c_args.append(ct(a.addr if isinstance(a, PtrValue)
                                       else 0))
-                elif at in self.extern_struct_ctypes:
+                elif at in self.extern_struct_decls:
                     c_args.append(a)
                 else:
                     c_args.append(ct(a))
@@ -1010,8 +1094,10 @@ class Interpreter:
                     return SumValue(decl.name, v.name, [])
             obj = self.eval_expr(e.obj, env)
             # Overtake Wave 2 (FFI): field read on a C-layout struct.
+            # Overtake final wave: unions too (ctypes.Union is not a
+            # subclass of ctypes.Structure).
             import ctypes as _ct2
-            if isinstance(obj, _ct2.Structure):
+            if isinstance(obj, (_ct2.Structure, _ct2.Union)):
                 return self.struct_field_get(obj, e.field, e)
             # Phase 8 (overtake): field access on an interface value
             # is E200 statically; this is the runtime backstop.
@@ -1664,6 +1750,83 @@ class Interpreter:
                 return tempfile.mkdtemp(prefix="misa-")
             except OSError as ex:
                 raise RuntimeError_(f"fs.temp_dir failed: {ex}")
+        # -- Final wave (stdlib): compression -------------------------
+        # Framing is manual (raw deflate + fixed header/trailer) so
+        # output is byte-identical to the AOT backend by construction.
+        # Header: 1f 8b 08 00 00000000 02 03 (mtime=0, XFL=max,
+        # OS=Unix); level 9; CRC32 + ISIZE (LE) trailer.
+        if name == "compress.gzip":
+            if not isinstance(args[0], str):
+                raise RuntimeError_(
+                    "compress.gzip(Text) needs a text arg")
+            return BytesValue(_gzip_framed(args[0].encode("utf-8")))
+        if name in ("compress.gunzip", "compress.gunzip_bytes"):
+            if not isinstance(args[0], BytesValue):
+                raise RuntimeError_(
+                    f"{name}(Bytes) needs a bytes arg")
+            try:
+                raw = gzip.decompress(args[0].data)
+            except (gzip.BadGzipFile, zlib.error, EOFError,
+                    OSError, ValueError) as ex:
+                raise RuntimeError_(
+                    f"{name} failed: corrupt gzip data ({ex})")
+            if name == "compress.gunzip_bytes":
+                return BytesValue(raw)
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as ex:
+                raise RuntimeError_(
+                    f"compress.gunzip failed: output is not UTF-8 text "
+                    f"({ex}); use compress.gunzip_bytes for binary data")
+        if name == "compress.gzip_file":
+            src, dst = args[0], args[1]
+            if not isinstance(src, str) or not isinstance(dst, str):
+                raise RuntimeError_(
+                    "compress.gzip_file(Text, Text) needs text args")
+            try:
+                comp = zlib.compressobj(9, zlib.DEFLATED, -15)
+                crc, isize = 0, 0
+                with open(src, "rb") as fin, \
+                        open(dst, "wb") as fout:
+                    fout.write(_GZ_HDR)
+                    while True:
+                        chunk = fin.read(65536)
+                        if not chunk:
+                            break
+                        crc = zlib.crc32(chunk, crc)
+                        isize += len(chunk)
+                        fout.write(comp.compress(chunk))
+                    fout.write(comp.flush())
+                    fout.write((crc & 0xFFFFFFFF).to_bytes(4, "little"))
+                    fout.write((isize & 0xFFFFFFFF).to_bytes(4,
+                                                             "little"))
+                return os.path.getsize(dst)
+            except OSError as ex:
+                raise IOError_(
+                    f"compress.gzip_file failed: {ex}",
+                    line=e.line, col=e.col)
+        if name == "compress.gunzip_file":
+            src, dst = args[0], args[1]
+            if not isinstance(src, str) or not isinstance(dst, str):
+                raise RuntimeError_(
+                    "compress.gunzip_file(Text, Text) needs text args")
+            try:
+                with gzip.open(src, "rb") as fin, \
+                        open(dst, "wb") as fout:
+                    while True:
+                        chunk = fin.read(65536)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                return os.path.getsize(dst)
+            except (gzip.BadGzipFile, zlib.error, EOFError) as ex:
+                raise RuntimeError_(
+                    f"compress.gunzip_file failed: corrupt gzip data "
+                    f"({ex})")
+            except OSError as ex:
+                raise IOError_(
+                    f"compress.gunzip_file failed: {ex}",
+                    line=e.line, col=e.col)
         if name == "set":
             return SetValue()
         if name in ("set.add", "set.contains", "set.remove",
@@ -3308,14 +3471,23 @@ class Interpreter:
     def eval_struct_lit(self, e: ast.StructLit, env: Env):
         """Overtake Wave 2: `Point { x: 1.0, y: 2.0 }` — build a
         ctypes Structure instance (C layout, by value). The checker
-        validated fields; re-check defensively for unchecked ASTs."""
+        validated fields; re-check defensively for unchecked ASTs.
+
+        Overtake final wave: nested aggregates (pass the inner
+        instance), unions (any subset of fields; the rest zero), and
+        bitfields (unsigned values; out-of-range is E300).
+        """
         import ctypes
-        cls = self.extern_struct_ctypes.get(e.name)
         decl = self.extern_struct_decls.get(e.name)
-        if cls is None or decl is None:
+        if decl is None:
             raise RuntimeError_(f"unknown struct '{e.name}'",
                                 line=e.line, col=e.col)
+        try:
+            cls = self._ffi_ctype(e.name)
+        except FFIError as ex:
+            raise RuntimeError_(ex.message, line=e.line, col=e.col)
         want = {fname: fte.name for fname, fte in decl.fields}
+        widths = {fname: fte.bitfield_width for fname, fte in decl.fields}
         kwargs = {}
         for fname, fv in e.fields:
             if fname not in want:
@@ -3328,6 +3500,16 @@ class Interpreter:
                 v = 1 if v else 0
             elif ft == "Ptr":
                 v = v.addr if isinstance(v, PtrValue) else 0
+            elif widths[fname] is not None:
+                # Unsigned bitfield: clean E300 instead of ctypes'
+                # ValueError on out-of-range values.
+                w = widths[fname]
+                if not isinstance(v, int) or isinstance(v, bool) \
+                        or not (0 <= v < (1 << w)):
+                    raise RuntimeError_(
+                        f"bitfield '{e.name}.{fname}' value {v!r} out "
+                        f"of range for :{w} (0..{(1 << w) - 1})",
+                        line=fv.line, col=fv.col)
             kwargs[fname] = v
         try:
             return cls(**kwargs)

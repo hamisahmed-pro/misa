@@ -31,6 +31,9 @@ class TypeExpr(Node):
     # (`[Box<Int>]`, `[[T]]`). When None, `name`+`is_list` carry the
     # (possibly flattened) form as before.
     list_elem: Optional["TypeExpr"] = None
+    # Overtake final wave (FFI): C bitfield width for `field: Int:N`
+    # inside an extern struct/union declaration. None = not a bitfield.
+    bitfield_width: Optional[int] = None
 
 
 # ---------------------------------------------------------------- program
@@ -217,9 +220,15 @@ class StructDecl(Node):
     from Misa as `Point { x: 1.0, y: 2.0 }`.
 
     v1 fields: Int, Float, Bool, Ptr only (checked with E225).
+
+    Overtake final wave: `kind` is "struct" or "union" (`union Value
+    { i: Int, f: Float }` — all fields share offset 0); fields may be
+    nested aggregates (another declared struct/union) or bitfields
+    (`a: Int:3`, stored on the field's TypeExpr.bitfield_width).
     """
     name: str = ""
     fields: List[Tuple[str, "TypeExpr"]] = field(default_factory=list)
+    kind: str = "struct"
 
 
 @dataclass

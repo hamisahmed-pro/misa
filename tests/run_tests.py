@@ -2582,13 +2582,271 @@ def _():
     assert any(e["code"] == "E225" for e in errs), errs
 
 
-@test("ffi2: nested struct field is E225")
+@test("ffi2: nested struct fields accepted (final wave)")
 def _():
+    # Final wave: nested aggregates are a feature (were E225 in Wave 2).
     errs = check_source('extern "c" {\n'
                         '  struct Inner { x: Int },\n'
-                        '  struct Outer { inner: Inner },\n'
+                        '  struct Outer { inner: Inner, y: Float },\n'
+                        '}\n')
+    assert errs == [], errs
+    # Cyclic nesting is still E225 (C requires complete by-value types).
+    errs = check_source('extern "c" {\n'
+                        '  struct A { b: B },\n'
+                        '  struct B { a: A },\n'
                         '}\n')
     assert any(e["code"] == "E225" for e in errs), errs
+
+
+@test("ffi2: unions and bitfields accepted (final wave)")
+def _():
+    errs = check_source('extern "c" {\n'
+                        '  union U { i: Int, f: Float },\n'
+                        '  struct B { a: Int:3, b: Int },\n'
+                        '}\n')
+    assert errs == [], errs
+    # Bad bitfield width is E225.
+    errs = check_source('extern "c" {\n'
+                        '  struct B { a: Int:0 },\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+    # Bitfield on non-Int is E225.
+    errs = check_source('extern "c" {\n'
+                        '  struct B { a: Float:3 },\n'
+                        '}\n')
+    assert any(e["code"] == "E225" for e in errs), errs
+
+
+# ----------------------------------------------------------------------
+# Overtake final wave: nested structs, unions, bitfields (runtime)
+# ----------------------------------------------------------------------
+
+@test("ffi3: nested struct literal + chained field access (interp)")
+def _():
+    src = ('extern "c" {\n'
+           '  struct Point { x: Int, y: Int },\n'
+           '  struct Outer { p: Point, n: Int },\n'
+           '}\n'
+           'let o = Outer { p: Point { x: 3, y: 4 }, n: 5 }\n'
+           'print(o.p.x)\n'
+           'print(o.p.y)\n'
+           'print(o.n)\n')
+    eq(run_src(src).strip().splitlines(), ["3", "4", "5"])
+
+
+@test("ffi3: nested struct by value through C (interp)")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  struct Point { x: Int, y: Int },\n'
+           '  struct Outer { tag: Bool, p: Point, n: Int },\n'
+           '  fn ffi_outer_add(o: Outer, k: Int) -> Outer,\n'
+           '  fn ffi_outer_tag(o: Outer) -> Int,\n'
+           '}\n'
+           'let o = Outer { tag: true, p: Point { x: 3, y: 4 }, n: 5 }\n'
+           'let q = ffi_outer_add(o, 10)\n'
+           'print("{q.p.x} {q.p.y} {q.n}")\n'
+           'print(ffi_outer_tag(q))\n')
+    # tag is a 4-byte Bool: the nested Point must start at offset 8
+    # (padding); C adding 10 to every field proves the layout matches.
+    eq(run_src(src).strip().splitlines(), ["13 14 15", "11"])
+
+
+@test("ffi3: union write/read reinterpretation (interp)")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  union Value { i: Int, f: Float },\n'
+           '  fn ffi_value_as_f(v: Value) -> Float,\n'
+           '  fn ffi_value_from_i(i: Int) -> Value,\n'
+           '}\n'
+           'let v = Value { i: 42 }\n'
+           'print(v.i)\n'
+           # int64 bits of 1.5 reinterpreted as double:
+           'let w = ffi_value_from_i(4609434218613702656)\n'
+           'print(w.f)\n'
+           'print(ffi_value_as_f(Value { f: 2.5 }))\n')
+    eq(run_src(src).strip().splitlines(), ["42", "1.5", "2.5"])
+
+
+@test("ffi3: union literal takes any field subset (interp)")
+def _():
+    src = ('extern "c" {\n'
+           '  union Value { i: Int, f: Float },\n'
+           '}\n'
+           'let a = Value { i: 7 }\n'
+           'let b = Value { f: 1.25 }\n'
+           'print(a.i)\n'
+           'print(b.f)\n')
+    eq(run_src(src).strip().splitlines(), ["7", "1.25"])
+
+
+@test("ffi3: bitfields pack per C rules, cross-checked via C (interp)")
+def _():
+    so = _ffi_helpers_so()
+    src = (f'extern "{so}" {{\n'
+           '  struct Bits { a: Int:3, b: Int:5, c: Int:20, d: Int, e: Int:9 },\n'
+           '  fn ffi_bits_sum(b: Bits) -> Int,\n'
+           '  fn ffi_bits_d(b: Bits) -> Int,\n'
+           '  fn ffi_bits_e(b: Bits) -> Int,\n'
+           '  fn ffi_bits_word0(b: Bits) -> Int,\n'
+           '}\n'
+           'let b = Bits { a: 5, b: 17, c: 703710, d: -7, e: 511 }\n'
+           'print(b.a)\n'
+           'print(b.b)\n'
+           'print(b.c)\n'
+           'print(b.d)\n'
+           'print(b.e)\n'
+           'print(ffi_bits_sum(b))\n'
+           'print(ffi_bits_d(b))\n'
+           'print(ffi_bits_e(b))\n'
+           'print(ffi_bits_word0(b))\n')
+    out = run_src(src).strip().splitlines()
+    # C reads the Misa-built bitfields: packing must be identical.
+    # word0 = 5 | (17<<3) | (703710<<8) = 180149901.
+    eq(out, ["5", "17", "703710", "-7", "511",
+             "703732", "-7", "511", "180149901"])
+
+
+@test("ffi3: bitfield value out of range is E300 (interp)")
+def _():
+    src = ('extern "c" {\n'
+           '  struct Bits { a: Int:3, b: Int:5 },\n'
+           '}\n'
+           'try {\n'
+           '  let b = Bits { a: 8, b: 1 }\n'
+           '} catch e {\n'
+           '  print("got {e.code}")\n'
+           '}\n'
+           'try {\n'
+           '  let b = Bits { a: -1, b: 1 }\n'
+           '} catch e {\n'
+           '  print("got {e.code}")\n'
+           '}\n')
+    eq(run_src(src).strip().splitlines(), ["got E300", "got E300"])
+
+
+@test("ffi3: byte-exact C layout vs GCC")
+def _():
+    """Compile a C reference with offsetof/sizeof prints; Misa's
+    ffi_layout must agree on every offset, size, and alignment.
+    Layout bugs are silent killers — this is the differential check."""
+    import subprocess, tempfile
+    c_src = r'''
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+struct Point { int64_t x; int64_t y; };
+struct Outer { int tag; struct Point p; int64_t n; };
+struct Mixed { int64_t id; double score; int64_t flags; void *tag; };
+union Value { int64_t i; double f; };
+struct UWrap { int t; union Value v; int64_t n; };
+struct Bits { unsigned long a:3; unsigned long b:5; unsigned long c:20;
+              int64_t d; unsigned long e:9; };
+union UBits { unsigned long a:3; int64_t i; };
+struct NestBits { int t; struct Bits b; };
+#define P(T, m) printf("%s.%s %zu\n", #T, #m, offsetof(struct T, m))
+#define PU(T, m) printf("%s.%s %zu\n", #T, #m, offsetof(union T, m))
+#define S(T) printf("%s.size %zu\n", #T, sizeof(struct T))
+#define SU(T) printf("%s.size %zu\n", #T, sizeof(union T))
+#define A(T) printf("%s.align %zu\n", #T, _Alignof(struct T))
+#define AU(T) printf("%s.align %zu\n", #T, _Alignof(union T))
+int main(void) {
+    P(Point, x); P(Point, y); S(Point); A(Point);
+    P(Outer, tag); P(Outer, p); P(Outer, n); S(Outer); A(Outer);
+    P(Mixed, id); P(Mixed, score); P(Mixed, flags); P(Mixed, tag);
+    S(Mixed); A(Mixed);
+    PU(Value, i); PU(Value, f); SU(Value); AU(Value);
+    P(UWrap, t); P(UWrap, v); P(UWrap, n); S(UWrap); A(UWrap);
+    P(Bits, d); S(Bits); A(Bits);
+    /* offsetof cannot apply to a bit-field; UBits.a is at 0 by union rule */
+    PU(UBits, i); SU(UBits); AU(UBits);
+    P(NestBits, t); P(NestBits, b); S(NestBits); A(NestBits);
+    /* bit positions: find which bit index each field starts at */
+    struct Bits bs = {0}; bs.a = 1;
+    for (int i = 0; i < 64; i++)
+        if (((unsigned long *)&bs)[0] & (1UL << i)) {
+            printf("Bits.a.bit %d\n", i); break; }
+    bs.a = 0; bs.b = 1;
+    for (int i = 0; i < 64; i++)
+        if (((unsigned long *)&bs)[0] & (1UL << i)) {
+            printf("Bits.b.bit %d\n", i); break; }
+    bs.b = 0; bs.c = 1;
+    for (int i = 0; i < 64; i++)
+        if (((unsigned long *)&bs)[0] & (1UL << i)) {
+            printf("Bits.c.bit %d\n", i); break; }
+    /* e starts a new unit after d (offset 16): bit 128 overall */
+    struct Bits be = {0}; be.e = 1;
+    unsigned long *w = (unsigned long *)&be;
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < 64; i++)
+            if (w[k] & (1UL << i)) { printf("Bits.e.bit %d\n", k*64+i); k = 9; break; }
+    return 0;
+}
+'''
+    with tempfile.TemporaryDirectory() as td:
+        c_path = os.path.join(td, "ref.c")
+        exe = os.path.join(td, "ref")
+        open(c_path, "w").write(c_src)
+        r = subprocess.run(["cc", "-O2", "-o", exe, c_path],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        r = subprocess.run([exe], capture_output=True, text=True)
+        assert r.returncode == 0
+        gcc = {}
+        for line in r.stdout.strip().splitlines():
+            k, v = line.split()
+            gcc[k] = int(v)
+
+    from misa import ffi_layout as L
+    from misa.ast import StructDecl, TypeExpr
+    def te(n, w=None):
+        return TypeExpr(name=n, bitfield_width=w)
+    decls = {
+        "Point": StructDecl(name="Point", kind="struct",
+                            fields=[("x", te("Int")), ("y", te("Int"))]),
+        "Outer": StructDecl(name="Outer", kind="struct",
+                            fields=[("tag", te("Bool")),
+                                    ("p", te("Point")), ("n", te("Int"))]),
+        "Mixed": StructDecl(name="Mixed", kind="struct",
+                            fields=[("id", te("Int")), ("score", te("Float")),
+                                    ("flags", te("Int")), ("tag", te("Ptr"))]),
+        "Value": StructDecl(name="Value", kind="union",
+                            fields=[("i", te("Int")), ("f", te("Float"))]),
+        "UWrap": StructDecl(name="UWrap", kind="struct",
+                            fields=[("t", te("Bool")), ("v", te("Value")),
+                                    ("n", te("Int"))]),
+        "Bits": StructDecl(name="Bits", kind="struct",
+                           fields=[("a", te("Int", 3)), ("b", te("Int", 5)),
+                                   ("c", te("Int", 20)), ("d", te("Int")),
+                                   ("e", te("Int", 9))]),
+        "UBits": StructDecl(name="UBits", kind="union",
+                            fields=[("a", te("Int", 3)), ("i", te("Int"))]),
+        "NestBits": StructDecl(name="NestBits", kind="struct",
+                               fields=[("t", te("Bool")),
+                                       ("b", te("Bits"))]),
+    }
+    # sizes + alignments
+    for name in decls:
+        size = L.aggregate_size(name, decls)
+        gk = f"{name}.size"
+        assert size == gcc[gk], (name, size, gcc[gk])
+    # field offsets (bit-fields have no offsetof; their unit offsets
+    # are verified via bit positions below)
+    for name in decls:
+        for fname, (desc, off, _extra) in L.field_map(name,
+                                                      decls).items():
+            if desc == "bits":
+                continue
+            gk = f"{name}.{fname}"
+            assert off == gcc[gk], (name, fname, off, gcc[gk])
+    # UBits.a (union bitfield) is at offset 0 by the union rule
+    assert L.field_map("UBits", decls)["a"][1] == 0
+    # bit positions (little-endian: a at 0, b at 3, c at 8, e at 128)
+    assert gcc["Bits.a.bit"] == 0, gcc
+    assert gcc["Bits.b.bit"] == 3, gcc
+    assert gcc["Bits.c.bit"] == 8, gcc
+    assert gcc["Bits.e.bit"] == 128, gcc
 
 
 @test("ffi2: duplicate struct name is E210")
@@ -2720,6 +2978,24 @@ def _():
     assert "fn printf(fmt: Text, ...)" in out, out
     assert "Point { x: 1.0, y: 2.0 }" in out, out
     # idempotent
+    assert format_source(out) == out
+
+
+@test("ffi3: formatter round-trips unions/nested/bitfields")
+def _():
+    from misa.fmt import format_source
+    src = ('extern "c" {\n'
+           '  struct Point { x: Int, y: Int },\n'
+           '  struct Outer { p: Point, n: Int },\n'
+           '  union Value { i: Int, f: Float },\n'
+           '  struct Bits { a: Int:3, b: Int:5 },\n'
+           '}\n'
+           'let o = Outer { p: Point { x: 1, y: 2 }, n: 3 }\n')
+    out = format_source(src)
+    assert "union Value { i: Int, f: Float }" in out, out
+    assert "struct Bits { a: Int:3, b: Int:5 }" in out, out
+    assert "struct Outer { p: Point, n: Int }" in out, out
+    assert "Outer { p: Point { x: 1, y: 2 }, n: 3 }" in out, out
     assert format_source(out) == out
 
 
@@ -4765,6 +5041,133 @@ def _():
     def go2():
         run_src('print(str.pad_left("a", 3, ""))\n')
     raises_code(go2, "E300")
+
+
+# ------------------------------------------------------------ Final wave: compression
+
+@test("compress: gzip round-trip + Bytes rendering + len + equality")
+def _():
+    src = ('let b = compress.gzip("hello world")\n'
+           'print(len(b))\n'
+           'print(b)\n'
+           'print(compress.gunzip(b))\n'
+           'print(compress.gzip("hello world") == b)\n'
+           'print(compress.gzip("other") == b)\n'
+           'print(compress.gzip("other") != b)\n')
+    eq(run_src(src),
+       "31\n<bytes: 31>\nhello world\ntrue\nfalse\ntrue\n")
+
+
+@test("compress: known vector is byte-exact (file API)")
+def _():
+    import gzip as _gz
+    import shutil
+    # Reference: level 9, mtime=0. Both backends must emit exactly
+    # these bytes (the AOT parity program asserts the same).
+    expected = _gz.compress(b"hello world", compresslevel=9, mtime=0)
+    assert len(expected) == 31, len(expected)
+    assert expected[:10] == bytes(
+        [0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03])
+    d = tempfile.mkdtemp(prefix="misa-gz-")
+    try:
+        inp = os.path.join(d, "in.txt")
+        outp = os.path.join(d, "out.gz")
+        with open(inp, "wb") as f:
+            f.write(b"hello world")
+        eq(run_src(f'let n = compress.gzip_file("{inp}", "{outp}")\n'
+                   f'print(n)\n'), "31\n")
+        assert open(outp, "rb").read() == expected, "not byte-identical"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("compress: gunzip_bytes round-trip")
+def _():
+    src = ('let b = compress.gzip("abcabcabc")\n'
+           'let r = compress.gunzip_bytes(b)\n'
+           'print(len(r))\n'
+           'print(r == compress.gunzip_bytes(compress.gzip("abcabcabc")))\n')
+    eq(run_src(src), "9\ntrue\n")
+
+
+@test("compress: unicode round-trip")
+def _():
+    src = ('let t = "h\xc3\xa9llo w\xc3\xb6rld"\n'
+           'print(compress.gunzip(compress.gzip(t)) == t)\n')
+    eq(run_src(src), "true\n")
+
+
+@test("compress: corrupt in-memory input is E300")
+def _():
+    # gunzip_bytes(gzip("hi")) is raw b"hi" -- not a gzip stream.
+    def go():
+        run_src('let raw = compress.gunzip_bytes(compress.gzip("hi"))\n'
+                'print(compress.gunzip(raw))\n')
+    raises_code(go, "E300")
+
+
+@test("compress: corrupt file is E300, missing file is E303")
+def _():
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-gz-")
+    try:
+        bad = os.path.join(d, "bad.gz")
+        out = os.path.join(d, "out.txt")
+        with open(bad, "wb") as f:
+            f.write(b"not gzip at all........")
+        def go_bad():
+            run_src(f'print(compress.gunzip_file("{bad}", "{out}"))\n')
+        raises_code(go_bad, "E300")
+
+        def go_trunc():
+            # truncated: header only, no deflate stream
+            tpath = os.path.join(d, "trunc.gz")
+            with open(tpath, "wb") as f:
+                f.write(bytes([0x1f, 0x8b, 0x08, 0x00] * 3))
+            run_src(f'print(compress.gunzip_file("{tpath}", "{out}"))\n')
+        raises_code(go_trunc, "E300")
+
+        def go_missing():
+            run_src(f'print(compress.gzip_file("{d}/nope.txt", "{out}"))\n')
+        raises_code(go_missing, "E303")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("compress: file round-trip (1MB)")
+def _():
+    import shutil
+    d = tempfile.mkdtemp(prefix="misa-gz-")
+    try:
+        inp = os.path.join(d, "big.txt")
+        gz = os.path.join(d, "big.gz")
+        back = os.path.join(d, "big.back")
+        data = ("The quick brown fox jumps over the lazy dog. " * 23000)
+        assert len(data.encode("utf-8")) > 1000000
+        with open(inp, "w", encoding="utf-8") as f:
+            f.write(data)
+        src = (f'let n = compress.gzip_file("{inp}", "{gz}")\n'
+               f'print(n > 0)\n'
+               f'print(n < 1000000)\n'
+               f'let m = compress.gunzip_file("{gz}", "{back}")\n'
+               f'print(m > 1000000)\n')
+        eq(run_src(src), "true\ntrue\ntrue\n")
+        with open(back, encoding="utf-8") as f:
+            assert f.read() == data, "1MB round-trip mismatch"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("compress: gunzip needs throws E300 (E227)")
+def _():
+    errs = check_source('fn f() -> Text {\n'
+                        '  return compress.gunzip(compress.gzip("x"))\n'
+                        '}\n')
+    assert any(e["code"] == "E227" for e in errs), errs
+    errs = check_source('fn f() -> Text throws E300 {\n'
+                        '  return compress.gunzip(compress.gzip("x"))\n'
+                        '}\n')
+    assert not errs, errs
 
 
 if __name__ == "__main__":

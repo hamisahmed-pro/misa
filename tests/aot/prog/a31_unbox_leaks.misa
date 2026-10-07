@@ -1,0 +1,30 @@
+// a31_unbox_leaks: P-2 unboxing must box raw i64 values at every MVal*
+// boundary (sum variants, closure args, captured cells). Regression for
+// the 2026-10-07 tasks.misa AOT build failure (i8* != i64 in
+// emit_sum_construct).
+type R {
+  Ok(v: [Int]),
+  Err(e: Text),
+}
+
+let x: R = R.Ok([1, 2, 3])
+match x {
+  R.Ok(v) => print(v),
+  R.Err(e) => print(e),
+}
+
+let f = |a: Int, b: Int| a * b + 1
+print(f(6, 7))
+
+var n = 10
+let h = || n + 1
+n = 20
+print(h())
+
+type S {
+  Single(v: Int),
+}
+let s: S = S.Single(99)
+match s {
+  S.Single(v) => print(v),
+}

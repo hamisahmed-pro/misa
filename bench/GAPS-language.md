@@ -24,10 +24,10 @@ but what "better by a mile" looks like. Sources: `spec/SYNTAX.md`,
 | A2 | Pattern matching | `match` (3.10+) — guards, literals, NOT exhaustive | `match` — exhaustive, guards, literals, the gold standard | `switch` / type-switch only — weakest | `match` on sum types — exhaustive (E216), arm-type agreement (E217). **No guards, no literal patterns** | **PAR** (exhaustiveness beats Go/Python; behind Rust on guards/literals → see A3) |
 | A3 | Match guards / literal patterns | ✅ both | ✅ both | n/a | ❌ neither | **LAG** |
 | A4 | Generics (mechanism) | `typing` — gradual, unchecked | Monomorphized + trait bounds — best | 1.18+, gcshape stenciling, no specialization | Monomorphized, call-site inference, explicit `f<T>()` pinning, depth cap 32 | **PAR** (with Go; ahead of Python; behind Rust → see A5) |
-| A5 | Generic bounds (traits/interfaces) | ABCs / `Protocol` | **Traits** — the model everyone copies | Interfaces (structural) | ❌ **Nothing.** No interfaces, traits, or protocols at all | **LAG** — the single biggest type-system gap |
-| A6 | Error handling | Exceptions — unchecked | `Result<T,E>` + `?` — typed, must-handle | `(T, error)` returns — routinely ignored | Catchable `Error{code,message}`, E-codes everywhere, `try/catch/throw`. Machine-readable (`--json`). **No `?` propagation, no throws-in-signature** | **PAR** (more disciplined than Go/Python; less type-level than Rust; LEAD on machine-readability for agents) |
+| A5 | Generic bounds (traits/interfaces) | ABCs / `Protocol` | **Traits** — the model everyone copies | Interfaces (structural) | ✅ `interface` + `impl` blocks (2026-10-06): nominal, static zero-cost + dynamic + bounded-generic (`T: Drawable`) dispatch, throws ⊆ rule | **PAR** (matches the model; less mature than Rust's ecosystem of impls) |
+| A6 | Error handling | Exceptions — unchecked | `Result<T,E>` + `?` — typed, must-handle | `(T, error)` returns — routinely ignored | ✅ **Checked `throws` signatures** (2026-10-06): `fn f() -> T throws E304` — error *codes* in the signature, enforced by `misa check` (E227), inferred throws-sets, `throws_graph` in `--json`. **Nobody else has this.** | **LEAD** |
 | A7 | Type inference | (unchecked — n/a) | Good (H-M-ish locals) | `:=` | "Inference beyond this is future work" — annotations required in many positions; lambda params and generic call-sites infer | **LAG** |
-| A8 | Interfaces / polymorphism | ABCs, Protocol, duck typing | Traits + dyn | Interfaces — structural, zero boilerplate | ❌ None. Only structural *function* types `(Int)->Bool` | **LAG** (same gap as A5, stated separately: it blocks both generic bounds AND everyday polymorphism) |
+| A8 | Interfaces / polymorphism | ABCs, Protocol, duck typing | Traits + dyn | Interfaces — structural, zero boilerplate | ✅ `interface`/`impl` (2026-10-06) — heterogeneous `[Drawable]` collections dispatch dynamically | **PAR** |
 
 ### Overtake proposals (type system)
 
@@ -42,17 +42,17 @@ but what "better by a mile" looks like. Sources: `spec/SYNTAX.md`,
 
 | # | Area | Python | Rust | Go | Misa today | Rating |
 |---|---|---|---|---|---|---|
-| B1 | Regex | `re` (stdlib) | `regex` crate (best-in-class) | `regexp` (stdlib) | ❌ None | **LAG** |
-| B2 | Crypto / hashing | `hashlib`, `hmac`, `secrets` | crates (`ring`, `sha2`) | `crypto/*` (stdlib) | ❌ None | **LAG** |
+| B1 | Regex | `re` (stdlib) | `regex` crate (best-in-class) | `regexp` (stdlib) | ✅ `regex("...")` (2026-10-07): **patterns validated at check time** (E200 with index, never a runtime surprise); 988 differential checks vs Python `re`, 0 mismatches | **LEAD** (nobody checks patterns at compile time) |
+| B2 | Crypto / hashing | `hashlib`, `hmac`, `secrets` | crates (`ring`, `sha2`) | `crypto/*` (stdlib) | ✅ `crypto.sha256/sha1/md5/hmac_sha256` (2026-10-07, self-contained C, no OpenSSL dep) | **PAR** |
 | B3 | Sockets / TCP | `socket` | `std::net` | `net` (stdlib, best) | ✅ `net.*`/`socket.*` (Wave 3, 2026-10-07): connect/listen/accept/send/recv/close/set_timeout, method + function style, `spawn`-native, E304 | **PAR** |
 | B4 | Filesystem depth | `pathlib`, `os`, `shutil` | `std::fs` | `os` | `fs.read`/`fs.write` whole-file only. No metadata, permissions, directory listing, watching | **LAG** |
-| B5 | Datetime / timezones | `datetime` + `zoneinfo` | `chrono` crate | `time` (stdlib, best) | `time.now`/`now_ms`/`format`/`parse` — **UTC only**, strftime-style | **LAG** |
+| B5 | Datetime / timezones | `datetime` + `zoneinfo` | `chrono` crate | `time` (stdlib, best) | ✅ `time.now_utc/to_utc/from_parts/add/in_tz/weekday/is_leap` (2026-10-07) — **offset-based, no tz database** | **PAR** (coverage; behind on named zones/DST) |
 | B6 | Unicode normalization | `unicodedata` | `unicode-normalization` crate | `x/text` | Code-point ops only (`str.*`) | **LAG** |
-| B7 | Compression | `gzip`, `zlib`, `bz2` | `flate2` crate | `compress/*` | ❌ None | **LAG** |
+| B7 | Compression | `gzip`, `zlib`, `bz2` | `flate2` crate | `compress/*` | ✅ `compress.*` (Final wave, 2026-10-07): gzip/gunzip/gunzip_bytes + streaming file variants, new `Bytes` type (`len`, `==`, `<bytes: N>` rendering), corrupt input = catchable `E300`, byte-identical output on both backends (deterministic framing, verified vs `gzip.compress`) | **PAR** |
 | B8 | Subprocess | `subprocess` (best) | `std::process` | `os/exec` | `process.run` — **interpreter only** (E600 on all AOT targets) | **LAG** (and platform-split, which is worse than missing) |
-| B9 | Random | `random`, `secrets` | `rand` crate | `math/rand` | ❌ None | **LAG** |
-| B10 | CLI arg parsing | `argparse` | `std::env::args` / `clap` | `flag` / `os.Args` | ❌ **No argv at all** — env-var workaround | **LAG** (flagged: blocks real CLI apps) |
-| B11 | Temp files | `tempfile` | `tempfile` crate | `os.CreateTemp` | ❌ None | **LAG** |
+| B9 | Random | `random`, `secrets` | `rand` crate | `math/rand` | ✅ `random.seed/int/float/choice/shuffle` (2026-10-07; determinism per-backend) | **PAR** |
+| B10 | CLI arg parsing | `argparse` | `std::env::args` / `clap` | `flag` / `os.Args` | ✅ `argv() -> [Text]` (2026-10-06, interp + AOT) | **PAR** (no typed schema/decl as proposed — future) |
+| B11 | Temp files | `tempfile` | `tempfile` crate | `os.CreateTemp` | ✅ `fs.temp_file()/temp_dir()` (2026-10-07) | **PAR** |
 | B12 | HTTP depth | `urllib`, `requests` | crates (`reqwest`, `hyper`) | `net/http` client **+ server** | ✅ `http.serve` (Wave 3, 2026-10-07): raw-socket HTTP/1.1 server, Request/Response records, per-connection error isolation. Client still `http.get`/`post`/`post_json` only (no headers control, 30s fixed timeout) | **PAR** |
 
 ### Overtake proposals (stdlib)
@@ -63,7 +63,7 @@ but what "better by a mile" looks like. Sources: `spec/SYNTAX.md`,
 - **B4 → Scope-bound filesystem.** `fs.walk(dir)` as a lazy iterator, `fs.watch(path)` integrated with `spawn`/`await`, and permission-checked writes. Parity on coverage.
 - **B5 → Compile-time-checked format strings.** `time.format(t, "%Y-%m-%d %Q")` — `%Q` is rejected by `misa check` with an E-code. Rust's chrono and Python's strftime both fail at *runtime* on bad specifiers. Plus a real timezone-aware `DateTime` type.
 - **B6 → `str.normalize(s, "NFC")`** — parity, done right on both backends (byte-identical guarantee).
-- **B7 → gzip via bundled miniz** — parity.
+- **B7 → gzip via zlib with deterministic framing** — DONE (Final wave, 2026-10-07): `compress.gzip/gunzip/gunzip_bytes` + streaming `gzip_file`/`gunzip_file`, new `Bytes` type, corrupt input = catchable `E300`, byte-identical output on both backends (fixed header, level 9 — verified against CPython's `gzip.compress`). Chose zlib over bundled miniz (universal incl. Android NDK; clean E600 where absent). **PAR** — beyond the original proposal: the `Bytes` type and byte-identity guarantee are the overtake-flavored parts.
 - **B8 → Capability-gated subprocess on AOT.** `app { allow: [process] }` — the manifest declares the capability; `misa build` embeds the grant, `misa run` prompts. Deno-like permissions, but declared at compile time and visible in `misa check --json`. Better than all three (none of which have a permission model for subprocess).
 - **B9 → Dual RNGs.** `random.secure(n)` (OS entropy) + `random.seeded(seed)` (deterministic — test runs are reproducible by construction). Overtake: determinism-by-default in `misa test`.
 - **B10 → Typed argv.** Declare the interface, get parsing + validation + `--help` free:
@@ -82,12 +82,14 @@ Misa has 7 `str.*` functions (`slice`, `starts_with`, `split`, `trim`,
 `ord`, `chr`, `chars`) plus 9 more in pure-Misa `std/strings`
 (`join`, `contains`, `repeat`, `pad_left`, `pad_right`, …).
 Python's `str` has ~45 methods; Rust's `str`/`String` is comparably
-rich; Go's `strings` package is solid. Missing in Misa: case
-conversion, `replace`, `find`/`index`, `join` as a builtin, strip
-variants beyond full trim, `format`/templating beyond interpolation,
-encoding conversions.
+rich; Go's `strings` package is solid. Misa now has ~26 (`str.*`:
+`slice`, `starts_with`, `ends_with`, `split`, `join`, `replace`,
+`trim`, `to_upper/to_lower` (ASCII), `pad_left/pad_right`, `ord`,
+`chr`, `chars`, plus 9 in `std/strings`). Still missing: case
+conversion beyond ASCII, `find`/`index`, strip variants, format/
+templating beyond interpolation, encoding conversions.
 
-| Rating | **LAG** |
+| Rating | **LAG** (narrowed 2026-10-07: was 7 builtins, now ~26) |
 
 **Overtake proposal → The Unicode-correct string library with proof.**
 Complete the namespace to 40+ functions, every one verified
@@ -105,8 +107,8 @@ something no multi-backend language even promises.
 
 | # | Area | Python | Rust | Go | Misa today | Rating |
 |---|---|---|---|---|---|---|
-| D1 | map / filter / fold | Comprehensions, `map`/`filter`/`functools.reduce` | Iterator adaptors — best in class | `slices`/`maps` (1.21+) | `std/lists`: `range`, `any`, `all`, `sum` **only** | **LAG** |
-| D2 | Sets | `set` (stdlib) | `HashSet` | Map idiom | ❌ None | **LAG** |
+| D1 | map / filter / fold | Comprehensions, `map`/`filter`/`functools.reduce` | Iterator adaptors — best in class | `slices`/`maps` (1.21+) | ✅ `map/filter/fold/sort_by/flat/zip/unique` (2026-10-07) | **PAR** (eager; no lazy iterators → D3) |
+| D2 | Sets | `set` (stdlib) | `HashSet` | Map idiom | ✅ `Set<T>` (2026-10-07): add/contains/remove/union/intersect/diff/to_list; O(n) membership, insertion-ordered | **PAR** (semantics; behind on hashed performance) |
 | D3 | Lazy iteration | Generators, itertools | Iterators (lazy, zero-cost) | Range-over-func (1.23) | ❌ None — `for` is eager only | **LAG** |
 
 ### Overtake proposals (collections)
@@ -138,7 +140,7 @@ something no multi-backend language even promises.
 
 | # | Area | Python (`ctypes`/`cffi`) | Rust (`bindgen`) | Go (`cgo`) | Misa `extern` v1 | Rating |
 |---|---|---|---|---|---|---|
-| F1 | Structs by value | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** (cleanest syntax; still no nested structs/unions/bitfields) |
+| F1 | Structs by value | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06; final wave 2026-10-07: + nested structs, unions, bitfields with C layout) | **LEAD** (cleanest syntax; byte-exact layout differentially verified vs GCC in-suite; dual-backend byte-identical) |
 | F2 | Callbacks (Misa fn → C fn pointer) | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** (typed closures, no unsafe blocks; easier than Rust/Go) |
 | F3 | Varargs | ✅ | ✅ | ✅ | ✅ (Wave 2, 2026-10-06) | **PAR** |
 | F4 | C++ (name mangling, classes) | n/a (C only) | ✅ via bindgen | n/a | ❌ | **LAG** |
@@ -170,7 +172,7 @@ something no multi-backend language even promises.
 
 | Area | Python | Rust | Go | Misa today | Rating |
 |---|---|---|---|---|---|
-| Unit tests | `pytest` — best in class | `cargo test` | `go test` | ❌ **None.** `misa test` runs *model evals only* (`eval` blocks). `assert()` exists but there is no test discovery, no runner | **LAG** |
+| Unit tests | `pytest` — best in class | `cargo test` | `go test` | ✅ `misa test` (2026-10-06): discovers `test NAME {}` blocks + `eval` model blocks in one runner, per-test isolation, `assert_eq`/`assert_ne`, `--json` | **PAR** (pytest more mature; the code+evals unification is unique) |
 
 ### Overtake proposal (testing)
 
@@ -210,27 +212,41 @@ These are not gaps — they are the moat. Any overtake plan should
 
 ---
 
-## Scorecard
+## Scorecard (updated 2026-10-07 — post Wave 1–3 + final wave)
 
-| Rating | Count |
-|---|---|
-| **LAG** | 34 |
-| **PAR** | 7 |
-| **LEAD** | 7 |
+| Rating | Count | Rows |
+|---|---|---|
+| **LAG** | 17 | A3, A7, B4, B6, B8, C, D3, E1–E4, F4, G1–G3, I1, I2 |
+| **PAR** | 19 | A1, A2, A4, A5, A8, B2, B3, B5, B7, B9, B10, B11, B12, D1, D2, F2, F3, F5, H |
+| **LEAD** | 11 | A6 (checked throws), B1 (check-time regex), F1 (FFI structs: nested/unions/bitfields, GCC-verified), + the 8 moat rows in §J |
 
-(34 LAG rows: A3, A5, A7, A8, B1–B12, C, D1–D3, E1–E4, F1–F4, G1–G3,
-H, I1, I2. PAR: A1, A2, A4, A6, F5, `T?` null safety, +1 partial.
-LEAD: the 7 LEAD rows in §J.)
+(Original 2026-10-06: 34 LAG / 7 PAR / 7 LEAD. Flipped since: 11 LAG→PAR,
+1 LAG→LEAD, 2 PAR→LEAD.)
 
 ---
 
-## Top 5 lags by importance
+## Top lags by importance (updated 2026-10-07)
 
-1. **No interfaces/traits (A5/A8).** Blocks all abstraction at scale — every stdlib and ecosystem API design hits this wall. Without it, `std/` packages can't offer polymorphic APIs and agent-written libraries will duplicate code.
-2. **Stdlib breadth (B1–B12).** The daily "can I build real things?" test. Agents reach for regex, crypto, sockets, timezones, random, and argv constantly; each missing piece is a failed task or an FFI escape hatch.
-3. **No unit-test framework (H).** `misa test` only runs model evals. The quality story is half-built, and agents need red/green loops — this is also the highest-leverage tooling-adjacent fix (one runner for code *and* models).
-4. **FFI depth (F1–F3).** Structs by value and callbacks block wrapping real C libraries — which is the entire point of FFI. (Postgres-via-FFI, the deferred Phase 5 item, needs F1.)
-5. **Thin strings/collections API (C, D1–D3).** Shows up in literally every program; the benchmark papercuts live here. Lowest risk to fix, highest daily friction removed.
+1. **No package registry (I2).** Spec written (`spec/REGISTRY.md`);
+   build blocked on hosting (Hamis's Oracle signup). This is the
+   ecosystem flywheel — everything else compounds through it.
+2. **Metaprogramming (G1–G3).** No macros, no attributes, no
+   derivation. The zero-attribute-derivation proposal (G3) is still
+   the highest-leverage unbuilt language feature: `json.stringify`
+   works on any declared record with no attributes.
+3. **Numbers (E1–E4).** No bigint/decimal/bitops. Deliberate for E1
+   (64-bit wrapping), but E3 (bitwise ops) is a real gap for
+   systems-adjacent code.
+4. **Filesystem depth (B4) + subprocess on AOT (B8).** `fs` is
+   whole-file only; `process.run` is interpreter-only. Both block
+   real-world scripting/CLI apps on native binaries.
+5. **Type inference (A7) + match guards (A3).** Inference is still
+   annotation-heavy; match still lacks guards/literals. Daily
+   ergonomics gaps vs Rust.
+
+Honorable mentions (narrowed but still LAG): C (strings ~26/45),
+I1 (flat imports, no namespaces), B6 (unicode normalization),
+D3 (no lazy iteration), F4 (no C++).
 
 ---
 

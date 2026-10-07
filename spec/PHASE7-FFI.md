@@ -38,7 +38,9 @@ let n = strlen("hello")   // 5
 | `Void` | `void` | `void` | `None` | |
 
 **v2 (Overtake Wave 2, 2026-10-06):** structs by value, callbacks,
-and varargs are implemented (see below). Remaining: C++ name
+and varargs are implemented (see below).
+**v3 (Overtake final wave, 2026-10-07):** nested structs, unions, and
+bitfields (see below) — F1 moves PAR → **LEAD**. Remaining: C++ name
 mangling, `safe extern`, automatic binding generation from headers.
 
 ### Structs
@@ -67,6 +69,83 @@ let p = Point { x: 3.0, y: 4.0 }
 - Interpreter: `ctypes.Structure` subclasses (exact C layout).
 - AOT: values are heap byte buffers (`M_TAG_STRUCT`) boxed at the
   boundary; field reads compile to GEP+load.
+
+### Nested structs (v3)
+
+```misa
+extern "c" {
+  struct Point { x: Int, y: Int },
+  struct Outer { tag: Bool, p: Point, n: Int },
+}
+let o = Outer { tag: true, p: Point { x: 3, y: 4 }, n: 5 }
+print(o.p.x)   // 3
+```
+
+- A field may be any other declared struct/union (E225 on unknown
+  types). Layout is recursive C layout: nested aggregates contribute
+  their own size/alignment, padding included.
+- Construction nests literals; field access chains (`o.p.x`)
+  type-checks through the nesting.
+- Cyclic by-value nesting is E225 (C requires complete types).
+- Interpreter: nested `ctypes.Structure` classes. AOT: nested LLVM
+  struct types; inner values marshal by unboxing the MVal*.
+
+### Unions (v3)
+
+```misa
+extern "c" {
+  union Value { i: Int, f: Float },
+}
+let v = Value { i: 42 }   // any subset of fields; unset bytes are zero
+print(v.i)                // 42 — read reinterprets last write
+```
+
+- `union` is a contextual keyword (identifier everywhere else).
+- Every field is at offset 0; size = max field size; alignment = max
+  field alignment. Reading a field reinterprets the stored bits
+  (write `i`, read `f`), exactly like C — including values that
+  crossed from C.
+- A union-typed variable may be read but a union literal may set any
+  subset of fields (structs still require every field, E211).
+- ABI subtlety, verified against `gcc -S`: a bare LLVM byte array
+  mislowers (passed on the stack) while C passes small unions in
+  registers. The backend coerces unions at the FFI boundary to the
+  SysV per-eightbyte register classes (`impl/misa/ffi_layout.py`:
+  `union_chunk_classes`): `{Int, Float}` → one integer register,
+  all-`Float` → one SSE register, 16-byte unions → two registers.
+  Unions over 16 bytes use the same `byval`/`sret` path as structs.
+- Interpreter: `ctypes.Union` (native). AOT: in-memory byte array
+  with bitcast field accessors; coerced type at calls.
+
+### Bitfields (v3)
+
+```misa
+extern "c" {
+  struct Flags { a: Int:3, b: Int:5, mode: Int },
+}
+let f = Flags { a: 5, b: 17, mode: 1 }
+```
+
+- Syntax `field: Int:N`, 1 ≤ N ≤ 64. Non-`Int` bitfields and widths
+  outside 1–64 are E225 (`:0` and unnamed bitfields are E225).
+- Packing follows GCC: consecutive bitfields share 8-byte (`Int`)
+  units, little-endian (bit 0 = LSB), never straddling a unit; a
+  non-bitfield field closes the open unit. In unions each bitfield
+  starts at bit 0 of offset 0 (matches GCC).
+- Bitfields are **unsigned** (`0 .. 2^N - 1`); an out-of-range
+  construction value is a catchable **E300** on both backends (no
+  silent truncation, no sign extension).
+- Endianness: little-endian only in v1 — all Misa targets (x86-64,
+  AArch64, ARMv7, wasm32) are little-endian. Documented; no E600
+  path needed.
+- There is no struct field *assignment* in Misa, so bitfields need
+  only construction packing + read extraction. Interpreter:
+  `ctypes` bitfield tuples. AOT: shift+mask insert/extract on the
+  unit word.
+- Layout authority: `impl/misa/ffi_layout.py` is the single source
+  of truth, shared by checker, interpreter, and AOT. The test suite
+  compiles a C reference with GCC and compares every offset, size,
+  alignment, and bit position (`ffi3: byte-exact C layout vs GCC`).
 
 ### Callbacks
 
@@ -178,3 +257,22 @@ headers.
       end-to-end via `snprintf` on interpreter + AOT.
 - [x] Clean E-codes for everything the backends can't do (E225/E211/
       E101/E102); full suites green (356 + 28 AOT parity).
+
+## Exit criteria (v3 — overtake final wave, 2026-10-07)
+
+- [x] Nested structs: recursive C layout (padding/alignment),
+      nested literals, chained field access — interpreter + AOT
+      byte-identical, round-trip through C by value.
+- [x] Unions: same-memory fields, write/read reinterpretation,
+      any-subset literals; SysV register-class coercion at the FFI
+      boundary verified against `gcc -S` (a bare LLVM byte array
+      mislowers to the stack — found and fixed).
+- [x] Bitfields: `Int:N` syntax, GCC packing rules (8-byte LE units,
+      no straddle), unsigned with catchable E300 on out-of-range
+      construction values, E225 on bad widths/non-Int.
+- [x] Byte-exact layout proof: the suite compiles a C reference with
+      GCC and compares every offset/size/alignment/bit position
+      against `impl/misa/ffi_layout.py`
+      (`ffi3: byte-exact C layout vs GCC`); `tests/aot/prog/a30_ffi3`
+      proves interpreter/AOT/C agreement end to end.
+- [x] Full suites green (411 + 33 AOT parity).

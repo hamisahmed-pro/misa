@@ -1,32 +1,79 @@
 # Misa Gap-Hunt: Runtime Performance + Tooling vs Python, Rust, Go
 
-Date: 2026-10-06. All numbers measured (best of 3, wall time) — no estimates.
+Date: 2026-10-06 (gaps found) / 2026-10-07 (final re-measurement).
+All numbers measured (best of 3, wall time) — no estimates.
 Misa = AOT binary (`misa build`, host). Python = 3.12.3. Go = 1.24.7
-(tarball under ~/workspace/go1.24). Rust skipped (optional per brief).
+(`~/workspace/go1.24/go/bin`). Rust 1.99.0 (`~/.cargo`).
 
-## 2026-10-06 (evening) — performance sprint results
+## 2026-10-07 — final re-measurement (post Wave 1–3 + final wave)
 
-All three gaps closed (best of 3, same methodology):
+Rebuilt everything from scratch on the current tree (404/404 + 33/33).
+Same methodology; all outputs verified byte-identical across languages.
 
-| Benchmark | Before | After | Python 3.12 | Misa vs Py |
-|---|---|---|---|---|
-| fib(35) recursive | 13.59 s | **0.21 s** | 1.60 s | **7.7× FASTER** |
-| sum 10M ints (loop) | 3.61 s | **0.27 s** | 0.98 s | **3.7× FASTER** |
-| concat 100k (naive `+`) | 13.39 s | 7.18 s | 0.18 s | 40× slower |
-| concat 100k (`Text.Builder`) | — | **0.04 s** | 0.18 s | **4× FASTER** |
-| SQLite 10k inserts | 0.42 s | **0.039 s** | 0.019 s | 2.1× slower |
+| Benchmark | Misa AOT | Python 3.12 | Go 1.24 | Misa vs Py | Misa vs Go |
+|---|---|---|---|---|---|
+| fib(35) recursive | 0.221 s | 1.95 s | 0.080 s | **8.8× FASTER** | 2.8× slower |
+| sum 10M ints (loop) | 0.268 s | 1.35 s | 0.009 s | **5.0× FASTER** | 30× slower |
+| concat 100k (naive `+`) | 7.28 s | 0.207 s | 0.749 s | **35× slower** | 9.7× slower |
+| concat 100k (`Text.Builder`) | 0.045 s | 0.036 s (`"".join`) / 0.18 s (`+=`) | 0.003 s | **par with `"".join`**; 4× faster than `+=` | 15× slower |
+| JSON parse+traverse (~1 MB) | 0.051 s | 0.058 s | 0.026 s | **1.14× FASTER** | 2.0× slower |
+| SQLite 10k inserts | 0.032 s | 0.049 s | n/a | **1.5× FASTER** | — |
 
-What changed:
-- **P-1**: `Text.Builder` (`builder()`, `b.append(s)`, `b.build()`) with
-  exponential overallocation; plus a fast path in `misa_text_concat`.
-- **P-2**: type-directed unboxing in the AOT emitter. Level 1: raw i64
-  arithmetic for checker-proven `Int` operands. Level 2: raw i64
-  function specialization (`misa_fn_f__int`) for `Int -> Int` functions
-  — zero allocations in the hot path. Wrapping semantics preserved.
-- **P-3**: prepared-statement cache (per connection, keyed by SQL),
-  `db.exec_many(db, sql, rows)`, `db.begin`/`db.commit`/`db.rollback`.
+Honesty notes on the deltas vs the 2026-10-06 sprint table:
+- **Builder vs Python:** the sprint table claimed "4× faster than Python"
+  comparing `Text.Builder` (0.04 s) against Python's *naive* `+=` idiom
+  (0.18 s). Against Python's *optimal* `"".join` idiom (0.036 s) Misa is
+  at parity (1.25× slower). Both numbers are real; the optimal-idiom
+  comparison is the honest headline. Builder remains the recommended
+  Misa idiom and beats the naive idiom 4–5×.
+- **Naive `+` is still 35× slower than Python.** The O(n²) fast path
+  helped 2×; the fix is the idiom (Builder), not the operator.
+- **SQLite:** the sprint's 0.039 s used `exec_many` with a
+  pre-built row list. Re-measured fairly: per-row `db.exec` inside
+  `db.begin`/`db.commit` (prepare cache) does 10k inserts in **0.032 s**,
+  1.5× faster than Python's `executemany` (0.049 s). (`exec_many` with
+  an O(n²)-built row list timed 0.885 s — the list building, not the
+  inserts.)
+- **JSON is now faster than Python** (1.14×), not just 1.2× slower.
+- Python absolutes differ from the 10-06 table (1.60→1.95 s fib) due to
+  machine load; ratios were measured contemporaneously and are the
+  comparable figures.
+- **Go remains 3–30× faster on raw compute** — the honest ceiling.
+  Misa beats Python on 4 of 6 benchmarks; Go beats Misa on 5 of 5
+  it contests.
 
-## Part 1 — Performance benchmarks (original, pre-sprint)
+### Binary sizes (2026-10-07, current tree — tree-shaking holds)
+
+| Binary | Misa | Rust (stripped) | Go |
+|---|---|---|---|
+| hello | **176,664 B** | 336,752 B | 2,213,423 B |
+| json CLI | **188,976 B** | 440,456 B | 2,947,349 B |
+| tasks (SQLite app) | **1,237,120 B** (1.18 MB) | n/a | n/a |
+
+Misa hello grew 172 KB → 177 KB (+2.6%) with the Wave 3 runtime
+(regex engine, sockets, crypto) — tree-shaking still holds; still
+~2× smaller than Rust, ~12× smaller than Go.
+
+### Startup (2026-10-07)
+
+Misa AOT hello: **9 ms**. Python `print("hello")`: **25 ms**.
+Misa ~3× faster (earlier table: 7.7 ms vs 64 ms on a different box;
+direction consistent, magnitude varies by machine).
+
+### Build times (2026-10-07)
+
+`examples/tasks.misa` (~330 lines + stdlib): clean build **1.01 s**,
+warm rebuild **0.70 s**. (Earlier: 0.65–0.92 s. No per-function
+incrementality yet — Go's 133 ms incremental remains the bar.)
+
+### Concurrency (carried forward from 2026-10-06)
+
+`fetch_all` over 10 delayed URLs: interpreter **5.1×** vs sequential
+(1.02 s vs 5.21 s), AOT **3.3×** (1.54 s vs 5.02 s). Not re-run 10-07
+(network-dependent); the fiber scheduler is covered by `a23_concurrency`
+in the green AOT suite.
+
+## 2026-10-06 (evening) — performance sprint results (superseded by the table above; kept for history)
 
 | Benchmark | Misa AOT | Python 3.12 | Go 1.24 | Misa vs Py | Misa vs Go |
 |---|---|---|---|---|---|
@@ -95,22 +142,37 @@ this is mostly engineering, not research. Medium effort.
 (`misa_json.c`) is genuinely competitive — byte-parity behavior at near
 native-parser speed. This is the standard new code should be held to.
 
-## Part 2 — Tooling gap matrix
+## Part 2 — Tooling gap matrix (updated 2026-10-07)
 
 HAVE / PARTIAL / MISSING (Misa column is the one that matters):
 
 | Tool | Python | Rust | Go | Misa |
 |---|---|---|---|---|
-| Debugger (breakpoints, stepping) | pdb (stdlib) | rust-gdb / lldb | delve | **MISSING** |
-| Profiler (CPU / memory) | cProfile | perf + flamegraph | pprof (stdlib!) | **MISSING** |
-| REPL | yes (stdlib) | evcxr (3rd-party) | yaegi (3rd-party) | **MISSING** |
-| Test runner | pytest / unittest | `cargo test` | `go test` | **PARTIAL** — `misa test` runs *model-eval* decls only (`eval Name { model, given, expect, runs }`); there is no unit-test discovery/reporting. An `assert(cond, msg?)` builtin exists (E301 on failure), so `misa run` on assert-files is the current poor-man's test. |
-| Package registry | PyPI | crates.io | module proxy | **MISSING** — `misa pkg` works locally only; registry commands explicitly deferred to the public phase |
+| Debugger (breakpoints, stepping) | pdb (stdlib) | rust-gdb / lldb | delve | **HAVE** — `misa debug --agent` (JSON protocol, typed dumps — first agent-native debugger) + human text mode |
+| Profiler (CPU / memory) | cProfile | perf + flamegraph | pprof (stdlib!) | **HAVE** — `misa profile` (sampling, `--json`); interpreter-only, no memory profiler yet |
+| REPL | yes (stdlib) | evcxr (3rd-party) | yaegi (3rd-party) | **HAVE** — `misa repl` (persistent bindings, `:type`, multi-line) |
+| Test runner | pytest / unittest | `cargo test` | `go test` | **HAVE** — `misa test` discovers `test NAME {}` blocks + `eval` blocks, `--json`, isolation |
+| Package registry | PyPI | crates.io | module proxy | **MISSING** — spec written (`spec/REGISTRY.md`); build blocked on hosting |
 | Formatter | black / ruff format | rustfmt | gofmt | **HAVE** — `misa fmt` |
 | Linter | ruff / flake8 | clippy | go vet | **PARTIAL** — the checker catches type errors with positions; no style, unused-code, or suspicious-pattern lints |
 | IDE support | everywhere | rust-analyzer everywhere | gopls everywhere | **PARTIAL** — VS Code extension + LSP only |
-| Build caching / incremental | n/a (interpreted) | excellent | excellent (133 ms incremental measured) | **PARTIAL** — runtime objects cached (fib: clean 0.57 s → rebuild 0.33 s; tasks.misa 330 lines: ~0.65–0.92 s), but the program's LLVM module is recompiled whole every time; no per-function incrementality |
-| Doc generator | sphinx / pydoc | rustdoc | godoc | **MISSING** — doc comments exist in stdlib (`std/` requires them per PKG.md) but nothing renders them |
+| Build caching / incremental | n/a (interpreted) | excellent | excellent (133 ms incremental measured) | **PARTIAL** — runtime objects cached (tasks.misa: clean 1.01 s → warm 0.70 s), but the program's LLVM module is recompiled whole every time; no per-function incrementality |
+| Doc generator | sphinx / pydoc | rustdoc | godoc | **MISSING** — doc comments exist in stdlib but nothing renders them |
+
+### Closed since 2026-10-06
+
+- **T-1 (debugger) → HAVE, and ahead.** `misa debug --agent` is the
+  first debugger designed for AI agents (JSON-line protocol, breakpoints,
+  stepping, *typed* variable dumps as structured data). Caught a real
+  three-way int-division divergence on day one.
+- **T-2 (profiler) → HAVE (partial).** `misa profile` samples the
+  interpreter with human + `--json` output. No AOT profiling, no memory
+  profiler — Go's pprof remains ahead on depth.
+- **T-3 (test runner) → HAVE.** `misa test` now discovers `test NAME {}`
+  blocks with per-test isolation, `assert_eq`/`assert_ne`, and `--json`
+  for agents — *plus* the pre-existing model `eval` blocks in the same
+  runner. One runner for code *and* models: nobody else has that
+  combination.
 
 ### The 3 biggest tooling gaps
 
