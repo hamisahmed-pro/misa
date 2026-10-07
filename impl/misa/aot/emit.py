@@ -2596,6 +2596,10 @@ class Emitter:
                 # P-2: raw i64 negation (no boxing).
                 if v.type == I64:
                     return b.neg(v, name="ineg")
+                # Float unboxing: raw double negation (no boxing).
+                if v.type == DBL:
+                    return b.fneg(v, name="fneg")
+                v = self._ensure_mval(v, e.operand, ctx)
                 return self.call(ctx, "misa_neg", [v, line, col], e)
             raise AOTError("E600", f"unknown unary '{e.op}'",
                            e.line, e.col)

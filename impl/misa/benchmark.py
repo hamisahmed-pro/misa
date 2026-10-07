@@ -122,6 +122,56 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs):
     }
 
 
+def bench_startup(misa_bin, runs=5):
+    """Measure hello-world startup time (launch to first output)."""
+    prog = 'print("hi")\n'
+    path = "/tmp/bench_hello.misa"
+    with open(path, "w") as f:
+        f.write(prog)
+    # Build once
+    bin_path = "/tmp/bench_hello_bin"
+    wall, out, err, rc = run_cmd([misa_bin, "build", path, "-o", bin_path])
+    if rc != 0:
+        return {"status": "build-failed", "error": err[:200]}
+    times = []
+    for _ in range(runs):
+        wall, out, err, rc = run_cmd([bin_path])
+        if rc != 0 or out.strip() != "hi":
+            return {"status": "run-failed", "error": err[:200]}
+        times.append(wall)
+    return {
+        "status": "ok",
+        "median": round(statistics.median(times), 4),
+        "times": [round(t, 4) for t in times],
+    }
+
+
+def bench_compile(misa_bin, runs=3):
+    """Measure compilation time (source to executable)."""
+    # Use nbody.misa as a medium-size program
+    root = _find_misa_root()
+    src = os.path.join(root, "bench", "external", "nbody.misa")
+    if not os.path.isfile(src):
+        return {"status": "missing-source"}
+    times = []
+    for _ in range(runs):
+        out_path = "/tmp/bench_compile_out"
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        wall, out, err, rc = run_cmd([misa_bin, "build", src, "-o", out_path])
+        if rc != 0:
+            return {"status": "build-failed", "error": err[:200]}
+        times.append(wall)
+    # Binary size
+    size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    return {
+        "status": "ok",
+        "median": round(statistics.median(times), 3),
+        "times": [round(t, 3) for t in times],
+        "binary_bytes": size,
+    }
+
+
 def run_benchmarks(runs=5, only=None):
     """Run the full suite, return results dict."""
     root = _find_misa_root()
@@ -136,6 +186,20 @@ def run_benchmarks(runs=5, only=None):
                       bench_dir, runs)
         r["description"] = desc
         results.append(r)
+
+    # Add startup and compile benchmarks (unless --only filters them out)
+    if not only or "startup" in only:
+        results.append({
+            "name": "startup",
+            "description": "Hello-world cold start (launch to output)",
+            **bench_startup(misa_bin, runs),
+        })
+    if not only or "compile" in only:
+        results.append({
+            "name": "compile",
+            "description": "AOT compilation time (nbody.misa)",
+            **bench_compile(misa_bin),
+        })
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -155,10 +219,14 @@ def to_markdown(data):
         f"**Generated:** {data['timestamp']}",
         f"**Methodology:** {data['methodology']}",
         "",
+        "## Compute Benchmarks (vs Python3)",
+        "",
         "| Benchmark | Python3 | Misa AOT | Ratio | Verdict |",
         "|-----------|---------|----------|-------|---------|",
     ]
     for r in data["results"]:
+        if r["name"] in ("startup", "compile"):
+            continue
         if r["status"] != "ok":
             lines.append(f"| {r['name']} | - | - | - | {r['status']} |")
             continue
@@ -169,6 +237,14 @@ def to_markdown(data):
         lines.append(
             f"| {r['name']} | {py}s | {misa}s | {ratio}x | {verdict} |"
         )
+    lines += ["", "## Startup & Compilation", ""]
+    for r in data["results"]:
+        if r["name"] == "startup" and r["status"] == "ok":
+            lines.append(f"- **Startup** (hello-world): {r['median']}s median")
+        if r["name"] == "compile" and r["status"] == "ok":
+            kb = r["binary_bytes"] // 1024
+            lines.append(f"- **Compile** (nbody.misa): {r['median']}s median, "
+                         f"{kb}KB binary")
     lines += [
         "",
         "_This report was generated from benchmark.json. Do not edit manually._",

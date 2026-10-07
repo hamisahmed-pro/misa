@@ -631,6 +631,23 @@ def cmd_benchmark(args):
     return bench_main(args)
 
 
+def cmd_fuzz(args):
+    """Canonical `misa fuzz` command.
+
+    Generates random programs and verifies interpreter == AOT.
+    (Implements Benchmark Review Plan §31: fuzzing in CI.)
+    """
+    from misa.fuzz import main as fuzz_main
+    # Convert misa CLI args to fuzz args
+    import sys
+    old_argv = sys.argv
+    sys.argv = ["misa-fuzz"] + args
+    try:
+        return fuzz_main()
+    finally:
+        sys.argv = old_argv
+
+
 def main(argv):
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         sys.stdout.write(__doc__)
@@ -700,6 +717,8 @@ def main(argv):
         return cmd_test(rest[0] if rest else ".", mock, as_json)
     if cmd == "benchmark":
         return cmd_benchmark(args)
+    if cmd == "fuzz":
+        return cmd_fuzz(args)
     if cmd == "build" and 1 <= len(args) <= 12:
         if "--list-targets" in args:
             return cmd_list_targets()
