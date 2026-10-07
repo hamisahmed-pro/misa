@@ -13,7 +13,7 @@ so later box/unbox elimination can be a mechanical dataflow pass.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Set
 
 Primitive = str
 
@@ -121,3 +121,96 @@ def dump(module: MIRModule) -> str:
                 lines.append(f"  {lhs}{ins.op} {args}{suffix}".rstrip())
             lines.append("}")
     return "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# MIR optimization passes
+
+_BINARY_FOLD = {
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul": lambda a, b: a * b,
+}
+
+def constant_fold(module: MIRModule) -> bool:
+    """Fold integer/float constants for pure arithmetic operations."""
+    changed = False
+    for fn in module.functions:
+        constants: Dict[int, object] = {}
+        for block in fn.blocks:
+            rewritten = []
+            for ins in block.instructions:
+                if ins.op == "const" and ins.result is not None:
+                    constants[ins.result.id] = ins.imm
+                    rewritten.append(ins)
+                    continue
+                if ins.op in _BINARY_FOLD and len(ins.args) == 2 and all(a.id in constants for a in ins.args):
+                    value = _BINARY_FOLD[ins.op](constants[ins.args[0].id], constants[ins.args[1].id])
+                    if ins.result is not None:
+                        constants[ins.result.id] = value
+                        rewritten.append(MIRInstr("const", ins.result, (), value))
+                        changed = True
+                        continue
+                rewritten.append(ins)
+            block.instructions = rewritten
+    return changed
+
+def eliminate_box_unbox(module: MIRModule) -> bool:
+    """Replace box -> unbox pairs with the original primitive value."""
+    changed = False
+    for fn in module.functions:
+        replacements: Dict[int, MIRValue] = {}
+        boxes: Dict[int, MIRValue] = {}
+        for block in fn.blocks:
+            out = []
+            for ins in block.instructions:
+                args = tuple(replacements.get(a.id, a) for a in ins.args)
+                if ins.op == "box" and ins.result is not None and len(args) == 1:
+                    boxes[ins.result.id] = args[0]
+                if ins.op == "unbox" and ins.result is not None and len(args) == 1:
+                    source = boxes.get(args[0].id)
+                    if source is not None and source.type == ins.result.type:
+                        replacements[ins.result.id] = source
+                        changed = True
+                        continue
+                out.append(MIRInstr(ins.op, ins.result, args, ins.imm))
+            block.instructions = out
+        if replacements:
+            for block in fn.blocks:
+                block.instructions = [
+                    MIRInstr(i.op, i.result, tuple(replacements.get(a.id, a) for a in i.args), i.imm)
+                    for i in block.instructions
+                ]
+    return changed
+
+def dead_code_eliminate(module: MIRModule) -> bool:
+    """Remove pure instructions whose results are never consumed."""
+    side_effecting = {"call", "store", "branch", "cond_branch", "return", "throw", "box", "unbox"}
+    changed = False
+    for fn in module.functions:
+        used: Set[int] = set()
+        for block in fn.blocks:
+            for ins in block.instructions:
+                used.update(a.id for a in ins.args)
+            if block.terminator:
+                used.update(a.id for a in block.terminator.args)
+        for block in fn.blocks:
+            kept = []
+            for ins in block.instructions:
+                if ins.result is not None and ins.result.id not in used and ins.op not in side_effecting:
+                    changed = True
+                    continue
+                kept.append(ins)
+            block.instructions = kept
+    return changed
+
+def optimize(module: MIRModule, max_rounds: int = 8) -> int:
+    """Run core MIR passes to a fixpoint; return number of changed rounds."""
+    rounds = 0
+    for _ in range(max_rounds):
+        changed = constant_fold(module) or False
+        changed = eliminate_box_unbox(module) or changed
+        changed = dead_code_eliminate(module) or changed
+        if not changed:
+            break
+        rounds += 1
+    return rounds
