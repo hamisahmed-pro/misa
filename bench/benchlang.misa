@@ -3,13 +3,13 @@
 // 2731f29bcf0bfda750a62c81337b5e5e7456bb4a.
 // This file is benchmark infrastructure, not a language feature demo.
 
-const PRIMES_LIMIT = 20000000
-const FIBONACCI_N = 45
-const STRING_ITER = 5000000
-const MANDEL_SIZE = 4096
-const MANDEL_MAX_ITER = 256
-const TREE_MIN_DEPTH = 4
-const TREE_MAX_DEPTH = 18
+var PRIMES_LIMIT = 20000000
+var FIBONACCI_N = 45
+var STRING_ITER = 5000000
+var MANDEL_SIZE = 4096
+var MANDEL_MAX_ITER = 256
+var TREE_MIN_DEPTH = 4
+var TREE_MAX_DEPTH = 18
 
 type Node {
   left: Node?,
