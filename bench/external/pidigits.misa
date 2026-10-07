@@ -174,15 +174,26 @@ fn bigint_div_int_quotient(a: [Int], b: [Int]) -> [Int] throws E300 {
   return result
 }
 
+fn extract_digit(num: [Int], acc: [Int], den: [Int], nth: Int) -> Int throws E300 {
+  // (num * nth + acc) / den, returns quotient as Int
+  let tmp1 = bigint_mul_small(num, nth)
+  let tmp2 = bigint_add(tmp1, acc)
+  let divres = bigint_div_int_quotient(tmp2, den)
+  return divres[0]
+}
+
 fn main() throws E300 {
   var n = 27
   let args = argv()
   if len(args) > 1 {
     n = int(args[1])
   }
-  // Spigot algorithm (same as Python GMP version):
-  // acc, den, num are BigInts
-  // Loop: k++, update acc/den/num, extract digit, eliminate digit
+  // Spigot algorithm (matches Python GMP version exactly):
+  // while i < n:
+  //   k++; next_Term(k)
+  //   if num > acc: continue
+  //   d = extract_Digit(3); if d != extract_Digit(4): continue
+  //   emit d; i++; eliminate_Digit(d)
   
   var acc = bigint_from_int(0)
   var den = bigint_from_int(1)
@@ -201,34 +212,26 @@ fn main() throws E300 {
     den = bigint_mul_small(den, k2)
     num = bigint_mul_small(num, k)
     
-    // extract_Digit(k+1): (num*(k+1) + acc) / den
-    let tmp1 = bigint_mul_small(num, k + 1)
-    let tmp2 = bigint_add(tmp1, acc)
-    // Need (tmp2 / den) as int, and remainder
-    let divres = bigint_div_int_quotient(tmp2, den)
-    let digit = divres[0]
-    // Reconstruct remainder from divres[1:]
-    var rem: [Int] = []
-    var ri = 1
-    while ri < len(divres) {
-      rem = rem + [divres[ri]]
-      ri = ri + 1
-    }
-    
-    // Check if digit is stable (compare with next term)
-    // Simplified: always emit (the Python version does more checks,
-    // but for the benchmark we need the core loop)
-    
-    // eliminate_Digit(digit): acc -= den*digit; acc *= 10; num *= 10
-    let den_digit = bigint_mul_small(den, digit)
-    acc = bigint_sub(acc, den_digit)
-    acc = bigint_mul_small(acc, 10)
-    num = bigint_mul_small(num, 10)
-    
-    out = out + str(digit)
-    digits = digits + 1
-    if digits % 10 == 0 {
-      out = out + "\n"
+    // if num <= acc: try to extract digit
+    if bigint_cmp(num, acc) <= 0 {
+      // d = extract_Digit(3); if d == extract_Digit(4): emit
+      let d3 = extract_digit(num, acc, den, 3)
+      let d4 = extract_digit(num, acc, den, 4)
+      if d3 == d4 {
+        let digit = d3
+        
+        // eliminate_Digit(digit): acc -= den*digit; acc *= 10; num *= 10
+        let den_digit = bigint_mul_small(den, digit)
+        acc = bigint_sub(acc, den_digit)
+        acc = bigint_mul_small(acc, 10)
+        num = bigint_mul_small(num, 10)
+        
+        out = out + str(digit)
+        digits = digits + 1
+        if digits % 10 == 0 {
+          out = out + "\t:" + str(digits) + "\n"
+        }
+      }
     }
   }
   print(out)
