@@ -2499,8 +2499,11 @@ class Emitter:
             idx = self.emit_expr(e.idx, ctx)
             self.check(ctx, e)
             line, col = self.loc(e)
-            # Fast path: raw i64 index avoids boxing
-            if idx.type == I64:
+            # Fast path: raw i64 index avoids boxing — ONLY for lists.
+            # For Text (and other types), use the generic path which
+            # dispatches correctly. Using misa_list_get_raw on a Text
+            # causes "index on non-list".
+            if idx.type == I64 and self._is_list_expr(e.obj, ctx):
                 return self.call(ctx, "misa_list_get_raw",
                                  [obj, idx, line, col], e)
             idx = self._ensure_mval(idx, e.idx, ctx)
@@ -2668,6 +2671,15 @@ class Emitter:
                                 for p in decl.params)):
                     return True
             return False
+        return False
+
+    def _is_list_expr(self, e, ctx: FnCtx) -> bool:
+        """Conservative: is e definitely a List? Used for index fast path."""
+        # TODO: track list-typed variables. For now, only ListLit is certain.
+        # This disables the misa_list_get_raw fast path for variables,
+        # fixing the Text indexing bug (was incorrectly using list fast path).
+        if isinstance(e, A.ListLit):
+            return True
         return False
 
     def _is_float_expr(self, e, ctx: FnCtx) -> bool:

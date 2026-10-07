@@ -1,5 +1,16 @@
-// knucleotide — Misa port (k-mer counting with maps)
-// Counts frequency of k-mers in DNA sequence.
+// knucleotide — Misa port (using list of pairs instead of Map)
+// Counts 3-mers in DNA sequence. Uses linear search (64 max distinct).
+
+fn find_idx(pairs: [[Text]], kmer: Text) -> Int throws E300 {
+  var i = 0
+  while i < len(pairs) {
+    if pairs[i][0] == kmer {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
 
 fn main() throws E300 {
   var n = 10000
@@ -7,34 +18,40 @@ fn main() throws E300 {
   if len(args) > 1 {
     n = int(args[1])
   }
-  // Generate test sequence
-  var seq = ""
+  // Use builder explicitly to avoid auto-transformation issues with indexing
+  let b = builder()
   let bases = ["a", "c", "g", "t"]
   var i = 0
   while i < n {
-    seq = seq + bases[i % 4]
+    b.append(bases[i % 4])
     i = i + 1
   }
-  // Count 3-mers
-  var counts: Map<Text, Int> = {}
+  let seq = b.build()
+  // Count 3-mers using list of [kmer, count] pairs
+  var pairs: [[Text]] = []
+  // Actually need [Text, Int] pairs — use parallel lists
+  var keys: [Text] = []
+  var vals: [Int] = []
   i = 0
   while i < n - 3 {
     let kmer = seq[i] + seq[i+1] + seq[i+2]
-    // Use try/catch for missing key, or check via keys()
-    var found = false
-    for k in counts.keys() {
-      if k == kmer {
-        found = true
+    var found = -1
+    var j = 0
+    while j < len(keys) {
+      if keys[j] == kmer {
+        found = j
       }
+      j = j + 1
     }
-    if found {
-      counts[kmer] = counts[kmer] + 1
+    if found >= 0 {
+      vals[found] = vals[found] + 1
     } else {
-      counts[kmer] = 1
+      keys = keys + [kmer]
+      vals = vals + [1]
     }
     i = i + 1
   }
-  print(len(counts))
+  print(len(keys))
 }
 
 main()

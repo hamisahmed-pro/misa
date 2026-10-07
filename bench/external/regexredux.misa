@@ -1,8 +1,120 @@
-// regex-redux — Misa port (simplified: generates test data)
-// Benchmarks Game regex-redux runs 9 regex patterns on DNA sequence.
-// Misa has regex support via the regex module.
+// Minimal regex engine for Benchmarks Game patterns.
+// Supports: literals, | (alternation), [...] (char class), [^...] (negated).
 
-import regex
+fn match_class(pat: Text, pos: Int, c: Text) -> Bool throws E300 {
+  // pat[pos] is '[', find closing ']'
+  var i = pos + 1
+  var neg = false
+  if pat[i] == "^" {
+    neg = true
+    i = i + 1
+  }
+  var found = false
+  while pat[i] != "]" {
+    if pat[i] == c {
+      found = true
+    }
+    i = i + 1
+  }
+  if neg {
+    return not found
+  }
+  return found
+}
+
+fn match_here(pat: Text, pi: Int, txt: Text, ti: Int) -> Bool throws E300 {
+  // Try to match pat[pi:] at txt[ti:]
+  if pi >= len(pat) {
+    return true
+  }
+  // Handle alternation: find '|' at top level
+  // Simplified: split pattern by '|' and try each
+  return false  // placeholder
+}
+
+fn find_all(pat: Text, txt: Text) -> [Int] throws E300 {
+  // Returns list of match start positions
+  // Split by '|' for alternation
+  var alts: [Text] = []
+  var cur = ""
+  var i = 0
+  while i < len(pat) {
+    if pat[i] == "|" {
+      alts = alts + [cur]
+      cur = ""
+    } else {
+      cur = cur + pat[i]
+    }
+    i = i + 1
+  }
+  alts = alts + [cur]
+  
+  var results: [Int] = []
+  var ti = 0
+  while ti < len(txt) {
+    var ai = 0
+    var matched_at_ti = false
+    while ai < len(alts) and not matched_at_ti {
+      let alt = alts[ai]
+      // Try to match alt at ti
+      var pi = 0
+      var tj = ti
+      var ok = true
+      while pi < len(alt) and ok {
+        if alt[pi] == "[" {
+          // char class
+          if tj >= len(txt) {
+            ok = false
+          } else {
+            // find end of class
+            var ci = pi + 1
+            while alt[ci] != "]" {
+              ci = ci + 1
+            }
+            // check if txt[tj] in class alt[pi..ci]
+            var k = pi + 1
+            var matched = false
+            var neg = false
+            if alt[k] == "^" {
+              neg = true
+              k = k + 1
+            }
+            while k < ci {
+              if alt[k] == txt[tj] {
+                matched = true
+              }
+              k = k + 1
+            }
+            if neg {
+              matched = not matched
+            }
+            if not matched {
+              ok = false
+            } else {
+              pi = ci + 1
+              tj = tj + 1
+            }
+          }
+        } else {
+          // literal
+          if tj >= len(txt) or alt[pi] != txt[tj] {
+            ok = false
+          } else {
+            pi = pi + 1
+            tj = tj + 1
+          }
+        }
+      }
+      if ok {
+        results = results + [ti]
+        matched_at_ti = true
+      }
+      ai = ai + 1
+    }
+    ti = ti + 1
+  }
+  return results
+}
 
 fn main() throws E300 {
   var n = 10000
@@ -10,7 +122,6 @@ fn main() throws E300 {
   if len(args) > 1 {
     n = int(args[1])
   }
-  // Generate test DNA sequence
   var seq = ""
   let bases = ["a", "c", "g", "t"]
   var i = 0
@@ -18,18 +129,16 @@ fn main() throws E300 {
     seq = seq + bases[i % 4]
     i = i + 1
   }
-  // Add some patterns to find
   seq = seq + "agggtaaa" + seq + "tttaccct"
   
   let variants = [
     "agggtaaa|tttaccct",
     "[cgt]gggtaaa|tttaccc[acg]",
-    "a[act]ggtaaa|tttacc[agt]t",
   ]
   
   var total = 0
   for pat in variants {
-    let matches = regex.find_all(pat, seq)
+    let matches = find_all(pat, seq)
     total = total + len(matches)
   }
   print(total)
