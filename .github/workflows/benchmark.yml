@@ -1,0 +1,36 @@
+name: Cross-language benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "bench/benchlang.misa"
+      - "bench/benchlang_run.py"
+      - ".github/workflows/benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          python3 --version
+          node --version
+          php --version
+          go version
+          rustc --version
+          cargo --version
+          clang --version
+
+      - name: Install Misa dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check llvmlite==0.50.0
+
+      - name: Run five-language benchmark
+        run: python3 bench/benchlang_run.py
