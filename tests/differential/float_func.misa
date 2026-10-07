@@ -1,0 +1,4 @@
+fn fadd(a: Float, b: Float) -> Float {
+  return a + b
+}
+print(fadd(1.5, 2.5))

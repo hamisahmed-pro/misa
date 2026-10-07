@@ -107,3 +107,25 @@ eval diagnose_healthy_plant {
 
 Dual-licensed MIT / Apache-2.0 (see LICENSE-MIT, LICENSE-APACHE),
 the same arrangement as Rust.
+
+<!-- STATUS:START -->
+## Project Status
+
+**Version:** 0.3.0
+
+| Phase | Name | Status |
+|-------|------|--------|
+| 1 | Spec & Interpreter | ✅ complete |
+| 2 | LLVM AOT Backend | ✅ complete |
+| 3 | Type System (generics, sum types, match) | ✅ complete |
+| 4 | Concurrency (structured, typed, budgeted) | ✅ complete |
+| 5 | Package Registry | ✅ complete |
+| 6 | Cross-Platform (Android, iOS, WASM) | 🚧 in-progress — Android beta, iOS beta (ABI fixed), WASM broken (time.parse) |
+| 7 | Performance Optimization | 🚧 in-progress — Int/float unboxing done, string builder done, typed arrays pending, MIR planned |
+| 8 | Ignition (public launch) | ⏳ not-started — Waiting for community, visibility, launch strategy per Hamis |
+| 9 | Flywheel (ecosystem growth) | ⏳ not-started |
+
+**Tests:** 473 unit, 36 AOT parity, 10 differential
+
+<!-- STATUS:GENERATED — do not hand-edit. Run tools/gen_readme.py to regenerate. -->
+<!-- STATUS:END -->

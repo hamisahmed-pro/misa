@@ -1,0 +1,7 @@
+fn outer() -> Int {
+  fn inner(x: Int) -> Int {
+    return x * 2
+  }
+  return inner(21)
+}
+print(outer())
