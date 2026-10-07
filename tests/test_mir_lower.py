@@ -14,7 +14,7 @@ fn add(a: Int, b: Int) -> Int {
 }
 """)
     mod = lower_program(prog)
-    assert not MIRLowerError
+    assert mod.functions and mod.functions[0].name == "add"
     assert "fn add" in dump(mod)
     optimize(mod)
     assert "mul" in dump(mod)
