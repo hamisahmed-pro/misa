@@ -13,6 +13,8 @@ Methodology (per corrected 2026-10-07 harness):
 import json
 import os
 import statistics
+import hashlib
+import platform
 import subprocess
 import sys
 import time
@@ -55,24 +57,34 @@ def _find_misa_root():
 
 
 def run_cmd(cmd, timeout=300):
-    """Run command, return (wall_seconds, stdout, stderr, returncode)."""
+    """Run command, return (wall_seconds, stdout, stderr, returncode, peak_rss_kb)."""
+    timed = ["/usr/bin/time", "-f", "%e %M"] + cmd
+
     start = time.perf_counter()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(timed, capture_output=True, text=True,
                            timeout=timeout)
         wall = time.perf_counter() - start
-        return wall, r.stdout, r.stderr, r.returncode
+        meta = r.stderr.rstrip().splitlines()
+        rss = None
+        if meta:
+            parts = meta[-1].split()
+            if len(parts) == 2:
+                try: rss = int(parts[1])
+                except ValueError: pass
+                r.stderr = "\n".join(meta[:-1])
+        return wall, r.stdout, r.stderr, r.returncode, rss
     except subprocess.TimeoutExpired:
-        return None, "", "timeout", -1
+        return None, "", "timeout", -1, None
 
 
 def build_misa(misa_bin, misa_file, out_path):
     """Build Misa file to binary ONCE (outside timed region)."""
-    wall, out, err, rc = run_cmd([misa_bin, "build", misa_file, "-o", out_path])
+    wall, out, err, rc, _ = run_cmd([misa_bin, "build", misa_file, "-o", out_path])
     return rc == 0, err
 
 
-def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs):
+def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs, warmups=3):
     """Run one benchmark, return result dict."""
     misa_path = os.path.join(bench_dir, misa_file)
     py_path = os.path.join(bench_dir, python_file)
@@ -86,21 +98,37 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs):
     if not ok:
         return {"name": name, "status": "build-failed", "error": err[:200]}
 
-    # Time Misa (execution only)
+    # Warmup outside measurements, then independent process measurements.
+    for _ in range(warmups):
+        wall, out, err, rc, _rss = run_cmd([bin_path, arg])
+        if rc != 0: return {"name": name, "status": "misa-failed", "error": err[:200]}
     misa_times = []
+    misa_rss = []
+    misa_out = None
     for _ in range(runs):
-        wall, out, err, rc = run_cmd([bin_path, arg])
+        wall, out, err, rc, rss = run_cmd([bin_path, arg])
         if rc != 0:
             return {"name": name, "status": "misa-failed", "error": err[:200]}
-        misa_times.append(wall)
+        misa_times.append(wall); misa_rss.append(rss or 0)
+        if misa_out is None: misa_out = out
+        elif out != misa_out: return {"name": name, "status": "nondeterministic-misa"}
 
     # Time Python
+    for _ in range(warmups):
+        wall, out, err, rc, _rss = run_cmd(["python3", py_path, arg])
+        if rc != 0: return {"name": name, "status": "python-failed", "error": err[:200]}
     py_times = []
+    py_rss = []
+    py_out = None
     for _ in range(runs):
-        wall, out, err, rc = run_cmd(["python3", py_path, arg])
+        wall, out, err, rc, rss = run_cmd(["python3", py_path, arg])
         if rc != 0:
             return {"name": name, "status": "python-failed", "error": err[:200]}
-        py_times.append(wall)
+        py_times.append(wall); py_rss.append(rss or 0)
+        if py_out is None: py_out = out
+        elif out != py_out: return {"name": name, "status": "nondeterministic-python"}
+    if misa_out != py_out:
+        return {"name": name, "status": "checksum-mismatch", "misa_sha256": hashlib.sha256(misa_out.encode()).hexdigest(), "python_sha256": hashlib.sha256(py_out.encode()).hexdigest()}
 
     misa_med = statistics.median(misa_times)
     py_med = statistics.median(py_times)
@@ -111,11 +139,19 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs):
         "status": "ok",
         "misa": {
             "median": round(misa_med, 3),
-            "times": [round(t, 3) for t in misa_times],
+            "times": [round(t, 6) for t in misa_times],
+            "p95": round(sorted(misa_times)[max(0, int(len(misa_times)*0.95)-1)], 6),
+            "min": round(min(misa_times), 6), "max": round(max(misa_times), 6),
+            "stddev": round(statistics.stdev(misa_times), 6) if len(misa_times)>1 else 0,
+            "peak_rss_kb": max(misa_rss),
         },
         "python": {
             "median": round(py_med, 3),
-            "times": [round(t, 3) for t in py_times],
+            "times": [round(t, 6) for t in py_times],
+            "p95": round(sorted(py_times)[max(0, int(len(py_times)*0.95)-1)], 6),
+            "min": round(min(py_times), 6), "max": round(max(py_times), 6),
+            "stddev": round(statistics.stdev(py_times), 6) if len(py_times)>1 else 0,
+            "peak_rss_kb": max(py_rss),
         },
         "ratio_misa_python": round(ratio, 2) if ratio else None,
         "verdict": "faster" if ratio and ratio < 1 else "slower",
@@ -135,7 +171,7 @@ def bench_startup(misa_bin, runs=5):
         return {"status": "build-failed", "error": err[:200]}
     times = []
     for _ in range(runs):
-        wall, out, err, rc = run_cmd([bin_path])
+        wall, out, err, rc, _rss = run_cmd([bin_path])
         if rc != 0 or out.strip() != "hi":
             return {"status": "run-failed", "error": err[:200]}
         times.append(wall)
@@ -158,7 +194,7 @@ def bench_compile(misa_bin, runs=3):
         out_path = "/tmp/bench_compile_out"
         if os.path.exists(out_path):
             os.remove(out_path)
-        wall, out, err, rc = run_cmd([misa_bin, "build", src, "-o", out_path])
+        wall, out, err, rc, _rss = run_cmd([misa_bin, "build", src, "-o", out_path])
         if rc != 0:
             return {"status": "build-failed", "error": err[:200]}
         times.append(wall)
@@ -183,7 +219,7 @@ def run_benchmarks(runs=5, only=None):
         if only and name not in only:
             continue
         r = bench_one(name, misa_file, python_file, arg, misa_bin,
-                      bench_dir, runs)
+                      bench_dir, runs, warmups=3)
         r["description"] = desc
         results.append(r)
 
@@ -206,6 +242,9 @@ def run_benchmarks(runs=5, only=None):
         "methodology": "misa-benchmark-v1: external wall time, AOT built "
                        "outside timed region, 5 runs median",
         "misa_version": "AOT",
+        "host": platform.platform(),
+        "cpu": platform.processor(),
+        "methodology": "external wall time; 3 warmups; measured independent processes; median/p95/min/max/stddev; peak RSS; exact stdout equality",
         "python_version": "3.12",
         "results": results,
     }
@@ -268,7 +307,7 @@ def to_csv(data):
 
 def main(argv):
     """Entry point for `misa benchmark`."""
-    runs = 5
+    runs = 10
     only = None
     fmt = "json"
     out = None
