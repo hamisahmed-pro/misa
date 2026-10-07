@@ -175,11 +175,17 @@ class Lexer:
             t = self._tok("...", "...")
             self.advance(3)
             return t
-        if ch in "+-*/%()[]{}.,:|=?<>!@":
+        if ch in "+-*/%()[]{}.,:|=?<>!@&^":
             # Phase 5 (DB): `@` for `@primary` in table declarations.
-            if ch == "!" :
+            if ch == "!":
                 raise LexError("unexpected '!'; did you mean '!=' or 'not'?",
                                line, col)
+            # Multi-char bitwise shifts: << >>
+            if ch in "<>":
+                if self.peek(1) == ch:
+                    t = self._tok(ch * 2, ch * 2)
+                    self.advance(); self.advance()
+                    return t
             t = self._tok(ch, ch)
             self.advance()
             return t
@@ -206,6 +212,19 @@ class Lexer:
             buf += self.advance()
             while self.peek().isdigit():
                 buf += self.advance()
+        # scientific notation: 1e10, 1.6e-03, 2E+5
+        if self.peek() in ("e", "E"):
+            # need digit after e, or sign+digit
+            j = 1
+            if self.peek(1) in ("+", "-"):
+                j = 2
+            if self.peek(j).isdigit():
+                is_float = True
+                buf += self.advance()  # e/E
+                if self.peek() in ("+", "-"):
+                    buf += self.advance()
+                while self.peek().isdigit():
+                    buf += self.advance()
         # duration suffix?
         rest = self.src[self.i:self.i + 2]
         suffix = ""

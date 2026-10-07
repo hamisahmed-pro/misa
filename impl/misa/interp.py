@@ -1346,11 +1346,16 @@ class Interpreter:
                 f"operator '+' cannot be applied to "
                 f"{type(l).__name__} and {type(r).__name__}")
         if op in ("-", "*", "/", "%"):
-            if not isinstance(l, (int, float)) or not isinstance(r, (int, float)) \
-                    or isinstance(l, bool) or isinstance(r, bool):
-                raise TypeMismatch(
-                    f"operator '{op}' cannot be applied to "
-                    f"{type(l).__name__} and {type(r).__name__}")
+            # Allow list repetition: [T] * Int
+            is_list_repeat = (op == "*" and
+                ((isinstance(l, list) and isinstance(r, int) and not isinstance(r, bool)) or
+                 (isinstance(l, int) and not isinstance(l, bool) and isinstance(r, list))))
+            if not is_list_repeat:
+                if not isinstance(l, (int, float)) or not isinstance(r, (int, float)) \
+                        or isinstance(l, bool) or isinstance(r, bool):
+                    raise TypeMismatch(
+                        f"operator '{op}' cannot be applied to "
+                        f"{type(l).__name__} and {type(r).__name__}")
         if op == "-":
             if isinstance(l, int) and isinstance(r, int):
                 return wrap_i64(l - r)
@@ -1358,6 +1363,17 @@ class Interpreter:
         if op == "*":
             if isinstance(l, int) and isinstance(r, int):
                 return wrap_i64(l * r)
+            # List repetition: [x] * n
+            if isinstance(l, list) and isinstance(r, int):
+                if r < 0:
+                    raise RuntimeError_("negative repeat count",
+                                         line=e.line, col=e.col)
+                return l * r
+            if isinstance(l, int) and isinstance(r, list):
+                if l < 0:
+                    raise RuntimeError_("negative repeat count",
+                                         line=e.line, col=e.col)
+                return r * l
             return l * r
         if op == "/":
             # C-5: clean E300, never a Python traceback (and catchable).
@@ -1378,6 +1394,24 @@ class Interpreter:
             except ZeroDivisionError:
                 raise RuntimeError_("division by zero",
                                      line=e.line, col=e.col)
+        # Bitwise operators (Int only, 64-bit wrapping)
+        if op in ("&", "|", "^", "<<", ">>"):
+            if not isinstance(l, int) or not isinstance(r, int) \
+                    or isinstance(l, bool) or isinstance(r, bool):
+                raise TypeMismatch(
+                    f"operator '{op}' cannot be applied to "
+                    f"{type(l).__name__} and {type(r).__name__}")
+            if op == "&":
+                return wrap_i64(l & r)
+            if op == "|":
+                return wrap_i64(l | r)
+            if op == "^":
+                return wrap_i64(l ^ r)
+            if op == "<<":
+                return wrap_i64(l << r)
+            if op == ">>":
+                # arithmetic shift
+                return wrap_i64(l >> r)
         if op == "%":
             if isinstance(l, int) and isinstance(r, int):
                 if r == 0:
@@ -1691,6 +1725,12 @@ class Interpreter:
             return self.time_parse(args[0], args[1], e)
         if name == "math.sqrt":
             return self.math_unary("sqrt", args[0], e, math.sqrt)
+        if name == "math.cos":
+            return self.math_unary("cos", args[0], e, math.cos)
+        if name == "math.sin":
+            return self.math_unary("sin", args[0], e, math.sin)
+        if name == "math.tan":
+            return self.math_unary("tan", args[0], e, math.tan)
         if name == "math.pow":
             return self.math_binary("pow", args[0], args[1], e)
         if name == "math.abs":
@@ -3472,6 +3512,17 @@ class Interpreter:
             return render_value(args[0])
         if name == "len":
             return len(args[0])
+        if name == "range":
+            # range(n) -> [0..n-1]; range(a, b) -> [a..b-1]; range(a, b, s)
+            if len(args) == 1:
+                start, stop, step = 0, args[0], 1
+            elif len(args) == 2:
+                start, stop, step = args[0], args[1], 1
+            else:
+                start, stop, step = args[0], args[1], args[2]
+            if step == 0:
+                raise RuntimeError_("range() step cannot be zero")
+            return list(range(start, stop, step))
         if name == "str":
             return render_value(args[0])
         if name == "int":

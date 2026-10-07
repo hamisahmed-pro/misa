@@ -966,3 +966,82 @@ def _link_emcc(obj_bytes: bytes, out_path: str, target: str,
         if r.returncode != 0:
             return False, _err("E600", f"emcc link failed:\n{r.stderr}")
     return True, []
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 JIT plan: content-hashed AOT compilation cache.
+# `misa run` builds through this so repeated runs are instant.
+# ---------------------------------------------------------------------------
+
+def _cache_dir() -> str:
+    d = os.path.join(os.path.expanduser("~"), ".cache", "misa", "aot")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cache_key_for(path: str) -> str:
+    """sha256 over toolchain version + every source file in the import
+    closure. Any edit to any imported file changes the key."""
+    import hashlib
+    sys.path.insert(0, IMPL_DIR)
+    from misa import __version__ as _v  # noqa
+    from misa.loader import load as load_with_imports
+    h = hashlib.sha256()
+    h.update(("misa-aot-cache-v1:" + _v).encode())
+    try:
+        _merged, _errs, order, _file_of = load_with_imports(path)
+        files = sorted(set(order or []))
+    except Exception:
+        files = [path]
+    # Always include the main file even if the loader failed.
+    if path not in files:
+        files.append(path)
+    for f in sorted(set(files)):
+        try:
+            with open(f, "rb") as fh:
+                h.update(b"\x00" + f.encode() + b"\x00")
+                h.update(fh.read())
+        except OSError:
+            h.update(b"\x00missing:" + f.encode())
+    return h.hexdigest()
+
+
+def build_cached(path: str, *, target: str = "",
+                 verbose: bool = False):
+    """Build via the content-hash cache.
+
+    Returns (status, payload) where status is one of:
+      "hit"      -> payload is the cached binary path (ready to exec)
+      "built"    -> payload is the freshly built binary path
+      "error"    -> payload is the errors list (frontend/AOT failure)
+      "rejected" -> payload is the AOTError (program not AOT-coverable;
+                    caller should fall back to the interpreter)
+    """
+    from misa.aot.emit import AOTError
+    key = cache_key_for(path)
+    out = os.path.join(_cache_dir(), key, "prog")
+    if os.path.isfile(out) and os.access(out, os.X_OK):
+        return "hit", out
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp_out = out + ".tmp"
+    try:
+        ok, errors = build(path, tmp_out, target=target, verbose=verbose)
+    except AOTError as e:
+        return "rejected", e
+    except RuntimeError as e:
+        return "error", [{"code": "E600", "message": str(e),
+                          "line": 0, "col": 0}]
+    if not ok:
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
+        return "error", errors
+    try:
+        os.replace(tmp_out, out)
+        os.chmod(out, 0o755)
+    except OSError as e:
+        return "error", [{"code": "E600",
+                          "message": f"cache install failed: {e}",
+                          "line": 0, "col": 0}]
+    return "built", out

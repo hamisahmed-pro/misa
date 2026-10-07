@@ -1,0 +1,54 @@
+// Are We Fast Yet — Storage benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/storage.py
+// The SOM Random LCG uses `& 65535`; Misa has no bitwise `&`, so we use
+// `% 65536`, which is identical for the non-negative values here.
+
+type Rand {
+  seed: Int,
+}
+
+fn rand_next(r: Rand) -> Int {
+  var rr = r
+  rr.seed = ((rr.seed * 1309) + 13849) % 65536
+  return rr.seed
+}
+
+type Storage {
+  count: Int,
+}
+
+type STree {
+  Leaf(size: Int),
+  Node(kids: [STree]),
+}
+
+fn build_tree_depth(st: Storage, r: Rand, depth: Int) -> STree {
+  var ss = st
+  ss.count = ss.count + 1
+  if depth == 1 {
+    let n = (rand_next(r) % 10) + 1
+    return STree.Leaf(n)
+  }
+  var kids: [STree] = []
+  var i = 0
+  while i < 4 {
+    kids = kids + [build_tree_depth(st, r, depth - 1)]
+    i = i + 1
+  }
+  return STree.Node(kids)
+}
+
+fn benchmark() -> Int {
+  var r: Rand = { seed: 74755 }
+  var st: Storage = { count: 0 }
+  build_tree_depth(st, r, 7)
+  return st.count
+}
+
+let result = benchmark()
+print("RESULT: {result}")
+if result == 5461 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL")
+}

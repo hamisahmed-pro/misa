@@ -1192,8 +1192,44 @@ class Parser:
         return left
 
     def parse_cmp(self) -> ast.Node:
-        left = self.parse_add()
+        left = self.parse_bitor()
         while self.at("<") or self.at("<=") or self.at(">") or self.at(">="):
+            t = self.advance()
+            right = self.parse_bitor()
+            left = ast.BinOp(op=t.kind, left=left, right=right,
+                             line=t.line, col=t.col)
+        return left
+
+    def parse_bitor(self) -> ast.Node:
+        left = self.parse_bitxor()
+        while self.at("|"):
+            t = self.advance()
+            right = self.parse_bitxor()
+            left = ast.BinOp(op="|", left=left, right=right,
+                             line=t.line, col=t.col)
+        return left
+
+    def parse_bitxor(self) -> ast.Node:
+        left = self.parse_bitand()
+        while self.at("^"):
+            t = self.advance()
+            right = self.parse_bitand()
+            left = ast.BinOp(op="^", left=left, right=right,
+                             line=t.line, col=t.col)
+        return left
+
+    def parse_bitand(self) -> ast.Node:
+        left = self.parse_shift()
+        while self.at("&"):
+            t = self.advance()
+            right = self.parse_shift()
+            left = ast.BinOp(op="&", left=left, right=right,
+                             line=t.line, col=t.col)
+        return left
+
+    def parse_shift(self) -> ast.Node:
+        left = self.parse_add()
+        while self.at("<<") or self.at(">>"):
             t = self.advance()
             right = self.parse_add()
             left = ast.BinOp(op=t.kind, left=left, right=right,

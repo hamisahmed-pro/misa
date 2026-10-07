@@ -1,0 +1,38 @@
+// regex-redux — Misa port (simplified: generates test data)
+// Benchmarks Game regex-redux runs 9 regex patterns on DNA sequence.
+// Misa has regex support via the regex module.
+
+import regex
+
+fn main() throws E300 {
+  var n = 10000
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  // Generate test DNA sequence
+  var seq = ""
+  let bases = ["a", "c", "g", "t"]
+  var i = 0
+  while i < n {
+    seq = seq + bases[i % 4]
+    i = i + 1
+  }
+  // Add some patterns to find
+  seq = seq + "agggtaaa" + seq + "tttaccct"
+  
+  let variants = [
+    "agggtaaa|tttaccct",
+    "[cgt]gggtaaa|tttaccc[acg]",
+    "a[act]ggtaaa|tttacc[agt]t",
+  ]
+  
+  var total = 0
+  for pat in variants {
+    let matches = regex.find_all(pat, seq)
+    total = total + len(matches)
+  }
+  print(total)
+}
+
+main()

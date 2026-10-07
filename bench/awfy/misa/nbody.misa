@@ -1,0 +1,129 @@
+// Are We Fast Yet: NBody benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/nbody.py
+// Standard AWFY input: 250000 advances of dt=0.01.
+// Expected energy: -0.1690859889909308
+//
+// Misa notes:
+// - No scientific-notation float literals; constants are written as
+//   exact decimal expansions (verified to round-trip to the same double).
+// - Bodies are records in a list; advance() copies a body, mutates the
+//   copy, and writes it back (fn params and list elements are values).
+
+type Body { x: Float, y: Float, z: Float, vx: Float, vy: Float, vz: Float, mass: Float }
+
+fn make_body(x: Float, y: Float, z: Float, vx: Float, vy: Float, vz: Float, mass: Float) -> Body {
+  let b: Body = {
+    x: x, y: y, z: z,
+    vx: vx * 365.24, vy: vy * 365.24, vz: vz * 365.24,
+    mass: mass * 39.47841760435743,
+  }
+  return b
+}
+
+fn advance(bodies: [Body], dt: Float) -> [Body] throws E300 {
+  var bs = bodies
+  let n = len(bs)
+  var i = 0
+  while i < n {
+    var j = i + 1
+    while j < n {
+      let dx = bs[i].x - bs[j].x
+      let dy = bs[i].y - bs[j].y
+      let dz = bs[i].z - bs[j].z
+      let dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+      let mag = dt / (dist * dist * dist)
+      var bi: Body = bs[i]
+      var bj: Body = bs[j]
+      bi.vx = bi.vx - dx * bj.mass * mag
+      bi.vy = bi.vy - dy * bj.mass * mag
+      bi.vz = bi.vz - dz * bj.mass * mag
+      bj.vx = bj.vx + dx * bi.mass * mag
+      bj.vy = bj.vy + dy * bi.mass * mag
+      bj.vz = bj.vz + dz * bi.mass * mag
+      bs[i] = bi
+      bs[j] = bj
+      j = j + 1
+    }
+    i = i + 1
+  }
+  var k = 0
+  while k < n {
+    var bk: Body = bs[k]
+    bk.x = bk.x + dt * bk.vx
+    bk.y = bk.y + dt * bk.vy
+    bk.z = bk.z + dt * bk.vz
+    bs[k] = bk
+    k = k + 1
+  }
+  return bs
+}
+
+fn energy(bodies: [Body]) -> Float throws E300 {
+  var e = 0.0
+  let n = len(bodies)
+  var i = 0
+  while i < n {
+    let bi = bodies[i]
+    e = e + 0.5 * bi.mass * (bi.vx * bi.vx + bi.vy * bi.vy + bi.vz * bi.vz)
+    var j = i + 1
+    while j < n {
+      let bj = bodies[j]
+      let dx = bi.x - bj.x
+      let dy = bi.y - bj.y
+      let dz = bi.z - bj.z
+      let dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+      e = e - (bi.mass * bj.mass) / dist
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return e
+}
+
+fn create_bodies() -> [Body] throws E300 {
+  let solar_mass = 39.47841760435743
+  var bodies: [Body] = []
+  bodies = bodies + [make_body(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)]
+  bodies = bodies + [make_body(4.84143144246472090231, -1.16032004402742838778, -0.10362204447112310923,
+    0.00166007664274403694, 0.00769901118419740425, -0.0000690460016972063,
+    0.00095479193842432661)]
+  bodies = bodies + [make_body(8.34336671824457987157, 4.1247985641243047894, -0.40352341711432138105,
+    -0.00276742510726862411, 0.00499852801234917238, 0.00002304172975737639,
+    0.00028588598066613081)]
+  bodies = bodies + [make_body(12.89436956213913099134, -15.11115140169863124697, -0.22330757889265573368,
+    0.00296460137564761618, 0.0023784717395948095, -0.00002965895685402376,
+    0.00004366244043351563)]
+  bodies = bodies + [make_body(15.37969711485091650616, -25.91931460998796410422, 0.17925877295037118131,
+    0.00268067772490389322, 0.00162824170038242295, -0.00009515922545197159,
+    0.00005151389020466115)]
+  var px = 0.0
+  var py = 0.0
+  var pz = 0.0
+  var i = 0
+  while i < len(bodies) {
+    px = px + bodies[i].vx * bodies[i].mass
+    py = py + bodies[i].vy * bodies[i].mass
+    pz = pz + bodies[i].vz * bodies[i].mass
+    i = i + 1
+  }
+  var sun: Body = bodies[0]
+  sun.vx = -(px / solar_mass)
+  sun.vy = -(py / solar_mass)
+  sun.vz = -(pz / solar_mass)
+  bodies[0] = sun
+  return bodies
+}
+
+var bodies = create_bodies()
+var step = 0
+while step < 250000 {
+  bodies = advance(bodies, 0.01)
+  step = step + 1
+}
+let result = energy(bodies)
+print("nbody energy: {result}")
+if result == -0.1690859889909308 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL (expected -0.1690859889909308)")
+}

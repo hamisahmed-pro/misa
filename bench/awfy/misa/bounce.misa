@@ -1,0 +1,107 @@
+// Are We Fast Yet: Bounce benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/bounce.py
+// Standard AWFY parameters: 100 balls, 50 iterations. Expected: 1331.
+//
+// Misa notes:
+// - Misa fn params are immutable, so bounce() copies the record,
+//   mutates the copy, and returns {ball, bounced}.
+// - `& 65535` (bitwise AND) is not in Misa; for non-negative ints it
+//   equals `% 65536`.
+// - No `range()` builtin; counted loops use `while`.
+
+type Ball { x: Int, y: Int, x_vel: Int, y_vel: Int }
+type BounceOut { ball: Ball, bounced: Bool }
+
+fn iabs(x: Int) -> Int {
+  if x < 0 {
+    return -x
+  }
+  return x
+}
+
+fn rand_next(seed: Int) -> Int {
+  return ((seed * 1309) + 13849) % 65536
+}
+
+fn make_ball(seed: Int) -> Ball {
+  // Python draws: x=next()%500, y=next()%500,
+  // x_vel=next()%300-150, y_vel=next()%300-150.
+  // Each next() advances the seed, so:
+  let s1 = rand_next(seed)
+  let s2 = rand_next(s1)
+  let s3 = rand_next(s2)
+  let s4 = rand_next(s3)
+  let b: Ball = {
+    x: s1 % 500,
+    y: s2 % 500,
+    x_vel: (s3 % 300) - 150,
+    y_vel: (s4 % 300) - 150,
+  }
+  return b
+}
+
+fn bounce(b: Ball) -> BounceOut {
+  var nb: Ball = b
+  var bounced = false
+  nb.x = nb.x + nb.x_vel
+  nb.y = nb.y + nb.y_vel
+  if nb.x > 500 {
+    nb.x = 500
+    nb.x_vel = -iabs(nb.x_vel)
+    bounced = true
+  }
+  if nb.x < 0 {
+    nb.x = 0
+    nb.x_vel = iabs(nb.x_vel)
+    bounced = true
+  }
+  if nb.y > 500 {
+    nb.y = 500
+    nb.y_vel = -iabs(nb.y_vel)
+    bounced = true
+  }
+  if nb.y < 0 {
+    nb.y = 0
+    nb.y_vel = iabs(nb.y_vel)
+    bounced = true
+  }
+  let out: BounceOut = { ball: nb, bounced: bounced }
+  return out
+}
+
+fn benchmark() -> Int {
+  var seed = 74755
+  let ball_count = 100
+  var bounces = 0
+  var balls: [Ball] = []
+  var i = 0
+  while i < ball_count {
+    balls = balls + [make_ball(seed)]
+    // make_ball consumes 4 draws
+    seed = rand_next(rand_next(rand_next(rand_next(seed))))
+    i = i + 1
+  }
+  var step = 0
+  while step < 50 {
+    var j = 0
+    while j < ball_count {
+      let res = bounce(balls[j])
+      balls[j] = res.ball
+      if res.bounced {
+        bounces = bounces + 1
+      }
+      j = j + 1
+    }
+    step = step + 1
+  }
+  return bounces
+}
+
+let result = benchmark()
+print("bounce result: {result}")
+print("RESULT: {result}")
+if result == 1331 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL (expected 1331)")
+}

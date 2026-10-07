@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-07T09:56:03.841174+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "sieve": {
+      "python": {
+        "median_s": 0.0008989090000568467,
+        "times": [
+          0.0008989090000568467,
+          0.0009101959999497922,
+          0.0008929400000852183
+        ]
+      },
+      "node": {
+        "median_s": 0.0012005809999999996,
+        "times": [
+          0.003551049000000006,
+          0.0007010819999999996,
+          0.0012005809999999996
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.4415328310000177,
+        "times": [
+          0.4194519229999969,
+          0.49790147400005935,
+          0.4415328310000177
+        ]
+      },
+      "misa_aot_error": "misa aot failed: 13:9: E200: index on non-list\n",
+      "correctness": "PASS"
+    }
+  }
+}

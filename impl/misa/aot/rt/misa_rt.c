@@ -61,6 +61,10 @@ struct MVal {
         /* cli: M_TAG_CLIPARSER / M_TAG_CLIARGS — opaque handles. */
         struct { void *p; } cliparser;
         struct { void *a; } cliargs;
+        /* Unboxed typed arrays (perf) */
+        struct { uint8_t *items; int64_t len, cap; } list_bool;
+        struct { int64_t *items; int64_t len, cap; } list_int;
+        struct { double *items; int64_t len, cap; } list_float;
     } u;
 };
 
@@ -291,9 +295,43 @@ void misa_report_task_error(MVal *err, int task_id, int line, int col) {
 /* constructors                                                       */
 /* ------------------------------------------------------------------ */
 
-MVal *misa_int(int64_t v)   { MVal *x = val_new(M_TAG_INT); x->u.i = v; return x; }
+MVal *misa_int(int64_t v) {
+    // Small int cache (like Python's) for -5..256 — avoids allocation in hot loops
+    static MVal *cache[262];
+    static int initialized = 0;
+    if (!initialized) {
+        for (int i = 0; i < 262; i++) {
+            cache[i] = val_new(M_TAG_INT);
+            cache[i]->u.i = (int64_t)(i - 5);
+        }
+        initialized = 1;
+    }
+    if (v >= -5 && v <= 256) {
+        return cache[v + 5];
+    }
+    MVal *x = val_new(M_TAG_INT);
+    x->u.i = v;
+    return x;
+}
 MVal *misa_float(double v)  { MVal *x = val_new(M_TAG_FLOAT); x->u.f = v; return x; }
-MVal *misa_bool(int v)      { MVal *x = val_new(M_TAG_BOOL); x->u.b = v ? 1 : 0; return x; }
+MVal *misa_bool(int v) {
+    // Singleton booleans (like Python's True/False) — avoids allocation
+    static MVal *true_val = NULL;
+    static MVal *false_val = NULL;
+    if (v) {
+        if (!true_val) {
+            true_val = val_new(M_TAG_BOOL);
+            true_val->u.b = 1;
+        }
+        return true_val;
+    } else {
+        if (!false_val) {
+            false_val = val_new(M_TAG_BOOL);
+            false_val->u.b = 0;
+        }
+        return false_val;
+    }
+}
 MVal *misa_null(void)       { return val_new(M_TAG_NULL); }
 
 MVal *misa_text(const char *bytes, size_t len) {
@@ -467,6 +505,9 @@ int misa_truthy(MVal *v) {
     case M_TAG_FLOAT: return v->u.f != 0.0;
     case M_TAG_TEXT:  return v->u.text.len > 0;
     case M_TAG_LIST:  return v->u.list.len > 0;
+    case M_TAG_LIST_BOOL:  return v->u.list_bool.len > 0;
+    case M_TAG_LIST_INT:   return v->u.list_int.len > 0;
+    case M_TAG_LIST_FLOAT: return v->u.list_float.len > 0;
     case M_TAG_MAP:   return v->u.map.len > 0;
     case M_TAG_RECORD:return v->u.record.len > 0;
     case M_TAG_TASK:  return 1;
@@ -603,6 +644,35 @@ static void render_into(Str *s, MVal *v) {
         }
         str_puts(s, "]");
         break;
+    case M_TAG_LIST_BOOL: {
+        str_puts(s, "[");
+        for (int64_t i = 0; i < v->u.list_bool.len; i++) {
+            if (i) str_puts(s, ", ");
+            str_puts(s, v->u.list_bool.items[i] ? "true" : "false");
+        }
+        str_puts(s, "]");
+        break;
+    }
+    case M_TAG_LIST_INT: {
+        str_puts(s, "[");
+        for (int64_t i = 0; i < v->u.list_int.len; i++) {
+            if (i) str_puts(s, ", ");
+            snprintf(tmp, sizeof tmp, "%lld",
+                     (long long)v->u.list_int.items[i]);
+            str_puts(s, tmp);
+        }
+        str_puts(s, "]");
+        break;
+    }
+    case M_TAG_LIST_FLOAT: {
+        str_puts(s, "[");
+        for (int64_t i = 0; i < v->u.list_float.len; i++) {
+            if (i) str_puts(s, ", ");
+            str_put_float(s, v->u.list_float.items[i]);
+        }
+        str_puts(s, "]");
+        break;
+    }
     case M_TAG_RECORD: {
         /* Phase 5a: closure values render opaquely, matching the
          * interpreter's "<lambda>" / "<function name>". */
@@ -866,6 +936,46 @@ MVal *misa_add(MVal *a, MVal *b, int line, int col) {
             misa_list_push(out, b->u.list.items[i]);
         return out;
     }
+    // Unboxed bool list concatenation
+    if (a->tag == M_TAG_LIST_BOOL && b->tag == M_TAG_LIST_BOOL) {
+        MVal *out = misa_list_bool_new();
+        for (int64_t i = 0; i < a->u.list_bool.len; i++)
+            misa_list_bool_push(out, a->u.list_bool.items[i]);
+        for (int64_t i = 0; i < b->u.list_bool.len; i++)
+            misa_list_bool_push(out, b->u.list_bool.items[i]);
+        return out;
+    }
+    // Unboxed int list concatenation
+    if (a->tag == M_TAG_LIST_INT && b->tag == M_TAG_LIST_INT) {
+        MVal *out = misa_list_int_new();
+        for (int64_t i = 0; i < a->u.list_int.len; i++)
+            misa_list_int_push(out, a->u.list_int.items[i]);
+        for (int64_t i = 0; i < b->u.list_int.len; i++)
+            misa_list_int_push(out, b->u.list_int.items[i]);
+        return out;
+    }
+    // Mixed: unboxed int + boxed list -> box the unboxed side, then
+    // standard boxed concat. O(n) one-time cost on type inconsistency.
+    if ((a->tag == M_TAG_LIST_INT && b->tag == M_TAG_LIST) ||
+        (a->tag == M_TAG_LIST && b->tag == M_TAG_LIST_INT)) {
+        MVal *ba = a, *bb = b;
+        if (a->tag == M_TAG_LIST_INT) {
+            ba = misa_list_new();
+            for (int64_t i = 0; i < a->u.list_int.len; i++)
+                misa_list_push(ba, misa_int(a->u.list_int.items[i]));
+        }
+        if (b->tag == M_TAG_LIST_INT) {
+            bb = misa_list_new();
+            for (int64_t i = 0; i < b->u.list_int.len; i++)
+                misa_list_push(bb, misa_int(b->u.list_int.items[i]));
+        }
+        MVal *out = misa_list_new();
+        for (int64_t i = 0; i < ba->u.list.len; i++)
+            misa_list_push(out, ba->u.list.items[i]);
+        for (int64_t i = 0; i < bb->u.list.len; i++)
+            misa_list_push(out, bb->u.list.items[i]);
+        return out;
+    }
     if (both_int(a, b)) return misa_int(wrap_add(a->u.i, b->u.i));
     if (both_num(a, b)) return misa_float(to_f(a) + to_f(b));
     misa_raise("E200", "cannot add these values", line, col);
@@ -882,6 +992,36 @@ MVal *misa_sub(MVal *a, MVal *b, int line, int col) {
 MVal *misa_mul(MVal *a, MVal *b, int line, int col) {
     if (both_int(a, b)) return misa_int(wrap_mul(a->u.i, b->u.i));
     if (both_num(a, b)) return misa_float(to_f(a) * to_f(b));
+    // List repetition: [x] * n
+    if (a->tag == M_TAG_LIST && b->tag == M_TAG_INT) {
+        int64_t n = b->u.i;
+        if (n < 0) {
+            misa_raise("E200", "negative repeat count", line, col);
+            return NULL;
+        }
+        MVal *r = misa_list_new();
+        for (int64_t i = 0; i < n; i++) {
+            for (int64_t j = 0; j < a->u.list.len; j++) {
+                misa_list_push(r, a->u.list.items[j]);
+            }
+        }
+        return r;
+    }
+    // Unboxed bool list repetition
+    if (a->tag == M_TAG_LIST_BOOL && b->tag == M_TAG_INT) {
+        int64_t n = b->u.i;
+        if (n < 0) {
+            misa_raise("E200", "negative repeat count", line, col);
+            return NULL;
+        }
+        MVal *r = misa_list_bool_new();
+        for (int64_t i = 0; i < n; i++) {
+            for (int64_t j = 0; j < a->u.list_bool.len; j++) {
+                misa_list_bool_push(r, a->u.list_bool.items[j]);
+            }
+        }
+        return r;
+    }
     misa_raise("E200", "cannot multiply these values", line, col);
     return NULL;
 }
@@ -1062,6 +1202,9 @@ int64_t misa_len(MVal *v, int line, int col) {
     switch (v->tag) {
     case M_TAG_TEXT:   return (int64_t)misa_text_nchars(v);
     case M_TAG_LIST:   return v->u.list.len;
+    case M_TAG_LIST_BOOL: return v->u.list_bool.len;
+    case M_TAG_LIST_INT: return v->u.list_int.len;
+    case M_TAG_LIST_FLOAT: return v->u.list_float.len;
     case M_TAG_MAP:    return v->u.map.len;
     case M_TAG_RECORD: return v->u.record.len;
     case M_TAG_SET:    return v->u.set.len;
@@ -1106,6 +1249,8 @@ int64_t misa_map_len(MVal *m) { return m->u.map.len; }
 MVal *misa_map_key(MVal *m, int64_t i) { return m->u.map.keys[i]; }
 MVal *misa_map_val(MVal *m, int64_t i) { return m->u.map.vals[i]; }
 int misa_bool_val(MVal *v) { return (int)v->u.b; }
+int64_t misa_int_val(MVal *v) { return v->u.i; }
+double misa_float_val(MVal *v) { return v->u.f; }
 const char *misa_text_data(MVal *v) { return v->u.text.data; }
 
 MVal *misa_index_get(MVal *obj, MVal *idx, int line, int col) {
@@ -1141,6 +1286,48 @@ MVal *misa_index_get(MVal *obj, MVal *idx, int line, int col) {
             return NULL;
         }
         return obj->u.list.items[i];
+    }
+    if (obj->tag == M_TAG_LIST_BOOL) {
+        if (idx->tag != M_TAG_INT) {
+            misa_raise("E200", "list index must be Int", line, col);
+            return NULL;
+        }
+        int64_t i = idx->u.i;
+        int64_t n = obj->u.list_bool.len;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            misa_raise("E300", "index out of range", line, col);
+            return NULL;
+        }
+        return misa_bool(obj->u.list_bool.items[i]);
+    }
+    if (obj->tag == M_TAG_LIST_INT) {
+        if (idx->tag != M_TAG_INT) {
+            misa_raise("E200", "list index must be Int", line, col);
+            return NULL;
+        }
+        int64_t i = idx->u.i;
+        int64_t n = obj->u.list_int.len;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            misa_raise("E300", "index out of range", line, col);
+            return NULL;
+        }
+        return misa_int(obj->u.list_int.items[i]);
+    }
+    if (obj->tag == M_TAG_LIST_FLOAT) {
+        if (idx->tag != M_TAG_INT) {
+            misa_raise("E200", "list index must be Int", line, col);
+            return NULL;
+        }
+        int64_t i = idx->u.i;
+        int64_t n = obj->u.list_float.len;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            misa_raise("E300", "index out of range", line, col);
+            return NULL;
+        }
+        return misa_float(obj->u.list_float.items[i]);
     }
     if (obj->tag == M_TAG_TEXT) {
         if (idx->tag != M_TAG_INT) {
@@ -1210,6 +1397,44 @@ void misa_index_set(MVal *obj, MVal *idx, MVal *val, int line, int col) {
         obj->u.list.items[i] = val;
         return;
     }
+    if (obj->tag == M_TAG_LIST_BOOL) {
+        if (idx->tag != M_TAG_INT) {
+            misa_raise("E200", "list index must be Int", line, col);
+            return;
+        }
+        if (val->tag != M_TAG_BOOL) {
+            misa_raise("E200", "type mismatch in [Bool] list", line, col);
+            return;
+        }
+        int64_t i = idx->u.i;
+        int64_t n = obj->u.list_bool.len;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            misa_raise("E300", "index out of range", line, col);
+            return;
+        }
+        obj->u.list_bool.items[i] = val->u.b ? 1 : 0;
+        return;
+    }
+    if (obj->tag == M_TAG_LIST_INT) {
+        if (idx->tag != M_TAG_INT) {
+            misa_raise("E200", "list index must be Int", line, col);
+            return;
+        }
+        if (val->tag != M_TAG_INT) {
+            misa_raise("E200", "type mismatch in [Int] list", line, col);
+            return;
+        }
+        int64_t i = idx->u.i;
+        int64_t n = obj->u.list_int.len;
+        if (i < 0) i += n;
+        if (i < 0 || i >= n) {
+            misa_raise("E300", "index out of range", line, col);
+            return;
+        }
+        obj->u.list_int.items[i] = val->u.i;
+        return;
+    }
     misa_raise("E300", "cannot index-assign here", line, col);
 }
 
@@ -1236,6 +1461,21 @@ MVal *misa_record_get_opt(MVal *obj, const char *field) {
             return obj->u.record.vals[i];
     }
     return NULL;
+}
+
+/* Fast path for statically-known record types: get field by index.
+ * The AOT emitter computes the index at compile time from the TypeDecl,
+ * avoiding the strcmp linear search. */
+MVal *misa_record_get_idx(MVal *obj, int64_t idx, int line, int col) {
+    if (obj->tag != M_TAG_RECORD) {
+        misa_raise("E300", "cannot access field on this value", line, col);
+        return NULL;
+    }
+    if (idx < 0 || idx >= obj->u.record.len) {
+        misa_raise("E300", "field index out of bounds", line, col);
+        return NULL;
+    }
+    return obj->u.record.vals[idx];
 }
 
 void misa_record_set(MVal *obj, const char *field, MVal *val,
@@ -1287,6 +1527,30 @@ MVal *misa_print(MVal *v) {
 MVal *misa_builtin_len(MVal *v, int line, int col) {
     if (misa_pending()) return NULL;
     return misa_int(misa_len(v, line, col));
+}
+
+MVal *misa_builtin_range(MVal *a, MVal *b, MVal *c, int has_b, int has_c) {
+    if (misa_pending()) return NULL;
+    int64_t start = 0, stop, step = 1;
+    if (!has_b) {
+        stop = misa_as_int(a);
+    } else if (!has_c) {
+        start = misa_as_int(a);
+        stop = misa_as_int(b);
+    } else {
+        start = misa_as_int(a);
+        stop = misa_as_int(b);
+        step = misa_as_int(c);
+    }
+    MVal *list = misa_list_new();
+    if (step > 0) {
+        for (int64_t i = start; i < stop; i += step)
+            misa_list_push(list, misa_int(i));
+    } else if (step < 0) {
+        for (int64_t i = start; i > stop; i += step)
+            misa_list_push(list, misa_int(i));
+    }
+    return list;
 }
 
 MVal *misa_builtin_str(MVal *v) { return misa_render(v); }
@@ -1706,6 +1970,24 @@ MVal *misa_math_sqrt(MVal *x, int line, int col) {
         return NULL;
     }
     return misa_float(sqrt(d));
+}
+
+MVal *misa_math_cos(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "cos");
+    if (misa_pending()) return NULL;
+    return misa_float(cos(d));
+}
+
+MVal *misa_math_sin(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "sin");
+    if (misa_pending()) return NULL;
+    return misa_float(sin(d));
+}
+
+MVal *misa_math_tan(MVal *x, int line, int col) {
+    double d = math_num(x, line, col, "tan");
+    if (misa_pending()) return NULL;
+    return misa_float(tan(d));
 }
 
 MVal *misa_math_pow(MVal *x, MVal *y, int line, int col) {
@@ -4651,4 +4933,168 @@ MVal *misa_str_pad_right(MVal *s, MVal *w, MVal *pad, int line, int col) {
         return NULL;
     }
     return str_pad(s, w->u.i, pad, 0, line, col);
+}
+
+// Optimized list access with unboxed int64 index (avoids index boxing)
+MVal *misa_list_get_raw(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return NULL;
+    // Unboxed bool list: box the result
+    if (list->tag == M_TAG_LIST_BOOL) {
+        int b = misa_list_bool_get(list, idx, line, col);
+        if (misa_pending()) return NULL;
+        return misa_bool(b);
+    }
+    // Unboxed int list: box the result
+    if (list->tag == M_TAG_LIST_INT) {
+        int64_t v = misa_list_int_get(list, idx, line, col);
+        if (misa_pending()) return NULL;
+        return misa_int(v);
+    }
+    if (list->tag != M_TAG_LIST) {
+        misa_raise("E200", "index on non-list", line, col);
+        return NULL;
+    }
+    if (idx < 0 || idx >= list->u.list.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return NULL;
+    }
+    return list->u.list.items[idx];
+}
+
+void misa_list_set_raw(MVal *list, int64_t idx, MVal *val, int line, int col) {
+    if (misa_pending()) return;
+    // Dispatch to unboxed storage if applicable
+    if (list->tag == M_TAG_LIST_BOOL) {
+        if (val->tag != M_TAG_BOOL) {
+            misa_raise("E200", "type mismatch in [Bool] list", line, col);
+            return;
+        }
+        misa_list_bool_set(list, idx, val->u.b, line, col);
+        return;
+    }
+    if (list->tag == M_TAG_LIST_INT) {
+        if (val->tag != M_TAG_INT) {
+            misa_raise("E200", "type mismatch in [Int] list", line, col);
+            return;
+        }
+        misa_list_int_set(list, idx, val->u.i, line, col);
+        return;
+    }
+    if (list->tag != M_TAG_LIST) {
+        misa_raise("E200", "index-assign on non-list", line, col);
+        return;
+    }
+    if (idx < 0 || idx >= list->u.list.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return;
+    }
+    list->u.list.items[idx] = val;
+}
+
+// Returns raw bool (i1) for [Bool] list element — avoids MVal* unboxing
+int misa_list_get_bool_raw(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return 0;
+    if (list->tag != M_TAG_LIST) {
+        misa_raise("E200", "index on non-list", line, col);
+        return 0;
+    }
+    if (idx < 0 || idx >= list->u.list.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return 0;
+    }
+    MVal *v = list->u.list.items[idx];
+    if (v->tag == M_TAG_BOOL) return v->u.b;
+    // fallback: truthy
+    return misa_truthy(v);
+}
+
+// Unboxed typed list constructors
+MVal *misa_list_bool_new(void) {
+    MVal *l = val_new(M_TAG_LIST_BOOL);
+    l->u.list_bool.items = NULL;
+    l->u.list_bool.len = 0;
+    l->u.list_bool.cap = 0;
+    return l;
+}
+
+MVal *misa_list_int_new(void) {
+    MVal *l = val_new(M_TAG_LIST_INT);
+    l->u.list_int.items = NULL;
+    l->u.list_int.len = 0;
+    l->u.list_int.cap = 0;
+    return l;
+}
+
+MVal *misa_list_float_new(void) {
+    MVal *l = val_new(M_TAG_LIST_FLOAT);
+    l->u.list_float.items = NULL;
+    l->u.list_float.len = 0;
+    l->u.list_float.cap = 0;
+    return l;
+}
+
+void misa_list_bool_push(MVal *list, int b) {
+    list->u.list_bool.items = (uint8_t*)grow_array(
+        list->u.list_bool.items, &list->u.list_bool.cap,
+        list->u.list_bool.len + 1, sizeof(uint8_t));
+    list->u.list_bool.items[list->u.list_bool.len++] = b ? 1 : 0;
+}
+
+void misa_list_int_push(MVal *list, int64_t v) {
+    list->u.list_int.items = (int64_t*)grow_array(
+        list->u.list_int.items, &list->u.list_int.cap,
+        list->u.list_int.len + 1, sizeof(int64_t));
+    list->u.list_int.items[list->u.list_int.len++] = v;
+}
+
+// Direct unboxed access (no MVal* boxing)
+int misa_list_bool_get(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return 0;
+    if (idx < 0 || idx >= list->u.list_bool.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return 0;
+    }
+    return list->u.list_bool.items[idx];
+}
+
+void misa_list_bool_set(MVal *list, int64_t idx, int b, int line, int col) {
+    if (misa_pending()) return;
+    if (idx < 0 || idx >= list->u.list_bool.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return;
+    }
+    list->u.list_bool.items[idx] = b ? 1 : 0;
+}
+
+int64_t misa_list_int_get(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return 0;
+    if (idx < 0 || idx >= list->u.list_int.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return 0;
+    }
+    return list->u.list_int.items[idx];
+}
+
+void misa_list_int_set(MVal *list, int64_t idx, int64_t v, int line, int col) {
+    if (misa_pending()) return;
+    if (idx < 0 || idx >= list->u.list_int.len) {
+        misa_raise_fmt("E304", line, col, "list index out of range");
+        return;
+    }
+    list->u.list_int.items[idx] = v;
+}
+
+// Create a [Bool] list of size n, initialized to false
+MVal *misa_bool_list_new(int64_t n, int line, int col) {
+    if (misa_pending()) return NULL;
+    if (n < 0) {
+        misa_raise("E200", "negative list size", line, col);
+        return NULL;
+    }
+    MVal *l = misa_list_bool_new();
+    l->u.list_bool.items = (uint8_t*)misa_alloc((size_t)n);
+    memset(l->u.list_bool.items, 0, (size_t)n);
+    l->u.list_bool.len = n;
+    l->u.list_bool.cap = n;
+    return l;
 }

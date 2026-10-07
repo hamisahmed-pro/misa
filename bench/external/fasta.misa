@@ -1,0 +1,24 @@
+// fasta — Misa port (simplified string generation)
+// Generates random DNA sequence, measures string building performance.
+
+fn main() throws E300 {
+  var n = 10000
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  let bases = ["a", "c", "g", "t"]
+  var seq = ""
+  var seed = 42
+  var i = 0
+  while i < n {
+    // Simple LCG
+    seed = (seed * 3877 + 29573) % 139968
+    let r = seed % 4
+    seq = seq + bases[r]
+    i = i + 1
+  }
+  print(len(seq))
+}
+
+main()

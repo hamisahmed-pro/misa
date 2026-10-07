@@ -1,0 +1,97 @@
+// Are We Fast Yet — Towers benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/towers.py
+
+type Disk {
+  size: Int,
+  next: Disk?,
+}
+
+type Towers {
+  piles: [Disk?],
+  moves_done: Int,
+}
+
+fn make_piles() -> [Disk?] {
+  var out: [Disk?] = []
+  var i = 0
+  while i < 3 {
+    out = out + [nil]
+    i = i + 1
+  }
+  return out
+}
+
+fn push_disk(t: Towers, disk: Disk, pile: Int) throws E300 {
+  var tt = t
+  var pp = tt.piles
+  let top = pp[pile]
+  if top != nil {
+    let topd: Disk = top
+    var dd = disk
+    if dd.size >= topd.size {
+      throw { code: "E300", message: "Cannot put a big disk on a smaller one" }
+    }
+    dd.next = top
+    pp[pile] = dd
+  } else {
+    pp[pile] = disk
+  }
+}
+
+fn pop_disk_from(t: Towers, pile: Int) -> Disk throws E300 {
+  var tt = t
+  var pp = tt.piles
+  let top = pp[pile]
+  if top == nil {
+    throw { code: "E300", message: "Attempting to remove a disk from an empty pile" }
+  }
+  let topd: Disk = top
+  pp[pile] = topd.next
+  var ret = topd
+  ret.next = nil
+  return ret
+}
+
+fn move_top_disk(t: Towers, from_pile: Int, to_pile: Int) throws E300 {
+  let disk = pop_disk_from(t, from_pile)
+  push_disk(t, disk, to_pile)
+  var tt = t
+  tt.moves_done = tt.moves_done + 1
+}
+
+fn build_tower_at(t: Towers, pile: Int, disks: Int) throws E300 {
+  var i = disks
+  while i >= 0 {
+    var d: Disk = { size: i, next: nil }
+    push_disk(t, d, pile)
+    i = i - 1
+  }
+}
+
+fn move_disks(t: Towers, disks: Int, from_pile: Int, to_pile: Int) throws E300 {
+  if disks == 1 {
+    move_top_disk(t, from_pile, to_pile)
+  } else {
+    let other_pile = (3 - from_pile) - to_pile
+    move_disks(t, disks - 1, from_pile, other_pile)
+    move_top_disk(t, from_pile, to_pile)
+    move_disks(t, disks - 1, other_pile, to_pile)
+  }
+}
+
+fn benchmark() -> Int throws E300 {
+  var t: Towers = { piles: make_piles(), moves_done: 0 }
+  build_tower_at(t, 0, 13)
+  var tt = t
+  tt.moves_done = 0
+  move_disks(t, 13, 0, 1)
+  return t.moves_done
+}
+
+let result = benchmark()
+print("RESULT: {result}")
+if result == 8191 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL")
+}

@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-07T08:26:58.142871+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "mandelbrot": {
+      "python": {
+        "median_s": 2.1138678119996257,
+        "times": [
+          2.1138678119996257,
+          1.7815044250000938,
+          2.6680330959998173
+        ]
+      },
+      "node": {
+        "median_s": 0.096887179,
+        "times": [
+          0.09596053799999998,
+          0.096887179,
+          0.10819781999999999
+        ]
+      },
+      "misa_interp_error": "misa interp failed: TIMEOUT",
+      "misa_aot": {
+        "median_s": 8.016369571000268,
+        "times": [
+          8.081917749999775,
+          8.016369571000268,
+          7.750842036999984
+        ],
+        "compile_s": 0.8705402979999235
+      },
+      "correctness": "FAIL"
+    }
+  }
+}

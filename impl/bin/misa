@@ -129,8 +129,17 @@ def cmd_fmt(path, write):
     return 0
 
 
-def cmd_run(path, mock_path, as_json, prog_argv=None):
+def cmd_run(path, mock_path, as_json, prog_argv=None, use_bytecode=False,
+            force_interp=False):
     mock_scripts = load_mock(mock_path)
+    # Phase 1 JIT plan: AOT is the default execution tier. Try the
+    # content-hashed AOT cache first; fall back to the interpreter when
+    # the program is not AOT-coverable or the user forces --interp.
+    if not use_bytecode and not force_interp:
+        rc = _cmd_run_aot_cached(path, mock_path, as_json, prog_argv)
+        if rc is not None:
+            return rc
+        # rc is None -> AOT rejected or failed; fall through to interp.
     merged, load_errors, _order, _file_of = load_with_imports(path)
     if merged is None:
         emit_errors(load_errors, as_json)
@@ -139,6 +148,9 @@ def cmd_run(path, mock_path, as_json, prog_argv=None):
     if errors:
         emit_errors(errors, as_json)
         return 1
+    if use_bytecode:
+        return cmd_run_bytecode(merged, mock_scripts, path, as_json,
+                                prog_argv or [])
     interp = Interpreter(mock_scripts=mock_scripts,
                          main_dir=os.path.dirname(os.path.abspath(path)),
                          argv=prog_argv or [])
@@ -148,6 +160,243 @@ def cmd_run(path, mock_path, as_json, prog_argv=None):
     except MisaError as e:
         emit_errors([e.to_dict()], as_json)
         return 1
+    return 0
+
+
+def _cmd_run_aot_cached(path, mock_path, as_json, prog_argv):
+    """Try running via the cached AOT binary.
+
+    Returns the exit code when the AOT path handled the run, or None
+    when the caller should fall back to the interpreter.
+    """
+    from misa.aot.build import build_cached
+    from misa.aot.emit import AOTError
+    try:
+        status, payload = build_cached(path)
+    except Exception as e:
+        # Cache/build infrastructure failure: fall back, don't crash.
+        if not as_json:
+            print(f"# aot cache unavailable ({e}); using interpreter",
+                  file=sys.stderr)
+        return None
+    if status == "hit" or status == "built":
+        if not as_json and status == "built":
+            print(f"# aot compiled -> {payload}", file=sys.stderr)
+        return _exec_cached_binary(payload, prog_argv, mock_path)
+    if status == "rejected":
+        # Program uses features the AOT backend can't compile.
+        if not as_json:
+            e = payload
+            code = getattr(e, "code", "E?")
+            print(f"# aot rejected ({code}); using interpreter",
+                  file=sys.stderr)
+        return None
+    # status == "error": frontend or toolchain errors -> report, no fallback
+    # (falling back would hide real compile errors; but syntax errors
+    # should still surface cleanly -- they do via emit_errors).
+    errs = payload if isinstance(payload, list) else [payload]
+    # If these are pure frontend errors, the interpreter would report
+    # them identically; still, surface them directly.
+    emit_errors([e if isinstance(e, dict) else
+                 {"code": getattr(e, "code", "E600"),
+                  "message": str(e), "line": 0, "col": 0}
+                 for e in errs], as_json)
+    return 1
+
+
+def _exec_cached_binary(binpath, prog_argv, mock_path):
+    """Exec the cached binary, forwarding argv. Returns exit code."""
+    import subprocess
+    cmd = [binpath] + (prog_argv or [])
+    # NOTE: --mock is an interpreter feature; AOT binaries don't take it.
+    # If a mock was requested with AOT, prefer the interpreter instead.
+    # (Handled by the caller passing force_interp when mock_path is set.)
+    try:
+        r = subprocess.run(cmd)
+        return r.returncode
+    except OSError as e:
+        print(f"# aot exec failed ({e}); using interpreter",
+              file=sys.stderr)
+        return None
+
+
+def cmd_run_bytecode(merged, mock_scripts, path, as_json, prog_argv):
+    """Run via bytecode compiler + C VM with auto-JIT.
+
+    Falls back to the tree-walking interpreter when the program uses
+    language features the bytecode compiler does not cover yet.
+
+    Auto-JIT: hot BytecodeFunctions (call count >= threshold) that are
+    int-only are compiled to native code via the LLVM JIT and executed
+    directly on subsequent calls.
+    """
+    from misa.bytecode import (Compiler, BytecodeFunction, VM, RETURN,
+                               LOAD_CONST)
+    c = Compiler()
+    try:
+        for stmt in merged.items:
+            c.compile(stmt)
+        c.emit(LOAD_CONST, c.add_const(None))
+        c.emit(RETURN)
+    except NotImplementedError as e:
+        # Feature not covered by the bytecode compiler: fall back.
+        if not as_json:
+            print(f"# bytecode: falling back to interpreter ({e})",
+                  file=sys.stderr)
+        interp = Interpreter(
+            mock_scripts=mock_scripts,
+            main_dir=os.path.dirname(os.path.abspath(path)),
+            argv=prog_argv)
+        try:
+            interp.run(merged)
+        except MisaError as err:
+            emit_errors([err.to_dict()], as_json)
+            return 1
+        return 0
+    # Prefer the MVal* VM (unified representation for JIT).
+    # The .so files live in impl/misa/; ensure it's on sys.path.
+    _misa_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "misa")
+    if _misa_dir not in sys.path:
+        sys.path.insert(0, _misa_dir)
+    try:
+        import misa_vm_mval
+        has_cvm_mval = True
+    except ImportError:
+        has_cvm_mval = False
+    try:
+        import misa_vm
+        has_cvm = True
+    except ImportError:
+        has_cvm = False
+    output = []
+
+    # Auto-JIT state.
+    from misa.jit import analyze_int_only, jit_compile_to_so, jit_load_and_run
+    import ctypes
+    import tempfile
+    import threading
+    JIT_THRESHOLD = 5
+    jit_cache = {}  # BytecodeFunction -> (so_path, fn_name)
+    jit_pending = set()  # BytecodeFunctions being compiled in background
+    jit_threads = []  # Thread objects for joining at exit
+    call_counts = {}
+    rt_lib = None
+    if has_cvm_mval:
+        import misa_vm_mval as _mvm
+        # Get the .so path for ctypes (for misa_int_val).
+        import misa_vm_mval as _m
+        _so = _m.__file__
+        rt_lib = ctypes.CDLL(_so)
+        rt_lib.misa_rt_init()
+        rt_lib.misa_int_val.restype = ctypes.c_int64
+        rt_lib.misa_int_val.argtypes = [ctypes.c_void_p]
+
+    def _jit_compile_bg(func, so_path, as_json):
+        """Background thread: compile func, update cache."""
+        try:
+            jit_compile_to_so(func, so_path, specialize_int=True)
+            jit_cache[func] = (so_path, func.name)
+            if not as_json:
+                print(f"# jit: compiled {func.name} (background)",
+                      file=sys.stderr)
+        except Exception as e:
+            if not as_json:
+                print(f"# jit failed for {func.name}: {e}",
+                      file=sys.stderr)
+        finally:
+            jit_pending.discard(func)
+
+    def resolver(func, args):
+        if isinstance(func, BytecodeFunction):
+            # Hot-function detection for auto-JIT.
+            if has_cvm_mval and rt_lib is not None:
+                cnt = call_counts.get(func, 0) + 1
+                call_counts[func] = cnt
+                if func in jit_cache:
+                    so_path, fn_name = jit_cache[func]
+                    # Int-only: args are Python ints.
+                    vars_vals = list(args) + [0] * (
+                        len(func.varnames) - len(args))
+                    consts_vals = list(func.consts)
+                    try:
+                        r_addr = jit_load_and_run(
+                            so_path, fn_name, vars_vals, consts_vals,
+                            specialize_int=True)
+                        if r_addr is None:
+                            # Deopt: JIT hit a runtime error; fall back to VM.
+                            # Invalidate the cache entry to avoid repeat.
+                            if not as_json:
+                                print(f"# jit: deopt {func.name}, "
+                                      f"falling back to VM", file=sys.stderr)
+                            del jit_cache[func]
+                        else:
+                            return rt_lib.misa_int_val(r_addr)
+                    except Exception:
+                        pass  # fall through to VM
+                elif cnt >= JIT_THRESHOLD:
+                    try:
+                        if analyze_int_only(func):
+                            from misa.jit import jit_cache_path
+                            so_path = jit_cache_path(func)
+                            if os.path.isfile(so_path):
+                                # Cache hit: use immediately.
+                                jit_cache[func] = (so_path, func.name)
+                                if not as_json:
+                                    print(f"# jit: cache hit {func.name}",
+                                          file=sys.stderr)
+                                return resolver(func, args)
+                            elif func not in jit_pending:
+                                # Cache miss: compile in background,
+                                # continue with VM meanwhile.
+                                jit_pending.add(func)
+                                t = threading.Thread(
+                                    target=_jit_compile_bg,
+                                    args=(func, so_path, as_json),
+                                    daemon=False)  # non-daemon: join at exit
+                                jit_threads.append(t)
+                                t.start()
+                                if not as_json:
+                                    print(f"# jit: compiling {func.name} "
+                                          f"in background", file=sys.stderr)
+                    except Exception as e:
+                        if not as_json:
+                            print(f"# jit failed for {func.name}: {e}",
+                                  file=sys.stderr)
+                        pass
+            # VM execution.
+            if has_cvm_mval:
+                return misa_vm_mval.run(func.code, func.consts,
+                                        len(func.varnames), args, resolver,
+                                        output)
+            if has_cvm:
+                return misa_vm.run(func.code, func.consts,
+                                   len(func.varnames), args, resolver,
+                                   output)
+            return VM().run(func, list(args))
+        return func(*args)
+
+    try:
+        if has_cvm_mval:
+            misa_vm_mval.run(c.code, c.consts, len(c.varnames), (), resolver,
+                             output)
+        elif has_cvm:
+            misa_vm.run(c.code, c.consts, len(c.varnames), (), resolver,
+                        output)
+        else:
+            VM().run(BytecodeFunction('<main>', c.code, c.consts,
+                                      c.varnames, 0))
+    except MisaError as e:
+        emit_errors([e.to_dict()], as_json)
+        return 1
+    except RuntimeError as e:
+        emit_errors([{"code": "E300", "message": str(e), "line": 0,
+                      "col": 0}], as_json)
+        return 1
+    # Wait for background JIT compilations to finish so the cache is
+    # populated for the next run.
+    for t in jit_threads:
+        t.join(timeout=30)
     return 0
 
 
@@ -399,18 +648,30 @@ def main(argv):
             prog_argv = []
         mock = None
         rest = []
+        use_bytecode = False
+        force_interp = False
         i = 0
         while i < len(args):
             if args[i] == "--mock" and i + 1 < len(args):
                 mock = args[i + 1]
                 i += 2
+            elif args[i] == "--bytecode":
+                use_bytecode = True
+                i += 1
+            elif args[i] == "--interp":
+                force_interp = True
+                i += 1
             else:
                 rest.append(args[i])
                 i += 1
         if len(rest) != 1:
             die("usage: misa run <file.misa> [--mock mocks.json] "
-                "[-- args...]")
-        return cmd_run(rest[0], mock, as_json, prog_argv)
+                "[--bytecode] [--interp] [-- args...]")
+        # --mock is an interpreter feature; force the interpreter tier.
+        if mock is not None:
+            force_interp = True
+        return cmd_run(rest[0], mock, as_json, prog_argv,
+                       use_bytecode=use_bytecode, force_interp=force_interp)
     if cmd == "test":
         mock = None
         rest = []

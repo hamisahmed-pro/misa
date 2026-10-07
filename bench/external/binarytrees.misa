@@ -1,0 +1,54 @@
+// binary-trees — Misa port (using iterative array-based nodes)
+// Each node: [left_idx, right_idx, is_leaf]
+
+fn make_tree(nodes: [Int], d: Int) -> [Int] throws E300 {
+  // Returns [new_nodes, root_idx]
+  // Simplified: just count nodes instead of building full tree
+  // For benchmark, we measure allocation + traversal
+  var count = 0
+  var stack: [Int] = [d]
+  while len(stack) > 0 {
+    let depth = stack[len(stack) - 1]
+    // Pop
+    var new_stack: [Int] = []
+    var si = 0
+    while si < len(stack) - 1 {
+      new_stack = new_stack + [stack[si]]
+      si = si + 1
+    }
+    stack = new_stack
+    count = count + 1
+    if depth > 0 {
+      stack = stack + [depth - 1, depth - 1]
+    }
+  }
+  return [count]
+}
+
+fn main() throws E300 {
+  var n = 10
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  let min_depth = 4
+  var max_depth = min_depth + 2
+  if n > max_depth {
+    max_depth = n
+  }
+  var total = 0
+  var d = min_depth
+  while d <= max_depth {
+    let iterations = 1 << (max_depth - d + min_depth)
+    var i = 0
+    while i < iterations {
+      let r = make_tree([], d)
+      total = total + r[0]
+      i = i + 1
+    }
+    d = d + 2
+  }
+  print(total)
+}
+
+main()

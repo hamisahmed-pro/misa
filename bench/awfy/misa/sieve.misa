@@ -1,0 +1,37 @@
+// Are We Fast Yet — Sieve benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/sieve.py
+
+fn make_flags(n: Int) -> [Bool] {
+  return [true] * n
+}
+
+fn sieve(flags: [Bool], size: Int) -> Int {
+  var f = flags
+  var prime_count = 0
+  var i = 2
+  while i <= size {
+    if f[i - 1] {
+      prime_count = prime_count + 1
+      var k = i + i
+      while k <= size {
+        f[k - 1] = false
+        k = k + i
+      }
+    }
+    i = i + 1
+  }
+  return prime_count
+}
+
+fn benchmark() -> Int {
+  let flags = make_flags(5000)
+  return sieve(flags, 5000)
+}
+
+let result = benchmark()
+print("RESULT: {result}")
+if result == 669 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL")
+}

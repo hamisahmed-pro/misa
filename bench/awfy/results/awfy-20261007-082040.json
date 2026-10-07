@@ -1,0 +1,85 @@
+{
+  "date": "2026-10-07T08:07:58.470860+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "mandelbrot": {
+      "python_error": "python failed: Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/Python/mandelbrot.py\", line 51, in benchmark\n    raise Exception(",
+      "node_error": "node failed: /home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/benchmark.js:35\n    throw new Error('subclass responsibility');\n    ^\n\nError: subclass responsibility\n    at Mandelbrot.benchmark (/home",
+      "misa_interp_error": "misa interp failed: TIMEOUT",
+      "misa_aot": {
+        "median_s": 11.292738891000226,
+        "times": [
+          11.292738891000226,
+          12.737488495999969,
+          10.011472798999876
+        ],
+        "compile_s": 0.5510831080000571
+      },
+      "correctness": "PASS"
+    },
+    "cd": {
+      "python_error": "python failed: Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nImportError: cannot import name 'Cd' from 'cd' (/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/Python/cd.py). Did you me",
+      "node_error": "node failed: /home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/benchmark.js:35\n    throw new Error('subclass responsibility');\n    ^\n\nError: subclass responsibility\n    at CD.benchmark (/home/hatch/w",
+      "misa_interp_error": "misa interp failed: TIMEOUT",
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/"
+    },
+    "json": {
+      "python_error": "python result inconsistent",
+      "node": {
+        "median_s": 0.0067774949999999876,
+        "times": [
+          0.005090542000000014,
+          0.0067774949999999876,
+          0.0073211310000000085
+        ]
+      },
+      "misa_interp": {
+        "median_s": 4.28780928399965,
+        "times": [
+          4.144615121999777,
+          7.205714450999949,
+          4.28780928399965
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.3332905689999279,
+        "times": [
+          0.3332905689999279,
+          0.34363640199990186,
+          0.32489045800002714
+        ],
+        "compile_s": 0.9100891729999603
+      },
+      "correctness": "FAIL"
+    },
+    "richards": {
+      "python": {
+        "median_s": 0.05102575699993395,
+        "times": [
+          0.05044230100020286,
+          0.051943944999948144,
+          0.05102575699993395
+        ]
+      },
+      "node": {
+        "median_s": 0.04334543600000001,
+        "times": [
+          0.029337424999999983,
+          0.04334543600000001,
+          0.044239478000000006
+        ]
+      },
+      "misa_interp": {
+        "median_s": 36.481246587999976,
+        "times": [
+          33.30658249099997,
+          36.59164633399996,
+          36.481246587999976
+        ]
+      },
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/",
+      "correctness": "PASS"
+    }
+  }
+}

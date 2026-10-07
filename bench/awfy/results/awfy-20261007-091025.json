@@ -1,0 +1,203 @@
+{
+  "date": "2026-10-07T09:09:59.314275+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "sieve": {
+      "python": {
+        "median_s": 0.0011031570002160151,
+        "times": [
+          0.0011031570002160151,
+          0.0009113480000451091,
+          0.0020235579995642183
+        ]
+      },
+      "node": {
+        "median_s": 0.0006880730000000028,
+        "times": [
+          0.0006131200000000092,
+          0.0006880730000000028,
+          0.0021728820000000014
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.5207699269994919,
+        "times": [
+          0.4914431479992345,
+          0.5207699269994919,
+          0.5869346919998861
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "queens": {
+      "python": {
+        "median_s": 0.001337687999694026,
+        "times": [
+          0.0013319899999260087,
+          0.001337687999694026,
+          0.0016622050006844802
+        ]
+      },
+      "node": {
+        "median_s": 0.0014302670000000007,
+        "times": [
+          0.0014302670000000007,
+          0.0017304579999999987,
+          0.0014160260000000023
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.9056379509993349,
+        "times": [
+          0.9165795080007229,
+          0.5648797600006219,
+          0.9056379509993349
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "permute": {
+      "python": {
+        "median_s": 0.0022120920002635103,
+        "times": [
+          0.0022120920002635103,
+          0.00261637800031167,
+          0.0020945749993188656
+        ]
+      },
+      "node": {
+        "median_s": 0.0007828049999999962,
+        "times": [
+          0.0028673650000000067,
+          0.0007348729999999932,
+          0.0007828049999999962
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.8458973599999808,
+        "times": [
+          0.8651251270002831,
+          0.8458973599999808,
+          0.7722597169995424
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "towers": {
+      "python": {
+        "median_s": 0.0032135450001078425,
+        "times": [
+          0.0031844009999986156,
+          0.0032135450001078425,
+          0.0032847820002643857
+        ]
+      },
+      "node": {
+        "median_s": 0.0016355259999999987,
+        "times": [
+          0.001160702999999998,
+          0.0016355259999999987,
+          0.0017319999999999994
+        ]
+      },
+      "misa_interp": {
+        "median_s": 1.4410174520007786,
+        "times": [
+          1.4704775709997193,
+          1.3736650139999256,
+          1.4410174520007786
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "storage": {
+      "python": {
+        "median_s": 0.0040111919997798395,
+        "times": [
+          0.004218003000460158,
+          0.0040111919997798395,
+          0.0039190540001072804
+        ]
+      },
+      "node": {
+        "median_s": 0.0013398719999999998,
+        "times": [
+          0.0013398719999999998,
+          0.0013628060000000061,
+          0.001148693999999992
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.5449684680006612,
+        "times": [
+          0.508365564000087,
+          0.5449684680006612,
+          0.5961691470001824
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "bounce": {
+      "python": {
+        "median_s": 0.0021432780004033702,
+        "times": [
+          0.0021432780004033702,
+          0.0015045690006445511,
+          0.0028034290007781237
+        ]
+      },
+      "node": {
+        "median_s": 0.0016921710000000019,
+        "times": [
+          0.0010270519999999977,
+          0.0016921710000000019,
+          0.002001835
+        ]
+      },
+      "misa_interp": {
+        "median_s": 0.9007286509995538,
+        "times": [
+          0.9007286509995538,
+          1.145780584000022,
+          0.5970877259996996
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    },
+    "list": {
+      "python": {
+        "median_s": 0.0012013730001854128,
+        "times": [
+          0.0015899469999567373,
+          0.0011293950001345365,
+          0.0012013730001854128
+        ]
+      },
+      "node": {
+        "median_s": 0.0014042889999999915,
+        "times": [
+          0.0014042889999999915,
+          0.002062907999999993,
+          0.000712048999999979
+        ]
+      },
+      "misa_interp": {
+        "median_s": 1.0301095140002872,
+        "times": [
+          0.9201691670004948,
+          1.0301095140002872,
+          1.7667559319997963
+        ]
+      },
+      "misa_aot_error": "misa build failed: misa: error: E600: C runtime compile failed (misa_rt.c):\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c: In function \u2018misa_builtin_range\u2019:\n/home/hatch/workspace/misa/impl/misa/aot/rt/misa_rt.c:",
+      "correctness": "PASS"
+    }
+  }
+}

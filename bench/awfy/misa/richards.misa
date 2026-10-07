@@ -1,0 +1,573 @@
+// Richards benchmark — Are We Fast Yet (DLS '16), ported from Python.
+// Simulates an OS task scheduler with 6 tasks (idler, worker, 2 handlers,
+// 2 devices) passing packets. Result: queue_count == 23246 and
+// hold_count == 9297.
+//
+// Mapping: Python objects -> integer handles into global arrays (Misa fn
+// params are immutable, so shared mutable state lives in top-level vars
+// captured by lambdas). Task "methods" dispatch on a kind tag.
+
+type Task {
+    link: Int,
+    identity: Int,
+    kind: Int,
+    priority: Int,
+    input: Int,
+    holding: Bool,
+    waiting: Bool,
+    packet_pending: Bool,
+    pending: Int,
+    work_in: Int,
+    device_in: Int,
+    control: Int,
+    count: Int,
+    destination: Int
+}
+
+type Packet {
+    link: Int,
+    kind: Int,
+    identity: Int,
+    datum: Int,
+    data: [Int]
+}
+
+// bitwise XOR (Misa has no ^ operator); pure function
+fn ixor(a: Int, b: Int) -> Int {
+    var result: Int = 0
+    var bit: Int = 1
+    var aa: Int = a
+    var bb: Int = b
+    while aa > 0 or bb > 0 {
+        if (aa % 2) != (bb % 2) {
+            result = result + bit
+        }
+        aa = aa / 2
+        bb = bb / 2
+        bit = bit * 2
+    }
+    return result
+}
+
+// ---- scheduler state (globals) ----
+var sched_task_list: Int = -1
+var sched_current_task: Int = -1
+var sched_current_task_identity: Int = 0
+var sched_task_table: [Int] = [-1, -1, -1, -1, -1, -1]
+var sched_queue_count: Int = 0
+var sched_hold_count: Int = 0
+
+var tasks: [Task] = []
+var packets: [Packet] = []
+
+// ---- _RBObject.append ----
+let rb_append = |packet_idx: Int, queue_head: Int| {
+    let p: Packet = packets[packet_idx]
+    let np: Packet = {
+        link: p.link, kind: p.kind, identity: p.identity,
+        datum: p.datum, data: p.data
+    }
+    // set link to -1 (null)
+    let np2: Packet = {
+        link: -1, kind: np.kind, identity: np.identity,
+        datum: np.datum, data: np.data
+    }
+    packets[packet_idx] = np2
+    if queue_head == -1 {
+        return packet_idx
+    }
+    var mouse: Int = queue_head
+    var done: Bool = false
+    while not done {
+        let m: Packet = packets[mouse]
+        if m.link == -1 {
+            done = true
+        } else {
+            mouse = m.link
+        }
+    }
+    let m2: Packet = packets[mouse]
+    let m3: Packet = {
+        link: packet_idx, kind: m2.kind, identity: m2.identity,
+        datum: m2.datum, data: m2.data
+    }
+    packets[mouse] = m3
+    return queue_head
+}
+
+let task_find = |identity: Int| {
+    return sched_task_table[identity]
+}
+
+let task_set_holding = |task_idx: Int, v: Bool| {
+    let t: Task = tasks[task_idx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: v,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[task_idx] = nt
+}
+
+let task_set_waiting = |task_idx: Int, v: Bool| {
+    let t: Task = tasks[task_idx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: v, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[task_idx] = nt
+}
+
+// ---- TaskControlBlock.add_input_and_check_priority ----
+let task_add_input = |task_idx: Int, packet_idx: Int, old_task_idx: Int| {
+    let t: Task = tasks[task_idx]
+    if t.input == -1 {
+        let nt: Task = {
+            link: t.link, identity: t.identity, kind: t.kind,
+            priority: t.priority, input: packet_idx, holding: t.holding,
+            waiting: t.waiting, packet_pending: true,
+            pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+            control: t.control, count: t.count, destination: t.destination
+        }
+        tasks[task_idx] = nt
+        let ot: Task = tasks[old_task_idx]
+        if t.priority > ot.priority {
+            return task_idx
+        }
+    } else {
+        let new_input: Int = rb_append(packet_idx, t.input)
+        let nt: Task = {
+            link: t.link, identity: t.identity, kind: t.kind,
+            priority: t.priority, input: new_input, holding: t.holding,
+            waiting: t.waiting, packet_pending: t.packet_pending,
+            pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+            control: t.control, count: t.count, destination: t.destination
+        }
+        tasks[task_idx] = nt
+    }
+    return old_task_idx
+}
+
+let sched_hold_self = || {
+    sched_hold_count = sched_hold_count + 1
+    task_set_holding(sched_current_task, true)
+    let t: Task = tasks[sched_current_task]
+    return t.link
+}
+
+let sched_queue_packet = |packet_idx: Int| {
+    let p: Packet = packets[packet_idx]
+    let task_idx: Int = task_find(p.identity)
+    if task_idx == -1 {
+        return -1
+    }
+    sched_queue_count = sched_queue_count + 1
+    // packet.link = -1; packet.identity = current_task_identity
+    let np: Packet = {
+        link: -1, kind: p.kind, identity: sched_current_task_identity,
+        datum: p.datum, data: p.data
+    }
+    packets[packet_idx] = np
+    return task_add_input(task_idx, packet_idx, sched_current_task)
+}
+
+let sched_release = |identity: Int| {
+    let task_idx: Int = task_find(identity)
+    if task_idx == -1 {
+        return -1
+    }
+    task_set_holding(task_idx, false)
+    let t: Task = tasks[task_idx]
+    let ct: Task = tasks[sched_current_task]
+    if t.priority > ct.priority {
+        return task_idx
+    }
+    return sched_current_task
+}
+
+let sched_mark_waiting = || {
+    task_set_waiting(sched_current_task, true)
+    return sched_current_task
+}
+
+// ---- packet data helper ----
+let packet_set_datum = |pidx: Int, v: Int| {
+    let p: Packet = packets[pidx]
+    let np: Packet = {
+        link: p.link, kind: p.kind, identity: p.identity,
+        datum: v, data: p.data
+    }
+    packets[pidx] = np
+}
+
+let packet_set_data = |pidx: Int, i: Int, v: Int| {
+    let p: Packet = packets[pidx]
+    var nd: [Int] = []
+    var j: Int = 0
+    while j < len(p.data) {
+        if j == i {
+            nd = nd + [v]
+        } else {
+            nd = nd + [p.data[j]]
+        }
+        j = j + 1
+    }
+    let np: Packet = {
+        link: p.link, kind: p.kind, identity: p.identity,
+        datum: p.datum, data: nd
+    }
+    packets[pidx] = np
+}
+
+let packet_set_identity = |pidx: Int, v: Int| {
+    let p: Packet = packets[pidx]
+    let np: Packet = {
+        link: p.link, kind: p.kind, identity: v,
+        datum: p.datum, data: p.data
+    }
+    packets[pidx] = np
+}
+
+// ---- task field helpers ----
+let task_set_pending = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: v, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_work_in = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: v, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_device_in = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: v,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_control = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: v, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_count = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: v, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_destination = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: v
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_input = |tidx: Int, v: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: v, holding: t.holding,
+        waiting: t.waiting, packet_pending: t.packet_pending,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_state_running = |tidx: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: false,
+        waiting: false, packet_pending: false,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+let task_set_packet_pending = |tidx: Int| {
+    let t: Task = tasks[tidx]
+    let nt: Task = {
+        link: t.link, identity: t.identity, kind: t.kind,
+        priority: t.priority, input: t.input, holding: false,
+        waiting: false, packet_pending: true,
+        pending: t.pending, work_in: t.work_in, device_in: t.device_in,
+        control: t.control, count: t.count, destination: t.destination
+    }
+    tasks[tidx] = nt
+}
+
+// ---- device task fn (kind 0) ----
+let device_fn = |task_idx: Int, work_idx: Int| {
+    let t: Task = tasks[task_idx]
+    if work_idx == -1 {
+        let fw: Int = t.pending
+        if fw == -1 {
+            return sched_mark_waiting()
+        }
+        task_set_pending(task_idx, -1)
+        return sched_queue_packet(fw)
+    }
+    task_set_pending(task_idx, work_idx)
+    return sched_hold_self()
+}
+
+// ---- handler task fn (kind 1) ----
+let handler_fn = |task_idx: Int, work_idx: Int| {
+    let t: Task = tasks[task_idx]
+    if work_idx != -1 {
+        let w: Packet = packets[work_idx]
+        if w.kind == 1 {
+            // work_in_add
+            let ni: Int = rb_append(work_idx, t.work_in)
+            task_set_work_in(task_idx, ni)
+        } else {
+            // device_in_add
+            let ni: Int = rb_append(work_idx, t.device_in)
+            task_set_device_in(task_idx, ni)
+        }
+    }
+    let t2: Task = tasks[task_idx]
+    let work_packet: Int = t2.work_in
+    if work_packet == -1 {
+        return sched_mark_waiting()
+    }
+    let wp: Packet = packets[work_packet]
+    let count: Int = wp.datum
+    if count >= 4 {
+        let wpl: Packet = packets[work_packet]
+        task_set_work_in(task_idx, wpl.link)
+        return sched_queue_packet(work_packet)
+    }
+    let t3: Task = tasks[task_idx]
+    let device_packet: Int = t3.device_in
+    if device_packet == -1 {
+        return sched_mark_waiting()
+    }
+    let dp: Packet = packets[device_packet]
+    task_set_device_in(task_idx, dp.link)
+    let wp2: Packet = packets[work_packet]
+    packet_set_datum(device_packet, wp2.data[count])
+    packet_set_datum(work_packet, count + 1)
+    return sched_queue_packet(device_packet)
+}
+
+// ---- idler task fn (kind 2) ----
+let idler_fn = |task_idx: Int, work_idx: Int| {
+    let t: Task = tasks[task_idx]
+    let c: Int = t.count - 1
+    task_set_count(task_idx, c)
+    if c == 0 {
+        return sched_hold_self()
+    }
+    let t2: Task = tasks[task_idx]
+    if (t2.control % 2) == 0 {
+        task_set_control(task_idx, t2.control / 2)
+        return sched_release(4)
+    }
+    task_set_control(task_idx, ixor(t2.control / 2, 53256))
+    return sched_release(5)
+}
+
+// ---- worker task fn (kind 3) ----
+let worker_fn = |task_idx: Int, work_idx: Int| {
+    if work_idx == -1 {
+        return sched_mark_waiting()
+    }
+    let t: Task = tasks[task_idx]
+    var dest: Int = 3
+    if t.destination == 2 {
+        dest = 3
+    } else {
+        dest = 2
+    }
+    task_set_destination(task_idx, dest)
+    packet_set_identity(work_idx, dest)
+    packet_set_datum(work_idx, 0)
+    var i: Int = 0
+    while i < 4 {
+        let t2: Task = tasks[task_idx]
+        let c: Int = t2.count + 1
+        var nc: Int = c
+        if nc > 26 {
+            nc = 1
+        }
+        task_set_count(task_idx, nc)
+        packet_set_data(work_idx, i, 65 + nc - 1)
+        i = i + 1
+    }
+    return sched_queue_packet(work_idx)
+}
+
+// ---- TaskControlBlock.run_task ----
+let task_run = |task_idx: Int| {
+    let t: Task = tasks[task_idx]
+    var message: Int = -1
+    if t.waiting and t.packet_pending and not t.holding {
+        message = t.input
+        let msg: Packet = packets[message]
+        task_set_input(task_idx, msg.link)
+        let t2: Task = tasks[task_idx]
+        if t2.input == -1 {
+            task_set_state_running(task_idx)
+        } else {
+            task_set_packet_pending(task_idx)
+        }
+    }
+    let t3: Task = tasks[task_idx]
+    let kind: Int = t3.kind
+    if kind == 0 {
+        return device_fn(task_idx, message)
+    }
+    if kind == 1 {
+        return handler_fn(task_idx, message)
+    }
+    if kind == 2 {
+        return idler_fn(task_idx, message)
+    }
+    return worker_fn(task_idx, message)
+}
+
+// ---- Scheduler.schedule ----
+let sched_schedule = || {
+    sched_current_task = sched_task_list
+    while sched_current_task != -1 {
+        let t: Task = tasks[sched_current_task]
+        let hold_or_wait: Bool = t.holding or ((not t.packet_pending) and t.waiting)
+        if hold_or_wait {
+            sched_current_task = t.link
+        } else {
+            sched_current_task_identity = t.identity
+            sched_current_task = task_run(sched_current_task)
+        }
+    }
+}
+
+// ---- creation ----
+let sched_create_packet = |link_idx: Int, identity: Int, kind: Int| {
+    let p: Packet = {
+        link: link_idx, kind: kind, identity: identity,
+        datum: 0, data: [0, 0, 0, 0]
+    }
+    packets = packets + [p]
+    return len(packets) - 1
+}
+
+let sched_create_task = |identity: Int, priority: Int, work_idx: Int, state_kind: Int, kind: Int| {
+    // state_kind: 0=running, 1=waiting, 2=waiting_with_packet
+    var holding: Bool = false
+    var waiting: Bool = false
+    var pp: Bool = false
+    if state_kind == 1 {
+        waiting = true
+    }
+    if state_kind == 2 {
+        waiting = true
+        pp = true
+    }
+    // data record defaults by kind
+    var pending: Int = -1
+    var work_in: Int = -1
+    var device_in: Int = -1
+    var control: Int = 1
+    var count: Int = 0
+    var destination: Int = 2
+    if kind == 2 {
+        count = 10000
+    }
+    let t: Task = {
+        link: sched_task_list, identity: identity, kind: kind,
+        priority: priority, input: work_idx, holding: holding,
+        waiting: waiting, packet_pending: pp,
+        pending: pending, work_in: work_in, device_in: device_in,
+        control: control, count: count, destination: destination
+    }
+    tasks = tasks + [t]
+    let idx: Int = len(tasks) - 1
+    sched_task_list = idx
+    // task_table[identity] = idx
+    var nt: [Int] = []
+    var i: Int = 0
+    while i < len(sched_task_table) {
+        if i == identity {
+            nt = nt + [idx]
+        } else {
+            nt = nt + [sched_task_table[i]]
+        }
+        i = i + 1
+    }
+    sched_task_table = nt
+    return idx
+}
+
+let sched_start = || {
+    sched_create_task(0, 0, -1, 0, 2)
+    var wkq: Int = sched_create_packet(-1, 1, 1)
+    wkq = sched_create_packet(wkq, 1, 1)
+    sched_create_task(1, 1000, wkq, 2, 3)
+    wkq = sched_create_packet(-1, 4, 0)
+    wkq = sched_create_packet(wkq, 4, 0)
+    wkq = sched_create_packet(wkq, 4, 0)
+    sched_create_task(2, 2000, wkq, 2, 1)
+    wkq = sched_create_packet(-1, 5, 0)
+    wkq = sched_create_packet(wkq, 5, 0)
+    wkq = sched_create_packet(wkq, 5, 0)
+    sched_create_task(3, 3000, wkq, 2, 1)
+    sched_create_task(4, 4000, -1, 1, 0)
+    sched_create_task(5, 5000, -1, 1, 0)
+    sched_schedule()
+    return sched_queue_count == 23246 and sched_hold_count == 9297
+}
+
+let result: Bool = sched_start()
+print("RESULT: {result}")
+if result {
+    print("VERIFY: PASS")
+} else {
+    print("VERIFY: FAIL")
+}

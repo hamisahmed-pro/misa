@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-07T08:21:10.301495+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "cd": {
+      "python": {
+        "median_s": 6.777831337999942,
+        "times": [
+          6.485295805000078,
+          7.235245277000104,
+          6.777831337999942
+        ]
+      },
+      "node": {
+        "median_s": 0.395362279,
+        "times": [
+          0.393052752,
+          0.409966034,
+          0.395362279
+        ]
+      },
+      "misa_interp_error": "misa interp failed: TIMEOUT",
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/",
+      "correctness": "PASS"
+    },
+    "json": {
+      "python": {
+        "median_s": 0.014567279999937455,
+        "times": [
+          0.013094369000100414,
+          0.014567279999937455,
+          0.03191640700015341
+        ]
+      },
+      "node": {
+        "median_s": 0.023373991999999986,
+        "times": [
+          0.023373991999999986,
+          0.011759325000000004,
+          0.024571560000000006
+        ]
+      },
+      "misa_interp": {
+        "median_s": 5.660078130999864,
+        "times": [
+          5.403221905999999,
+          5.784071846999723,
+          5.660078130999864
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.48926109200010615,
+        "times": [
+          0.48926109200010615,
+          0.34916446099987297,
+          0.5636844759997075
+        ],
+        "compile_s": 1.1725660379997862
+      },
+      "correctness": "PASS"
+    }
+  }
+}

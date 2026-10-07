@@ -1,0 +1,65 @@
+// Are We Fast Yet: List benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/list.py
+// Builds three linked lists (15, 10, 6) and runs the recursive
+// tail/is_shorter_than benchmark. Expected: 10.
+//
+// Misa notes:
+// - `Element.next` is `Element?` (nil-terminated). The checker allows
+//   `.next` on the optional because the algorithm guarantees non-nil
+//   at those points (same as the Python version).
+
+type Element { val: Int, next: Element? }
+
+fn list_len(e: Element?) -> Int {
+  if e == nil {
+    return 0
+  }
+  return 1 + list_len(e.next)
+}
+
+fn make_list(length: Int) -> Element? {
+  if length == 0 {
+    return nil
+  }
+  let rest = make_list(length - 1)
+  let e: Element = { val: length, next: rest }
+  return e
+}
+
+fn is_shorter_than(x: Element?, y: Element?) -> Bool {
+  var x_tail = x
+  var y_tail = y
+  while y_tail != nil {
+    if x_tail == nil {
+      return true
+    }
+    x_tail = x_tail.next
+    y_tail = y_tail.next
+  }
+  return false
+}
+
+fn tail(x: Element?, y: Element?, z: Element?) -> Element? {
+  if is_shorter_than(y, x) {
+    return tail(
+      tail(x.next, y, z),
+      tail(y.next, z, x),
+      tail(z.next, x, y),
+    )
+  }
+  return z
+}
+
+fn benchmark() -> Int {
+  let result = tail(make_list(15), make_list(10), make_list(6))
+  return list_len(result)
+}
+
+let result = benchmark()
+print("list result: {result}")
+print("RESULT: {result}")
+if result == 10 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL (expected 10)")
+}

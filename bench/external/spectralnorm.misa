@@ -1,0 +1,77 @@
+// spectral-norm — Misa port of Benchmarks Game spectralnorm.python3-6
+// Source: https://benchmarksgame-team.pages.debian.net/benchmarksgame/
+
+fn eval_A(i: Int, j: Int) -> Float {
+  let ij = i + j
+  return 1.0 / (1.0 * (ij * (ij + 1) / 2 + i + 1))
+}
+
+fn eval_A_times_u(u: [Float]) -> [Float] {
+  let n = len(u)
+  var result: [Float] = []
+  var i = 0
+  while i < n {
+    var sum = 0.0
+    var j = 0
+    while j < n {
+      sum = sum + eval_A(i, j) * u[j]
+      j = j + 1
+    }
+    result = result + [sum]
+    i = i + 1
+  }
+  return result
+}
+
+fn eval_At_times_u(u: [Float]) -> [Float] {
+  let n = len(u)
+  var result: [Float] = []
+  var i = 0
+  while i < n {
+    var sum = 0.0
+    var j = 0
+    while j < n {
+      sum = sum + eval_A(j, i) * u[j]
+      j = j + 1
+    }
+    result = result + [sum]
+    i = i + 1
+  }
+  return result
+}
+
+fn eval_AtA_times_u(u: [Float]) -> [Float] {
+  return eval_At_times_u(eval_A_times_u(u))
+}
+
+fn main() throws E300 {
+  var n = 100
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  var u: [Float] = []
+  var i = 0
+  while i < n {
+    u = u + [1.0]
+    i = i + 1
+  }
+  var dummy = 0
+  while dummy < 10 {
+    let v = eval_AtA_times_u(u)
+    u = eval_AtA_times_u(v)
+    dummy = dummy + 1
+  }
+  var vBv = 0.0
+  var vv = 0.0
+  let v = eval_AtA_times_u(u)
+  i = 0
+  while i < n {
+    vBv = vBv + u[i] * v[i]
+    vv = vv + v[i] * v[i]
+    i = i + 1
+  }
+  print(math.sqrt(vBv / vv))
+}
+
+main()

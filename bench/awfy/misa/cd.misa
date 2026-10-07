@@ -1,0 +1,1520 @@
+// Are We Fast Yet: CD (collision detector) benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/cd.py
+// Standard AWFY input: 1000 aircraft, 200 frames. Expected: 14484 collisions.
+//
+// Misa notes:
+// - No `math.cos`/`math.sin` in stdlib; brought in via `extern "c"`
+//   (libm, bit-identical to Python's math.cos/sin).
+// - No `float("inf")`; uses math.pow(10.0, 308.0).
+// - No `//` floor-div; uses math.floor(x / d).
+// - Misa fn params are immutable and functions cannot see module-level
+//   `var`, so the three red-black trees are threaded through as
+//   `{nodes, root}` records. Inside each fn, `var ns = t.nodes`
+//   aliases (not copies) the list, so mutations stay O(1).
+// - SOM `Vector` is replaced by Misa lists.
+
+extern "c" {
+  fn cos(x: Float) -> Float,
+  fn sin(x: Float) -> Float,
+}
+
+type V2D { x: Float, y: Float }
+type V3D { x: Float, y: Float, z: Float }
+type Color { Red, Black }
+type CallSign { v: Int }
+type Motion { cs: CallSign, p1: V3D, p2: V3D }
+type Aircraft { cs: CallSign, pos: V3D }
+
+let MIN_X = 0.0
+let MIN_Y = 0.0
+let MAX_X = 1000.0
+let MAX_Y = 1000.0
+let MIN_Z = 0.0
+let MAX_Z = 10.0
+let PROXIMITY_RADIUS = 1.0
+let GOOD_VOXEL_SIZE = 2.0
+let INF_POS = math.pow(10.0, 308.0)
+let INF_NEG = -math.pow(10.0, 308.0)
+
+fn cmp_num(a: Float, b: Float) -> Int {
+  if a == b {
+    return 0
+  }
+  if a < b {
+    return -1
+  }
+  if a > b {
+    return 1
+  }
+  if a == a {
+    return 1
+  }
+  return -1
+}
+
+fn v2d_cmp(a: V2D, b: V2D) -> Int {
+  let r = cmp_num(a.x, b.x)
+  if r != 0 {
+    return r
+  }
+  return cmp_num(a.y, b.y)
+}
+
+fn cs_cmp(a: CallSign, b: CallSign) -> Int {
+  if a.v == b.v {
+    return 0
+  }
+  if a.v < b.v {
+    return -1
+  }
+  return 1
+}
+
+fn v2d_plus(a: V2D, b: V2D) -> V2D {
+  let r: V2D = { x: a.x + b.x, y: a.y + b.y }
+  return r
+}
+
+fn v2d_minus(a: V2D, b: V2D) -> V2D {
+  let r: V2D = { x: a.x - b.x, y: a.y - b.y }
+  return r
+}
+
+fn v3d_plus(a: V3D, b: V3D) -> V3D {
+  let r: V3D = { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+  return r
+}
+
+fn v3d_minus(a: V3D, b: V3D) -> V3D {
+  let r: V3D = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+  return r
+}
+
+fn v3d_dot(a: V3D, b: V3D) -> Float {
+  return a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+fn v3d_times(a: V3D, s: Float) -> V3D {
+  let r: V3D = { x: a.x * s, y: a.y * s, z: a.z * s }
+  return r
+}
+
+fn horiz() -> V2D {
+  let h: V2D = { x: 2.0, y: 0.0 }
+  return h
+}
+
+fn vert() -> V2D {
+  let v: V2D = { x: 0.0, y: 2.0 }
+  return v
+}
+type SNode { key: CallSign, val: V3D, left: Int, right: Int, parent: Int, color: Color }
+type STree { nodes: [SNode], root: Int }
+type SEntry { key: CallSign, val: V3D }
+
+fn s_minimum(t: STree, idx: Int) -> Int {
+  var ns = t.nodes
+  var cur = idx
+  while ns[cur].left != -1 {
+    cur = ns[cur].left
+  }
+  return cur
+}
+
+fn s_successor(t: STree, idx: Int) -> Int {
+  var ns = t.nodes
+  var x = idx
+  if ns[x].right != -1 {
+    return s_minimum(t, ns[x].right)
+  }
+  var y = ns[x].parent
+  while y != -1 and x == ns[y].right {
+    x = y
+    y = ns[y].parent
+  }
+  return y
+}
+
+fn s_find(t: STree, key: CallSign) -> Int {
+  var ns = t.nodes
+  var cur = t.root
+  while cur != -1 {
+    let c = cs_cmp(key, ns[cur].key)
+    if c == 0 { return cur }
+    if c < 0 { cur = ns[cur].left } else { cur = ns[cur].right }
+  }
+  return -1
+}
+
+fn s_left_rotate(t: STree, x: Int) -> STree {
+  var ns = t.nodes
+  var root = t.root
+  let y = ns[x].right
+  var nx: SNode = ns[x]
+  nx.right = ns[y].left
+  if ns[y].left != -1 {
+    var yl: SNode = ns[ns[y].left]
+    yl.parent = x
+    ns[ns[y].left] = yl
+  }
+  ns[x] = nx
+  var ny: SNode = ns[y]
+  ny.parent = ns[x].parent
+  ns[y] = ny
+  if ns[x].parent == -1 {
+    root = y
+  } else {
+    let xp = ns[x].parent
+    var xpp: SNode = ns[xp]
+    if x == xpp.left { xpp.left = y } else { xpp.right = y }
+    ns[xp] = xpp
+  }
+  ny = ns[y]
+  ny.left = x
+  ns[y] = ny
+  nx = ns[x]
+  nx.parent = y
+  ns[x] = nx
+  let nt: STree = { nodes: ns, root: root }
+  return nt
+}
+
+fn s_right_rotate(t: STree, y: Int) -> STree {
+  var ns = t.nodes
+  var root = t.root
+  let x = ns[y].left
+  var ny: SNode = ns[y]
+  ny.left = ns[x].right
+  if ns[x].right != -1 {
+    var xr: SNode = ns[ns[x].right]
+    xr.parent = y
+    ns[ns[x].right] = xr
+  }
+  ns[y] = ny
+  var nx: SNode = ns[x]
+  nx.parent = ns[y].parent
+  ns[x] = nx
+  if ns[y].parent == -1 {
+    root = x
+  } else {
+    let yp = ns[y].parent
+    var ypp: SNode = ns[yp]
+    if y == ypp.left { ypp.left = x } else { ypp.right = x }
+    ns[yp] = ypp
+  }
+  nx = ns[x]
+  nx.right = y
+  ns[x] = nx
+  ny = ns[y]
+  ny.parent = x
+  ns[y] = ny
+  let nt: STree = { nodes: ns, root: root }
+  return nt
+}
+
+
+type SeenNode { key: CallSign, val: Bool, left: Int, right: Int, parent: Int, color: Color }
+type SeenTree { nodes: [SeenNode], root: Int }
+
+fn seen_minimum(t: SeenTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var cur = idx
+  while ns[cur].left != -1 {
+    cur = ns[cur].left
+  }
+  return cur
+}
+
+fn seen_successor(t: SeenTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var x = idx
+  if ns[x].right != -1 {
+    return seen_minimum(t, ns[x].right)
+  }
+  var y = ns[x].parent
+  while y != -1 and x == ns[y].right {
+    x = y
+    y = ns[y].parent
+  }
+  return y
+}
+
+fn seen_find(t: SeenTree, key: CallSign) -> Int {
+  var ns = t.nodes
+  var cur = t.root
+  while cur != -1 {
+    let c = cs_cmp(key, ns[cur].key)
+    if c == 0 { return cur }
+    if c < 0 { cur = ns[cur].left } else { cur = ns[cur].right }
+  }
+  return -1
+}
+
+fn seen_left_rotate(t: SeenTree, x: Int) -> SeenTree {
+  var ns = t.nodes
+  var root = t.root
+  let y = ns[x].right
+  var nx: SeenNode = ns[x]
+  nx.right = ns[y].left
+  if ns[y].left != -1 {
+    var yl: SeenNode = ns[ns[y].left]
+    yl.parent = x
+    ns[ns[y].left] = yl
+  }
+  ns[x] = nx
+  var ny: SeenNode = ns[y]
+  ny.parent = ns[x].parent
+  ns[y] = ny
+  if ns[x].parent == -1 {
+    root = y
+  } else {
+    let xp = ns[x].parent
+    var xpp: SeenNode = ns[xp]
+    if x == xpp.left { xpp.left = y } else { xpp.right = y }
+    ns[xp] = xpp
+  }
+  ny = ns[y]
+  ny.left = x
+  ns[y] = ny
+  nx = ns[x]
+  nx.parent = y
+  ns[x] = nx
+  let nt: SeenTree = { nodes: ns, root: root }
+  return nt
+}
+
+fn seen_right_rotate(t: SeenTree, y: Int) -> SeenTree {
+  var ns = t.nodes
+  var root = t.root
+  let x = ns[y].left
+  var ny: SeenNode = ns[y]
+  ny.left = ns[x].right
+  if ns[x].right != -1 {
+    var xr: SeenNode = ns[ns[x].right]
+    xr.parent = y
+    ns[ns[x].right] = xr
+  }
+  ns[y] = ny
+  var nx: SeenNode = ns[x]
+  nx.parent = ns[y].parent
+  ns[x] = nx
+  if ns[y].parent == -1 {
+    root = x
+  } else {
+    let yp = ns[y].parent
+    var ypp: SeenNode = ns[yp]
+    if y == ypp.left { ypp.left = x } else { ypp.right = x }
+    ns[yp] = ypp
+  }
+  nx = ns[x]
+  nx.right = y
+  ns[x] = nx
+  ny = ns[y]
+  ny.parent = x
+  ns[y] = ny
+  let nt: SeenTree = { nodes: ns, root: root }
+  return nt
+}
+
+
+type VNode { key: V2D, val: [Motion], left: Int, right: Int, parent: Int, color: Color }
+type VTree { nodes: [VNode], root: Int }
+type VEntry { key: V2D, val: [Motion] }
+
+fn v_minimum(t: VTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var cur = idx
+  while ns[cur].left != -1 {
+    cur = ns[cur].left
+  }
+  return cur
+}
+
+fn v_successor(t: VTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var x = idx
+  if ns[x].right != -1 {
+    return v_minimum(t, ns[x].right)
+  }
+  var y = ns[x].parent
+  while y != -1 and x == ns[y].right {
+    x = y
+    y = ns[y].parent
+  }
+  return y
+}
+
+fn v_find(t: VTree, key: V2D) -> Int {
+  var ns = t.nodes
+  var cur = t.root
+  while cur != -1 {
+    let c = v2d_cmp(key, ns[cur].key)
+    if c == 0 { return cur }
+    if c < 0 { cur = ns[cur].left } else { cur = ns[cur].right }
+  }
+  return -1
+}
+
+fn v_left_rotate(t: VTree, x: Int) -> VTree {
+  var ns = t.nodes
+  var root = t.root
+  let y = ns[x].right
+  var nx: VNode = ns[x]
+  nx.right = ns[y].left
+  if ns[y].left != -1 {
+    var yl: VNode = ns[ns[y].left]
+    yl.parent = x
+    ns[ns[y].left] = yl
+  }
+  ns[x] = nx
+  var ny: VNode = ns[y]
+  ny.parent = ns[x].parent
+  ns[y] = ny
+  if ns[x].parent == -1 {
+    root = y
+  } else {
+    let xp = ns[x].parent
+    var xpp: VNode = ns[xp]
+    if x == xpp.left { xpp.left = y } else { xpp.right = y }
+    ns[xp] = xpp
+  }
+  ny = ns[y]
+  ny.left = x
+  ns[y] = ny
+  nx = ns[x]
+  nx.parent = y
+  ns[x] = nx
+  let nt: VTree = { nodes: ns, root: root }
+  return nt
+}
+
+fn v_right_rotate(t: VTree, y: Int) -> VTree {
+  var ns = t.nodes
+  var root = t.root
+  let x = ns[y].left
+  var ny: VNode = ns[y]
+  ny.left = ns[x].right
+  if ns[x].right != -1 {
+    var xr: VNode = ns[ns[x].right]
+    xr.parent = y
+    ns[ns[x].right] = xr
+  }
+  ns[y] = ny
+  var nx: VNode = ns[x]
+  nx.parent = ns[y].parent
+  ns[x] = nx
+  if ns[y].parent == -1 {
+    root = x
+  } else {
+    let yp = ns[y].parent
+    var ypp: VNode = ns[yp]
+    if y == ypp.left { ypp.left = x } else { ypp.right = x }
+    ns[yp] = ypp
+  }
+  nx = ns[x]
+  nx.right = y
+  ns[x] = nx
+  ny = ns[y]
+  ny.parent = x
+  ns[y] = ny
+  let nt: VTree = { nodes: ns, root: root }
+  return nt
+}
+
+
+type SPutOut { tree: STree, old: V3D? }
+fn s_put(t: STree, key: CallSign, val: V3D) -> SPutOut {
+  var ns = t.nodes
+  var root = t.root
+  var y = -1
+  var x = root
+  while x != -1 {
+    y = x
+    let c = cs_cmp(key, ns[x].key)
+    if c < 0 { x = ns[x].left } else {
+      if c > 0 { x = ns[x].right } else {
+        var xn: SNode = ns[x]
+        let old = xn.val
+        xn.val = val
+        ns[x] = xn
+        let nt0: STree = { nodes: ns, root: root }
+        let r0: SPutOut = { tree: nt0, old: old }
+        return r0
+      }
+    }
+  }
+  let z = len(ns)
+  ns = ns + [{ key: key, val: val, left: -1, right: -1, parent: y, color: Color.Red }]
+  if y == -1 { root = z } else {
+    var yn: SNode = ns[y]
+    if cs_cmp(key, yn.key) < 0 { yn.left = z } else { yn.right = z }
+    ns[y] = yn
+  }
+  var fx = z
+  var tt: STree = { nodes: ns, root: root }
+  while fx != root and ns[ns[fx].parent].color == Color.Red {
+    let xp = ns[fx].parent
+    let xpp = ns[xp].parent
+    if xp == ns[xpp].left {
+      let w = ns[xpp].right
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].right {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = s_left_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = s_right_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    } else {
+      let w = ns[xpp].left
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].left {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = s_right_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = s_left_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    }
+  }
+  var rn: SNode = ns[root]
+  rn.color = Color.Black
+  ns[root] = rn
+  let nt: STree = { nodes: ns, root: root }
+  let r: SPutOut = { tree: nt, old: nil }
+  return r
+}
+
+fn s_get(t: STree, key: CallSign) -> V3D? {
+  let idx = s_find(t, key)
+  if idx == -1 { return nil }
+  return t.nodes[idx].val
+}
+
+fn s_entries(t: STree) -> [SEntry] {
+  var out: [SEntry] = []
+  if t.root == -1 { return out }
+  var cur = s_minimum(t, t.root)
+  while cur != -1 {
+    out = out + [{ key: t.nodes[cur].key, val: t.nodes[cur].val }]
+    cur = s_successor(t, cur)
+  }
+  return out
+}
+
+type SeenPutOut { tree: SeenTree, old: Bool? }
+fn seen_put(t: SeenTree, key: CallSign, val: Bool) -> SeenPutOut {
+  var ns = t.nodes
+  var root = t.root
+  var y = -1
+  var x = root
+  while x != -1 {
+    y = x
+    let c = cs_cmp(key, ns[x].key)
+    if c < 0 { x = ns[x].left } else {
+      if c > 0 { x = ns[x].right } else {
+        var xn: SeenNode = ns[x]
+        let old = xn.val
+        xn.val = val
+        ns[x] = xn
+        let nt0: SeenTree = { nodes: ns, root: root }
+        let r0: SeenPutOut = { tree: nt0, old: old }
+        return r0
+      }
+    }
+  }
+  let z = len(ns)
+  ns = ns + [{ key: key, val: val, left: -1, right: -1, parent: y, color: Color.Red }]
+  if y == -1 { root = z } else {
+    var yn: SeenNode = ns[y]
+    if cs_cmp(key, yn.key) < 0 { yn.left = z } else { yn.right = z }
+    ns[y] = yn
+  }
+  var fx = z
+  var tt: SeenTree = { nodes: ns, root: root }
+  while fx != root and ns[ns[fx].parent].color == Color.Red {
+    let xp = ns[fx].parent
+    let xpp = ns[xp].parent
+    if xp == ns[xpp].left {
+      let w = ns[xpp].right
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SeenNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SeenNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SeenNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].right {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = seen_left_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SeenNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SeenNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = seen_right_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    } else {
+      let w = ns[xpp].left
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SeenNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SeenNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SeenNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].left {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = seen_right_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SeenNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SeenNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = seen_left_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    }
+  }
+  var rn: SeenNode = ns[root]
+  rn.color = Color.Black
+  ns[root] = rn
+  let nt: SeenTree = { nodes: ns, root: root }
+  let r: SeenPutOut = { tree: nt, old: nil }
+  return r
+}
+
+fn seen_get(t: SeenTree, key: CallSign) -> Bool? {
+  let idx = seen_find(t, key)
+  if idx == -1 { return nil }
+  return t.nodes[idx].val
+}
+
+type VPutOut { tree: VTree, old: [Motion]? }
+fn v_put(t: VTree, key: V2D, val: [Motion]) -> VPutOut {
+  var ns = t.nodes
+  var root = t.root
+  var y = -1
+  var x = root
+  while x != -1 {
+    y = x
+    let c = v2d_cmp(key, ns[x].key)
+    if c < 0 { x = ns[x].left } else {
+      if c > 0 { x = ns[x].right } else {
+        var xn: VNode = ns[x]
+        let old = xn.val
+        xn.val = val
+        ns[x] = xn
+        let nt0: VTree = { nodes: ns, root: root }
+        let r0: VPutOut = { tree: nt0, old: old }
+        return r0
+      }
+    }
+  }
+  let z = len(ns)
+  ns = ns + [{ key: key, val: val, left: -1, right: -1, parent: y, color: Color.Red }]
+  if y == -1 { root = z } else {
+    var yn: VNode = ns[y]
+    if v2d_cmp(key, yn.key) < 0 { yn.left = z } else { yn.right = z }
+    ns[y] = yn
+  }
+  var fx = z
+  var tt: VTree = { nodes: ns, root: root }
+  while fx != root and ns[ns[fx].parent].color == Color.Red {
+    let xp = ns[fx].parent
+    let xpp = ns[xp].parent
+    if xp == ns[xpp].left {
+      let w = ns[xpp].right
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: VNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: VNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: VNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].right {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = v_left_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: VNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: VNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = v_right_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    } else {
+      let w = ns[xpp].left
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: VNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: VNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: VNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].left {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = v_right_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: VNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: VNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = v_left_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    }
+  }
+  var rn: VNode = ns[root]
+  rn.color = Color.Black
+  ns[root] = rn
+  let nt: VTree = { nodes: ns, root: root }
+  let r: VPutOut = { tree: nt, old: nil }
+  return r
+}
+
+fn v_get(t: VTree, key: V2D) -> [Motion]? {
+  let idx = v_find(t, key)
+  if idx == -1 { return nil }
+  return t.nodes[idx].val
+}
+
+fn v_entries(t: VTree) -> [VEntry] {
+  var out: [VEntry] = []
+  if t.root == -1 { return out }
+  var cur = v_minimum(t, t.root)
+  while cur != -1 {
+    out = out + [{ key: t.nodes[cur].key, val: t.nodes[cur].val }]
+    cur = v_successor(t, cur)
+  }
+  return out
+}
+
+type SRemOut { tree: STree, old: V3D? }
+fn s_remove_fixup(t: STree, x: Int, x_parent: Int) -> STree {
+  var ns = t.nodes
+  var root = t.root
+  var fx = x
+  var fxp = x_parent
+  var tt: STree = { nodes: ns, root: root }
+  while fx != root and (fx == -1 or ns[fx].color == Color.Black) {
+    if fx == ns[fxp].left {
+      var w = ns[fxp].right
+      if ns[w].color == Color.Red {
+        var wn: SNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var fxp_n: SNode = ns[fxp]
+        fxp_n.color = Color.Red
+        ns[fxp] = fxp_n
+        tt = { nodes: ns, root: root }
+        tt = s_left_rotate(tt, fxp)
+        ns = tt.nodes
+        root = tt.root
+        w = ns[fxp].right
+      }
+      let wleft = ns[w].left
+      let wright = ns[w].right
+      if (wleft == -1 or ns[wleft].color == Color.Black) and (wright == -1 or ns[wright].color == Color.Black) {
+        var wn2: SNode = ns[w]
+        wn2.color = Color.Red
+        ns[w] = wn2
+        fx = fxp
+        fxp = ns[fx].parent
+      } else {
+        if wright == -1 or ns[wright].color == Color.Black {
+          var wln: SNode = ns[wleft]
+          wln.color = Color.Black
+          ns[wleft] = wln
+          var wn3: SNode = ns[w]
+          wn3.color = Color.Red
+          ns[w] = wn3
+          tt = { nodes: ns, root: root }
+          tt = s_right_rotate(tt, w)
+          ns = tt.nodes
+          root = tt.root
+          w = ns[fxp].right
+        }
+        var wn4: SNode = ns[w]
+        wn4.color = ns[fxp].color
+        ns[w] = wn4
+        var fxp_n2: SNode = ns[fxp]
+        fxp_n2.color = Color.Black
+        ns[fxp] = fxp_n2
+        let wright2 = ns[w].right
+        if wright2 != -1 {
+          var wrn: SNode = ns[wright2]
+          wrn.color = Color.Black
+          ns[wright2] = wrn
+        }
+        tt = { nodes: ns, root: root }
+        tt = s_left_rotate(tt, fxp)
+        ns = tt.nodes
+        root = tt.root
+        fx = root
+        fxp = ns[fx].parent
+      }
+    } else {
+      var w = ns[fxp].left
+      if ns[w].color == Color.Red {
+        var wn: SNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var fxp_n: SNode = ns[fxp]
+        fxp_n.color = Color.Red
+        ns[fxp] = fxp_n
+        tt = { nodes: ns, root: root }
+        tt = s_right_rotate(tt, fxp)
+        ns = tt.nodes
+        root = tt.root
+        w = ns[fxp].left
+      }
+      let wright = ns[w].right
+      let wleft = ns[w].left
+      if (wright == -1 or ns[wright].color == Color.Black) and (wleft == -1 or ns[wleft].color == Color.Black) {
+        var wn2: SNode = ns[w]
+        wn2.color = Color.Red
+        ns[w] = wn2
+        fx = fxp
+        fxp = ns[fx].parent
+      } else {
+        if wleft == -1 or ns[wleft].color == Color.Black {
+          var wrn: SNode = ns[wright]
+          wrn.color = Color.Black
+          ns[wright] = wrn
+          var wn3: SNode = ns[w]
+          wn3.color = Color.Red
+          ns[w] = wn3
+          tt = { nodes: ns, root: root }
+          tt = s_left_rotate(tt, w)
+          ns = tt.nodes
+          root = tt.root
+          w = ns[fxp].left
+        }
+        var wn4: SNode = ns[w]
+        wn4.color = ns[fxp].color
+        ns[w] = wn4
+        var fxp_n2: SNode = ns[fxp]
+        fxp_n2.color = Color.Black
+        ns[fxp] = fxp_n2
+        let wleft2 = ns[w].left
+        if wleft2 != -1 {
+          var wln: SNode = ns[wleft2]
+          wln.color = Color.Black
+          ns[wleft2] = wln
+        }
+        tt = { nodes: ns, root: root }
+        tt = s_right_rotate(tt, fxp)
+        ns = tt.nodes
+        root = tt.root
+        fx = root
+        fxp = ns[fx].parent
+      }
+    }
+  }
+  if fx != -1 {
+    var fxn: SNode = ns[fx]
+    fxn.color = Color.Black
+    ns[fx] = fxn
+  }
+  let nt: STree = { nodes: ns, root: root }
+  return nt
+}
+
+fn s_remove(t: STree, key: CallSign) -> SRemOut {
+  var ns = t.nodes
+  var root = t.root
+  let z = s_find(t, key)
+  if z == -1 {
+    let nt0: STree = { nodes: ns, root: root }
+    let r0: SRemOut = { tree: nt0, old: nil }
+    return r0
+  }
+  var y = -1
+  let zn = ns[z]
+  if zn.left == -1 or zn.right == -1 { y = z } else { y = s_successor(t, z) }
+  var x = -1
+  let yn = ns[y]
+  if yn.left != -1 { x = yn.left } else { x = yn.right }
+  var x_parent = -1
+  if x != -1 {
+    var xn: SNode = ns[x]
+    xn.parent = yn.parent
+    ns[x] = xn
+    x_parent = ns[x].parent
+  } else { x_parent = yn.parent }
+  let yp = yn.parent
+  if yp == -1 { root = x } else {
+    var ypp: SNode = ns[yp]
+    if y == ypp.left { ypp.left = x } else { ypp.right = x }
+    ns[yp] = ypp
+  }
+  var tt: STree = { nodes: ns, root: root }
+  if y != z {
+    if yn.color == Color.Black {
+      tt = s_remove_fixup(tt, x, x_parent)
+      ns = tt.nodes
+      root = tt.root
+    }
+    var y2: SNode = ns[y]
+    y2.parent = zn.parent
+    y2.color = zn.color
+    y2.left = zn.left
+    y2.right = zn.right
+    ns[y] = y2
+    if zn.left != -1 {
+      var zl: SNode = ns[zn.left]
+      zl.parent = y
+      ns[zn.left] = zl
+    }
+    if zn.right != -1 {
+      var zr: SNode = ns[zn.right]
+      zr.parent = y
+      ns[zn.right] = zr
+    }
+    if zn.parent != -1 {
+      var zp: SNode = ns[zn.parent]
+      if zp.left == z { zp.left = y } else { zp.right = y }
+      ns[zn.parent] = zp
+    } else { root = y }
+  } else {
+    if yn.color == Color.Black {
+      tt = s_remove_fixup(tt, x, x_parent)
+      ns = tt.nodes
+      root = tt.root
+    }
+  }
+  let nt: STree = { nodes: ns, root: root }
+  let r: SRemOut = { tree: nt, old: zn.val }
+  return r
+}
+
+// ---------------- motion / voxel logic ----------------
+type RecOut { seen: SeenVTree, vtree: VTree }
+
+fn motion_delta(m: Motion) -> V3D {
+  return v3d_minus(m.p2, m.p1)
+}
+
+fn is_in_voxel(voxel: V2D, m: Motion) -> Bool throws E300 {
+  if voxel.x > 1000.0 or voxel.x < 0.0 or voxel.y > 1000.0 or voxel.y < 0.0 {
+    return false
+  }
+  let init = m.p1
+  let fin = m.p2
+  let v_s = 2.0
+  let r = 1.0 / 2.0
+  let v_x = voxel.x
+  let x0 = init.x
+  let xv = fin.x - init.x
+  let v_y = voxel.y
+  let y0 = init.y
+  let yv = fin.y - init.y
+  var low_x = 0.0
+  var high_x = 0.0
+  if xv == 0.0 {
+    if (v_x - r - x0) < 0.0 {
+      low_x = -math.pow(10.0, 308.0)
+    } else {
+      low_x = math.pow(10.0, 308.0)
+    }
+    if (v_x + v_s + r - x0) < 0.0 {
+      high_x = -math.pow(10.0, 308.0)
+    } else {
+      high_x = math.pow(10.0, 308.0)
+    }
+  } else {
+    low_x = (v_x - r - x0) / xv
+    high_x = (v_x + v_s + r - x0) / xv
+  }
+  if xv < 0.0 {
+    let t = low_x
+    low_x = high_x
+    high_x = t
+  }
+  var low_y = 0.0
+  var high_y = 0.0
+  if yv == 0.0 {
+    if (v_y - r - y0) < 0.0 {
+      low_y = -math.pow(10.0, 308.0)
+    } else {
+      low_y = math.pow(10.0, 308.0)
+    }
+    if (v_y + v_s + r - y0) < 0.0 {
+      high_y = -math.pow(10.0, 308.0)
+    } else {
+      high_y = math.pow(10.0, 308.0)
+    }
+  } else {
+    low_y = (v_y - r - y0) / yv
+    high_y = (v_y + v_s + r - y0) / yv
+  }
+  if yv < 0.0 {
+    let t = low_y
+    low_y = high_y
+    high_y = t
+  }
+  let x_ok = (xv == 0.0 and v_x <= x0 + r and x0 - r <= v_x + v_s) or
+    (low_x <= 1.0 and 1.0 <= high_x) or
+    (low_x <= 0.0 and 0.0 <= high_x) or
+    (0.0 <= low_x and high_x <= 1.0)
+  let y_ok = (yv == 0.0 and v_y <= y0 + r and y0 - r <= v_y + v_s) or
+    ((low_y <= 1.0 and 1.0 <= high_y) or
+     (low_y <= 0.0 and 0.0 <= high_y) or
+     (0.0 <= low_y and high_y <= 1.0))
+  let xy_ok = xv == 0.0 or yv == 0.0 or
+    (low_y <= high_x and high_x <= high_y) or
+    (low_y <= low_x and low_x <= high_y) or
+    (low_x <= low_y and high_y <= high_x)
+  return x_ok and y_ok and xy_ok
+}
+
+fn put_into_map(vtree: VTree, voxel: V2D, m: Motion) -> VTree {
+  let idx = v_find(vtree, voxel)
+  if idx == -1 {
+    let r = v_put(vtree, voxel, [m])
+    return r.tree
+  }
+  var a: [Motion] = vtree.nodes[idx].val
+  a = a + [m]
+  let r2 = v_put(vtree, voxel, a)
+  return r2.tree
+}
+
+fn recurse(seen: SeenVTree, vtree: VTree, start: V2D, m: Motion) -> RecOut throws E300 {
+  // Iterative DFS (the recursive version overflows Misa's call stack
+  // on large motions). Visits voxels in the same order as the recursive
+  // version: neighbors pushed in reverse so they pop in order.
+  var s = seen
+  var v = vtree
+  var stack: [V2D] = []
+  stack = stack + [start]
+  var top = 0
+  let h = horiz()
+  let vv = vert()
+  while top >= 0 {
+    let voxel = stack[top]
+    top = top - 1
+    if is_in_voxel(voxel, m) {
+      let sp = seenv_put(s, voxel, true)
+      s = sp.tree
+      if sp.old == nil {
+        v = put_into_map(v, voxel, m)
+        // push 8 neighbors in reverse order
+        stack = stack + [v2d_plus(v2d_plus(voxel, h), vv)]
+        stack = stack + [v2d_minus(v2d_plus(voxel, h), vv)]
+        stack = stack + [v2d_plus(v2d_minus(voxel, h), vv)]
+        stack = stack + [v2d_minus(v2d_minus(voxel, h), vv)]
+        stack = stack + [v2d_plus(voxel, vv)]
+        stack = stack + [v2d_minus(voxel, vv)]
+        stack = stack + [v2d_plus(voxel, h)]
+        stack = stack + [v2d_minus(voxel, h)]
+        top = len(stack) - 1
+      }
+    }
+  }
+  let o: RecOut = { seen: s, vtree: v }
+  return o
+}
+
+fn voxel_hash(pos: V3D) -> V2D throws E300 {
+  let x_div = math.floor(pos.x / 2.0)
+  let y_div = math.floor(pos.y / 2.0)
+  var x = 2.0 * x_div
+  var y = 2.0 * y_div
+  if pos.x < 0.0 {
+    x = x - 2.0
+  }
+  if pos.y < 0.0 {
+    y = y - 2.0
+  }
+  let r: V2D = { x: x, y: y }
+  return r
+}
+
+fn draw_motion_on_voxel_map(vtree: VTree, m: Motion) -> VTree throws E300 {
+  let seen0: SeenVTree = { nodes: [], root: -1 }
+  let r = recurse(seen0, vtree, voxel_hash(m.p1), m)
+  return r.vtree
+}
+
+fn reduce_collision_set(motions: [Motion]) -> [[Motion]] throws E300 {
+  var vtree: VTree = { nodes: [], root: -1 }
+  var i = 0
+  while i < len(motions) {
+    vtree = draw_motion_on_voxel_map(vtree, motions[i])
+    i = i + 1
+  }
+  var result: [[Motion]] = []
+  let entries = v_entries(vtree)
+  var j = 0
+  while j < len(entries) {
+    if len(entries[j].val) > 1 {
+      result = result + [entries[j].val]
+    }
+    j = j + 1
+  }
+  return result
+}
+
+fn find_intersection(m1: Motion, m2: Motion) -> V3D? throws E300 {
+  let init1 = m1.p1
+  let init2 = m2.p1
+  let vec1 = motion_delta(m1)
+  let vec2 = motion_delta(m2)
+  let radius = 1.0
+  let a = v3d_dot(v3d_minus(vec2, vec1), v3d_minus(vec2, vec1))
+  if a != 0.0 {
+    let b = 2.0 * v3d_dot(v3d_minus(init1, init2), v3d_minus(vec1, vec2))
+    let c = -radius * radius + v3d_dot(v3d_minus(init2, init1), v3d_minus(init2, init1))
+    let discr = b * b - 4.0 * a * c
+    if discr < 0.0 {
+      return nil
+    }
+    let v1 = (-b - math.sqrt(discr)) / (2.0 * a)
+    let v2 = (-b + math.sqrt(discr)) / (2.0 * a)
+    if v1 <= v2 and ((v1 <= 1.0 and 1.0 <= v2) or (v1 <= 0.0 and 0.0 <= v2) or (0.0 <= v1 and v2 <= 1.0)) {
+      var v = 0.0
+      if v1 <= 0.0 {
+        v = 0.0
+      } else {
+        v = v1
+      }
+      let result1 = v3d_plus(init1, v3d_times(vec1, v))
+      let result2 = v3d_plus(init2, v3d_times(vec2, v))
+      let result = v3d_times(v3d_plus(result1, result2), 0.5)
+      if result.x >= 0.0 and result.x <= 1000.0 and result.y >= 0.0 and result.y <= 1000.0 and result.z >= 0.0 and result.z <= 10.0 {
+        return result
+      }
+      return nil
+    }
+    return nil
+  }
+  let dist = math.sqrt(v3d_dot(v3d_minus(init2, init1), v3d_minus(init2, init1)))
+  if dist <= radius {
+    return v3d_times(v3d_plus(init1, init2), 0.5)
+  }
+  return nil
+}
+
+// ---------------- collision detector ----------------
+type FrameOut { state: STree, collisions: Int }
+
+fn handle_new_frame(state: STree, frame: [Aircraft]) -> FrameOut throws E300 {
+  var st = state
+  var motions: [Motion] = []
+  var seen: SeenTree = { nodes: [], root: -1 }
+  var i = 0
+  while i < len(frame) {
+    let ac = frame[i]
+    let fidx = s_find(st, ac.cs)
+    var use_old: V3D = ac.pos
+    if fidx != -1 {
+      use_old = st.nodes[fidx].val
+    }
+    let pr = s_put(st, ac.cs, ac.pos)
+    st = pr.tree
+    let sr = seen_put(seen, ac.cs, true)
+    seen = sr.tree
+    motions = motions + [{ cs: ac.cs, p1: use_old, p2: ac.pos }]
+    i = i + 1
+  }
+  var to_remove: [CallSign] = []
+  let entries = s_entries(st)
+  var j = 0
+  while j < len(entries) {
+    if seen_get(seen, entries[j].key) == nil {
+      to_remove = to_remove + [entries[j].key]
+    }
+    j = j + 1
+  }
+  var k = 0
+  while k < len(to_remove) {
+    let rr = s_remove(st, to_remove[k])
+    st = rr.tree
+    k = k + 1
+  }
+  let all_reduced = reduce_collision_set(motions)
+  var collisions = 0
+  var r = 0
+  while r < len(all_reduced) {
+    let reduced = all_reduced[r]
+    var a = 0
+    while a < len(reduced) {
+      var b = a + 1
+      while b < len(reduced) {
+        let hit = find_intersection(reduced[a], reduced[b])
+        if hit != nil {
+          collisions = collisions + 1
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+    r = r + 1
+  }
+  let fo: FrameOut = { state: st, collisions: collisions }
+  return fo
+}
+
+fn simulate(num_aircraft: Int, time: Float) -> [Aircraft] throws E226 {
+  var frame: [Aircraft] = []
+  var i = 0
+  while i < num_aircraft {
+    let cs1: CallSign = { v: i }
+    let p1: V3D = { x: time, y: cos(time) * 2.0 + i * 3.0, z: 10.0 }
+    frame = frame + [{ cs: cs1, pos: p1 }]
+    let cs2: CallSign = { v: i + 1 }
+    let p2: V3D = { x: time, y: sin(time) * 2.0 + i * 3.0, z: 10.0 }
+    frame = frame + [{ cs: cs2, pos: p2 }]
+    i = i + 2
+  }
+  return frame
+}
+
+fn cd_benchmark(num_aircraft: Int) -> Int throws E300, E226 {
+  var state: STree = { nodes: [], root: -1 }
+  var total = 0
+  var f = 0
+  while f < 200 {
+    let t = f / 10.0
+    let fo = handle_new_frame(state, simulate(num_aircraft, t))
+    state = fo.state
+    total = total + fo.collisions
+    f = f + 1
+  }
+  return total
+}
+
+let result = cd_benchmark(1000)
+print("cd result: {result}")
+print("RESULT: {result}")
+if result == 14484 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL (expected 14484)")
+}
+type SeenVNode { key: V2D, val: Bool, left: Int, right: Int, parent: Int, color: Color }
+type SeenVTree { nodes: [SeenVNode], root: Int }
+
+fn seenv_minimum(t: SeenVTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var cur = idx
+  while ns[cur].left != -1 {
+    cur = ns[cur].left
+  }
+  return cur
+}
+
+fn seenv_successor(t: SeenVTree, idx: Int) -> Int {
+  var ns = t.nodes
+  var x = idx
+  if ns[x].right != -1 {
+    return seenv_minimum(t, ns[x].right)
+  }
+  var y = ns[x].parent
+  while y != -1 and x == ns[y].right {
+    x = y
+    y = ns[y].parent
+  }
+  return y
+}
+
+fn seenv_find(t: SeenVTree, key: V2D) -> Int {
+  var ns = t.nodes
+  var cur = t.root
+  while cur != -1 {
+    let c = v2d_cmp(key, ns[cur].key)
+    if c == 0 { return cur }
+    if c < 0 { cur = ns[cur].left } else { cur = ns[cur].right }
+  }
+  return -1
+}
+
+fn seenv_left_rotate(t: SeenVTree, x: Int) -> SeenVTree {
+  var ns = t.nodes
+  var root = t.root
+  let y = ns[x].right
+  var nx: SeenVNode = ns[x]
+  nx.right = ns[y].left
+  if ns[y].left != -1 {
+    var yl: SeenVNode = ns[ns[y].left]
+    yl.parent = x
+    ns[ns[y].left] = yl
+  }
+  ns[x] = nx
+  var ny: SeenVNode = ns[y]
+  ny.parent = ns[x].parent
+  ns[y] = ny
+  if ns[x].parent == -1 {
+    root = y
+  } else {
+    let xp = ns[x].parent
+    var xpp: SeenVNode = ns[xp]
+    if x == xpp.left { xpp.left = y } else { xpp.right = y }
+    ns[xp] = xpp
+  }
+  ny = ns[y]
+  ny.left = x
+  ns[y] = ny
+  nx = ns[x]
+  nx.parent = y
+  ns[x] = nx
+  let nt: SeenVTree = { nodes: ns, root: root }
+  return nt
+}
+
+fn seenv_right_rotate(t: SeenVTree, y: Int) -> SeenVTree {
+  var ns = t.nodes
+  var root = t.root
+  let x = ns[y].left
+  var ny: SeenVNode = ns[y]
+  ny.left = ns[x].right
+  if ns[x].right != -1 {
+    var xr: SeenVNode = ns[ns[x].right]
+    xr.parent = y
+    ns[ns[x].right] = xr
+  }
+  ns[y] = ny
+  var nx: SeenVNode = ns[x]
+  nx.parent = ns[y].parent
+  ns[x] = nx
+  if ns[y].parent == -1 {
+    root = x
+  } else {
+    let yp = ns[y].parent
+    var ypp: SeenVNode = ns[yp]
+    if y == ypp.left { ypp.left = x } else { ypp.right = x }
+    ns[yp] = ypp
+  }
+  nx = ns[x]
+  nx.right = y
+  ns[x] = nx
+  ny = ns[y]
+  ny.parent = x
+  ns[y] = ny
+  let nt: SeenVTree = { nodes: ns, root: root }
+  return nt
+}
+
+type SeenvPutOut { tree: SeenVTree, old: Bool? }
+fn seenv_put(t: SeenVTree, key: V2D, val: Bool) -> SeenvPutOut {
+  var ns = t.nodes
+  var root = t.root
+  var y = -1
+  var x = root
+  while x != -1 {
+    y = x
+    let c = v2d_cmp(key, ns[x].key)
+    if c < 0 { x = ns[x].left } else {
+      if c > 0 { x = ns[x].right } else {
+        var xn: SeenVNode = ns[x]
+        let old = xn.val
+        xn.val = val
+        ns[x] = xn
+        let nt0: SeenVTree = { nodes: ns, root: root }
+        let r0: SeenvPutOut = { tree: nt0, old: old }
+        return r0
+      }
+    }
+  }
+  let z = len(ns)
+  ns = ns + [{ key: key, val: val, left: -1, right: -1, parent: y, color: Color.Red }]
+  if y == -1 { root = z } else {
+    var yn: SeenVNode = ns[y]
+    if v2d_cmp(key, yn.key) < 0 { yn.left = z } else { yn.right = z }
+    ns[y] = yn
+  }
+  var fx = z
+  var tt: SeenVTree = { nodes: ns, root: root }
+  while fx != root and ns[ns[fx].parent].color == Color.Red {
+    let xp = ns[fx].parent
+    let xpp = ns[xp].parent
+    if xp == ns[xpp].left {
+      let w = ns[xpp].right
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SeenVNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SeenVNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SeenVNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].right {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = seenv_left_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SeenVNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SeenVNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = seenv_right_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    } else {
+      let w = ns[xpp].left
+      if w != -1 and ns[w].color == Color.Red {
+        var xpn: SeenVNode = ns[xp]
+        xpn.color = Color.Black
+        ns[xp] = xpn
+        var wn: SeenVNode = ns[w]
+        wn.color = Color.Black
+        ns[w] = wn
+        var xppn: SeenVNode = ns[xpp]
+        xppn.color = Color.Red
+        ns[xpp] = xppn
+        fx = xpp
+      } else {
+        if fx == ns[xp].left {
+          fx = xp
+          tt = { nodes: ns, root: root }
+          tt = seenv_right_rotate(tt, fx)
+          ns = tt.nodes
+          root = tt.root
+        }
+        let xp2 = ns[fx].parent
+        let xpp2 = ns[xp2].parent
+        var xpn2: SeenVNode = ns[xp2]
+        xpn2.color = Color.Black
+        ns[xp2] = xpn2
+        var xppn2: SeenVNode = ns[xpp2]
+        xppn2.color = Color.Red
+        ns[xpp2] = xppn2
+        tt = { nodes: ns, root: root }
+        tt = seenv_left_rotate(tt, xpp2)
+        ns = tt.nodes
+        root = tt.root
+      }
+    }
+  }
+  var rn: SeenVNode = ns[root]
+  rn.color = Color.Black
+  ns[root] = rn
+  let nt: SeenVTree = { nodes: ns, root: root }
+  let r: SeenvPutOut = { tree: nt, old: nil }
+  return r
+}
+
+fn seenv_get(t: SeenVTree, key: V2D) -> Bool? {
+  let idx = seenv_find(t, key)
+  if idx == -1 { return nil }
+  return t.nodes[idx].val
+}

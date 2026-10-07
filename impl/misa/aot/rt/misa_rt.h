@@ -48,6 +48,10 @@ enum {
     M_TAG_BYTES = 21,  /* Final wave (stdlib): binary data (compress.*) */
     M_TAG_CLIPARSER = 22, /* cli: CliParser handle (wraps MisaCliParser*) */
     M_TAG_CLIARGS = 23,   /* cli: CliArgs handle (wraps MisaCliArgs*) */
+    /* Unboxed typed arrays (perf): direct native storage, no MVal* per element */
+    M_TAG_LIST_BOOL = 24,  /* uint8_t* */
+    M_TAG_LIST_INT = 25,   /* int64_t* */
+    M_TAG_LIST_FLOAT = 26, /* double* */
 };
 
 /* Media kinds. */
@@ -152,6 +156,9 @@ MVal *misa_index_get(MVal *obj, MVal *idx, int line, int col);
 void  misa_index_set(MVal *obj, MVal *idx, MVal *val, int line, int col);
 MVal *misa_record_get(MVal *obj, const char *field, int line, int col);
 MVal *misa_record_get_opt(MVal *obj, const char *field); /* no raise */
+/* Fast path: get field by index (for statically-known record types).
+ * Avoids the strcmp linear search in misa_record_get. */
+MVal *misa_record_get_idx(MVal *obj, int64_t idx, int line, int col);
 void  misa_record_set(MVal *obj, const char *field, MVal *val,
                       int line, int col);
 int64_t misa_list_len(MVal *l);
@@ -164,6 +171,8 @@ int64_t misa_map_len(MVal *m);
 MVal   *misa_map_key(MVal *m, int64_t i);
 MVal   *misa_map_val(MVal *m, int64_t i);
 int     misa_bool_val(MVal *v);
+int64_t misa_int_val(MVal *v);
+double  misa_float_val(MVal *v);
 /* Raw text bytes (NOT NUL-terminated; use with misa_text_len). */
 const char *misa_text_data(MVal *v);
 
@@ -175,6 +184,20 @@ MVal *misa_iter_next(MVal *it);
 /* -- builtins ------------------------------------------------------- */
 MVal *misa_print(MVal *v);          /* writes render(v)+"\n", returns Text */
 MVal *misa_builtin_len(MVal *v, int line, int col);
+MVal *misa_builtin_range(MVal *a, MVal *b, MVal *c, int has_b, int has_c);
+/* Optimized list access with unboxed index */
+MVal *misa_list_get_raw(MVal *list, int64_t idx, int line, int col);
+void misa_list_set_raw(MVal *list, int64_t idx, MVal *val, int line, int col);
+/* Unboxed typed lists */
+MVal *misa_list_bool_new(void);
+MVal *misa_list_int_new(void);
+MVal *misa_list_float_new(void);
+void misa_list_bool_push(MVal *list, int b);
+void misa_list_int_push(MVal *list, int64_t v);
+int misa_list_bool_get(MVal *list, int64_t idx, int line, int col);
+void misa_list_bool_set(MVal *list, int64_t idx, int b, int line, int col);
+int64_t misa_list_int_get(MVal *list, int64_t idx, int line, int col);
+void misa_list_int_set(MVal *list, int64_t idx, int64_t v, int line, int col);
 MVal *misa_builtin_str(MVal *v);
 MVal *misa_builtin_int(MVal *v, int line, int col);
 MVal *misa_builtin_float(MVal *v, int line, int col);
@@ -209,6 +232,9 @@ MVal *misa_time_now_ms(void);
 MVal *misa_time_format(MVal *epoch, MVal *fmt, int line, int col);
 MVal *misa_time_parse(MVal *s, MVal *fmt, int line, int col); /* E300 */
 MVal *misa_math_sqrt(MVal *x, int line, int col);
+MVal *misa_math_cos(MVal *x, int line, int col);
+MVal *misa_math_sin(MVal *x, int line, int col);
+MVal *misa_math_tan(MVal *x, int line, int col);
 MVal *misa_math_pow(MVal *x, MVal *y, int line, int col);
 MVal *misa_math_abs(MVal *x, int line, int col);
 MVal *misa_math_floor(MVal *x, int line, int col);

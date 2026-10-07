@@ -1,0 +1,186 @@
+{
+  "date": "2026-10-07T08:06:46.828890+00:00",
+  "method": "Are We Fast Yet (DLS '16) ports; official Python/JS refs unmodified; median of 3 runs; same machine",
+  "machine": "htch-runtime",
+  "benchmarks": {
+    "sieve": {
+      "python": {
+        "median_s": 0.0019849599998451595,
+        "times": [
+          0.0022846799997751077,
+          0.0019849599998451595,
+          0.0009009430000332941
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Sieve } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/sieve.js'); const b = new Sieve(); const t0 = performance.now(); const r = b.benchmark(); const t1 =",
+      "misa_interp": {
+        "median_s": 0.6286537269998007,
+        "times": [
+          0.8844334560003517,
+          0.6286537269998007,
+          0.605816490000052
+        ]
+      },
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/",
+      "correctness": "PASS"
+    },
+    "queens": {
+      "python": {
+        "median_s": 0.0013575079997281136,
+        "times": [
+          0.0013622449996546493,
+          0.0013575079997281136,
+          0.001325619999988703
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Queens } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/queens.js'); const b = new Queens(); const t0 = performance.now(); const r = b.benchmark(); const t",
+      "misa_interp": {
+        "median_s": 0.5819806339995921,
+        "times": [
+          0.7273437130002094,
+          0.5763725050001085,
+          0.5819806339995921
+        ]
+      },
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/",
+      "correctness": "FAIL"
+    },
+    "permute": {
+      "python": {
+        "median_s": 0.0023530120001851174,
+        "times": [
+          0.0020948450001014862,
+          0.0031012759995974193,
+          0.0023530120001851174
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Permute } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/permute.js'); const b = new Permute(); const t0 = performance.now(); const r = b.benchmark(); cons",
+      "misa_interp": {
+        "median_s": 0.7554259439998532,
+        "times": [
+          0.9434097390003444,
+          0.7554259439998532,
+          0.7545313600003283
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.014291836000211333,
+        "times": [
+          0.014291836000211333,
+          0.01519847800000207,
+          0.013754580000295391
+        ],
+        "compile_s": 0.5974976299999071
+      },
+      "correctness": "PASS"
+    },
+    "towers": {
+      "python": {
+        "median_s": 0.003185573000337172,
+        "times": [
+          0.0032008550001592084,
+          0.003185573000337172,
+          0.003179813999850012
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Towers } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/towers.js'); const b = new Towers(); const t0 = performance.now(); const r = b.benchmark(); const t",
+      "misa_interp": {
+        "median_s": 1.4762033680003697,
+        "times": [
+          1.4762033680003697,
+          1.4787754989997666,
+          1.403221969000242
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.0396993519998432,
+        "times": [
+          0.04174568400003409,
+          0.0396993519998432,
+          0.03739766700027758
+        ],
+        "compile_s": 0.43970826699978716
+      },
+      "correctness": "PASS"
+    },
+    "storage": {
+      "python": {
+        "median_s": 0.003910259999884147,
+        "times": [
+          0.003937831999792252,
+          0.003910259999884147,
+          0.0038407869997172384
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Storage } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/storage.js'); const b = new Storage(); const t0 = performance.now(); const r = b.benchmark(); cons",
+      "misa_interp": {
+        "median_s": 0.5656117099997573,
+        "times": [
+          0.518552998999894,
+          0.5656117099997573,
+          0.7849781410000105
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.028148439999768016,
+        "times": [
+          0.03581017300029998,
+          0.028148439999768016,
+          0.019609731000400643
+        ],
+        "compile_s": 0.6083639749999747
+      },
+      "correctness": "PASS"
+    },
+    "bounce": {
+      "python": {
+        "median_s": 0.0015974489997461205,
+        "times": [
+          0.0016544330001124763,
+          0.0015484949999517994,
+          0.0015974489997461205
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { Bounce } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/bounce.js'); const b = new Bounce(); const t0 = performance.now(); const r = b.benchmark(); const t",
+      "misa_interp": {
+        "median_s": 0.6573261329999696,
+        "times": [
+          1.0772859109997626,
+          0.5871637660002307,
+          0.6573261329999696
+        ]
+      },
+      "misa_aot_error": "misa build failed: Traceback (most recent call last):\n  File \"/home/hatch/workspace/misa/impl/bin/misa\", line 528, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/hatch/workspace/misa/",
+      "correctness": "FAIL"
+    },
+    "list": {
+      "python": {
+        "median_s": 0.0011531420000210346,
+        "times": [
+          0.0011531420000210346,
+          0.0011802519998127536,
+          0.0011473119998299808
+        ]
+      },
+      "node_error": "node failed: [eval]:1\nconst { List } = require('/home/hatch/workspace/misa/bench/awfy/ref/benchmarks/JavaScript/list.js'); const b = new List(); const t0 = performance.now(); const r = b.benchmark(); const t1 = pe",
+      "misa_interp": {
+        "median_s": 0.6871156570000494,
+        "times": [
+          0.6800274249999347,
+          0.6871156570000494,
+          0.7656780150000486
+        ]
+      },
+      "misa_aot": {
+        "median_s": 0.027777964000051725,
+        "times": [
+          0.027777964000051725,
+          0.028537603999666317,
+          0.02333100799978638
+        ],
+        "compile_s": 0.8268140699997275
+      },
+      "correctness": "FAIL"
+    }
+  }
+}

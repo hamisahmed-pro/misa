@@ -1,0 +1,110 @@
+// fannkuch-redux — Misa port of Benchmarks Game fannkuchredux.python3-6
+// Source: https://benchmarksgame-team.pages.debian.net/benchmarksgame/
+
+fn fannkuch(n: Int) -> Int throws E300 {
+  var maxFlipsCount = 0
+  var permSign = true
+  var checksum = 0
+
+  var perm1: [Int] = []
+  var i = 0
+  while i < n {
+    perm1 = perm1 + [i]
+    i = i + 1
+  }
+  var count: [Int] = []
+  i = 0
+  while i < n {
+    count = count + [perm1[i]]
+    i = i + 1
+  }
+
+  while true {
+    let k = perm1[0]
+    if k != 0 {
+      var perm: [Int] = []
+      var pi = 0
+      while pi < n {
+        perm = perm + [perm1[pi]]
+        pi = pi + 1
+      }
+      var flipsCount = 1
+      var kk = perm[k]
+      var kk_idx = k
+      while kk != 0 {
+        // Reverse perm[0..k]
+        var lo = 0
+        var hi = kk_idx
+        while lo < hi {
+          let tmp = perm[lo]
+          perm[lo] = perm[hi]
+          perm[hi] = tmp
+          lo = lo + 1
+          hi = hi - 1
+        }
+        flipsCount = flipsCount + 1
+        kk_idx = kk
+        kk = perm[kk]
+      }
+      if maxFlipsCount < flipsCount {
+        maxFlipsCount = flipsCount
+      }
+      if permSign {
+        checksum = checksum + flipsCount
+      } else {
+        checksum = checksum - flipsCount
+      }
+    }
+
+    // Generate next permutation
+    if permSign {
+      let tmp = perm1[0]
+      perm1[0] = perm1[1]
+      perm1[1] = tmp
+      permSign = false
+    } else {
+      let tmp = perm1[1]
+      perm1[1] = perm1[2]
+      perm1[2] = tmp
+      permSign = true
+      var r = 2
+      var done = false
+      while r < n - 1 and not done {
+        if count[r] != 0 {
+          done = true
+        } else {
+          count[r] = r
+          let perm0 = perm1[0]
+          var j = 0
+          while j <= r {
+            perm1[j] = perm1[j + 1]
+            j = j + 1
+          }
+          perm1[r + 1] = perm0
+          r = r + 1
+        }
+      }
+      if not done {
+        r = n - 1
+        if count[r] == 0 {
+          print(checksum)
+          return maxFlipsCount
+        }
+      }
+      count[r] = count[r] - 1
+    }
+  }
+  return maxFlipsCount
+}
+
+fn main() throws E300 {
+  var n = 8
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  let result = fannkuch(n)
+  print("Pfannkuchen({n}) = {result}")
+}
+
+main()

@@ -1,0 +1,40 @@
+// knucleotide — Misa port (k-mer counting with maps)
+// Counts frequency of k-mers in DNA sequence.
+
+fn main() throws E300 {
+  var n = 10000
+  let args = argv()
+  if len(args) > 1 {
+    n = int(args[1])
+  }
+  // Generate test sequence
+  var seq = ""
+  let bases = ["a", "c", "g", "t"]
+  var i = 0
+  while i < n {
+    seq = seq + bases[i % 4]
+    i = i + 1
+  }
+  // Count 3-mers
+  var counts: Map<Text, Int> = {}
+  i = 0
+  while i < n - 3 {
+    let kmer = seq[i] + seq[i+1] + seq[i+2]
+    // Use try/catch for missing key, or check via keys()
+    var found = false
+    for k in counts.keys() {
+      if k == kmer {
+        found = true
+      }
+    }
+    if found {
+      counts[kmer] = counts[kmer] + 1
+    } else {
+      counts[kmer] = 1
+    }
+    i = i + 1
+  }
+  print(len(counts))
+}
+
+main()

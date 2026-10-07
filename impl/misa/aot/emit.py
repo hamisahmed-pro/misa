@@ -83,6 +83,19 @@ class FnCtx:
         # (not MVal*). Loads produce i64; stores expect i64. Applies in
         # both normal mode (for `: Int` locals) and int_mode.
         self.raw_int_vars: set = set()
+        # -- record field index optimization ---------------------------
+        # var_types: variable name -> type expression (for record field
+        # index resolution). Enables misa_record_get_idx fast path.
+        self.var_types: dict = {}
+        # -- string builder optimization -------------------------------
+        # string_builders: set of variable names that should use Builder
+        # instead of Text (for `s = s + x` pattern in loops).
+        self.string_builders: set = set()
+        # -- float unboxing ------------------------------------------
+        # raw_float_vars: variables holding raw double (not MVal*).
+        # Like raw_int_vars but for Float. Enables direct LLVM fadd/
+        # fsub/fmul/fdiv without boxing overhead.
+        self.raw_float_vars: set = set()
         # Phase 5a: names of `var`s cell-allocated (1-elem lists) because
         # a nested lambda may capture them. Reads/writes go through
         # misa_list_get/misa_index_set instead of a plain alloca.
@@ -118,6 +131,11 @@ _RT_SIGS = {
     "misa_text": (PTR, [PTR, I64]),
     "misa_text_cstr": (PTR, [PTR]),
     "misa_list_new": (PTR, []),
+    "misa_list_bool_new": (PTR, []),
+    "misa_list_int_new": (PTR, []),
+    "misa_list_float_new": (PTR, []),
+    "misa_list_bool_push": (ir.VoidType(), [PTR, I32]),
+    "misa_list_int_push": (ir.VoidType(), [PTR, I64]),
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
     "misa_list_get": (PTR, [PTR, I64]),
     # Phase 8 (overtake): wrap each element of a list as an interface
@@ -162,12 +180,16 @@ _RT_SIGS = {
     "misa_len": (I64, [PTR, I32, I32]),
     "misa_index_get": (PTR, [PTR, PTR, I32, I32]),
     "misa_index_set": (ir.VoidType(), [PTR, PTR, PTR, I32, I32]),
+    "misa_list_get_raw": (PTR, [PTR, I64, I32, I32]),
+    "misa_list_set_raw": (ir.VoidType(), [PTR, I64, PTR, I32, I32]),
     "misa_record_get": (PTR, [PTR, PTR, I32, I32]),
+    "misa_record_get_idx": (PTR, [PTR, I64, I32, I32]),
     "misa_record_set": (ir.VoidType(), [PTR, PTR, PTR, I32, I32]),
     "misa_iter_new": (PTR, [PTR, I32, I32]),
     "misa_iter_next": (PTR, [PTR]),
     "misa_print": (PTR, [PTR]),
     "misa_builtin_len": (PTR, [PTR, I32, I32]),
+    "misa_builtin_range": (PTR, [PTR, PTR, PTR, I32, I32]),
     "misa_builtin_str": (PTR, [PTR]),
     "misa_builtin_int": (PTR, [PTR, I32, I32]),
     "misa_builtin_float": (PTR, [PTR, I32, I32]),
@@ -190,6 +212,9 @@ _RT_SIGS = {
     "misa_time_format": (PTR, [PTR, PTR, I32, I32]),
     "misa_time_parse": (PTR, [PTR, PTR, I32, I32]),
     "misa_math_sqrt": (PTR, [PTR, I32, I32]),
+    "misa_math_cos": (PTR, [PTR, I32, I32]),
+    "misa_math_sin": (PTR, [PTR, I32, I32]),
+    "misa_math_tan": (PTR, [PTR, I32, I32]),
     "misa_math_pow": (PTR, [PTR, PTR, I32, I32]),
     "misa_math_abs": (PTR, [PTR, I32, I32]),
     "misa_math_floor": (PTR, [PTR, I32, I32]),
@@ -836,6 +861,110 @@ class Emitter:
                     and decl.ret.name in self.extern_structs:
                 return decl.ret.name
         return None
+
+    def _record_field_index(self, obj_expr, field_name: str, ctx) -> Optional[int]:
+        """Field index for statically-known record types."""
+        # Unwrap Index: bs[i] -> bs (for [RecordType])
+        base = obj_expr
+        is_indexed = False
+        if isinstance(base, A.Index):
+            base = base.obj
+            is_indexed = True
+        if not isinstance(base, A.Ident):
+            return None
+        pte = ctx.var_types.get(base.name)
+        if pte is None:
+            return None
+        # Extract type name
+        # TypeExpr has: name='Body', is_list=True for [Body]
+        #               name='Body', is_list=False for Body
+        type_name = None
+        if hasattr(pte, 'name') and hasattr(pte, 'is_list'):
+            if pte.is_list and is_indexed:
+                # var[i] where var: [T] -> T
+                type_name = pte.name
+            elif not pte.is_list and not is_indexed:
+                # var.field where var: RecordType
+                type_name = pte.name
+        if type_name is None:
+            return None
+        # Look up the TypeDecl
+        tdecl = self.type_decls.get(type_name)
+        if tdecl is None or tdecl.is_sum:
+            return None
+        # Find field index
+        for idx, (fname, _) in enumerate(tdecl.fields):
+            if fname == field_name:
+                return idx
+        return None
+
+    def _find_string_accumulators(self, stmts) -> set:
+        """Find variables that accumulate strings via `s = s + x` in loops.
+
+        Pattern:
+          var s = ""
+          while ... {
+            s = s + x
+          }
+
+        Returns set of variable names to convert to Builder.
+        Conservative: only transforms if ALL assignments after init
+        are self-concats, and at least one is in a loop.
+        """
+        # First pass: find candidates (var s = "")
+        candidates = {}
+        def find_inits(node_list, out):
+            for s in node_list:
+                if isinstance(s, A.LetStmt) and s.mutable:
+                    if isinstance(s.value, A.StrLit):
+                        parts = s.value.parts
+                        if (len(parts) == 1 and parts[0] == "") or len(parts) == 0:
+                            out[s.name] = s
+                if isinstance(s, A.WhileStmt):
+                    find_inits(s.body, out)
+                elif isinstance(s, A.ForStmt):
+                    find_inits(s.body, out)
+                elif isinstance(s, A.IfStmt):
+                    find_inits(s.then, out)
+                    if s.els:
+                        find_inits(s.els, out)
+        find_inits(stmts, candidates)
+
+        if not candidates:
+            return set()
+
+        info = {name: {"self_concat": True, "in_loop": False} for name in candidates}
+
+        def check_assigns(node_list, in_loop=False):
+            for s in node_list:
+                if isinstance(s, A.AssignStmt):
+                    if isinstance(s.target, A.Ident):
+                        name = s.target.name
+                        if name in candidates:
+                            v = s.value
+                            is_self_concat = (
+                                isinstance(v, A.BinOp) and v.op == "+" and
+                                isinstance(v.left, A.Ident) and v.left.name == name
+                            )
+                            if not is_self_concat:
+                                info[name]["self_concat"] = False
+                            if in_loop:
+                                info[name]["in_loop"] = True
+                if isinstance(s, A.WhileStmt):
+                    check_assigns(s.body, in_loop=True)
+                elif isinstance(s, A.ForStmt):
+                    check_assigns(s.body, in_loop=True)
+                elif isinstance(s, A.IfStmt):
+                    check_assigns(s.then, in_loop=in_loop)
+                    if s.els:
+                        check_assigns(s.els, in_loop=in_loop)
+        check_assigns(stmts, in_loop=False)
+
+        result = set()
+        for name, inf in info.items():
+            if inf["self_concat"] and inf["in_loop"]:
+                result.add(name)
+        return result
 
     def _vararg_kind(self, arg_e, ctx, e) -> str:
         """The FFI kind of a `...` argument for marshalling."""
@@ -1608,6 +1737,9 @@ class Emitter:
 
     def emit_fn_body_direct(self, fn, decl: A.FnDecl):
         ctx = self.new_fn_ctx(fn)
+        # String builder optimization: detect `var s = ""` followed by
+        # `s = s + x` in loops, convert to builder pattern automatically.
+        ctx.string_builders = self._find_string_accumulators(decl.body)
         # Phase 5a: cell-allocate `var`s captured by nested lambdas.
         ctx.cell_vars = self._cell_vars_for(decl.body)
         b = ctx.builder
@@ -1616,6 +1748,9 @@ class Emitter:
             a = self.alloca_var(ctx, pn)
             b.store(arg, a)
             ctx.scope.declare(pn, a)
+            # Track param type for record field index optimization.
+            if pte is not None:
+                ctx.var_types[pn] = pte
             # P-2: track provably-Int variables for unboxing.
             if self._te_is_int(pte):
                 ctx.int_vars.add(pn)
@@ -1861,7 +1996,13 @@ class Emitter:
                 val_node = A.MapLit(
                     entries=[(k, v) for k, v in val_node.fields],
                     line=val_node.line, col=val_node.col)
-            v = self.emit_expr(val_node, ctx)
+            # String builder optimization: `var s = ""` where s is an
+            # accumulator → `var s = builder()`
+            if s.name in ctx.string_builders:
+                # Emit builder() instead of ""
+                v = self.call(ctx, "misa_builder_new", [], s, check=False)
+            else:
+                v = self.emit_expr(val_node, ctx)
             self.check(ctx, s)
             # P-2: Int-typed locals use raw i64 allocas (no per-access
             # boxing). In int_mode any i64 value qualifies; in normal mode
@@ -1876,6 +2017,15 @@ class Emitter:
                 is_int_local = (s.name not in ctx.cell_vars
                                 and (self._te_is_int(s.ann)
                                      or self._is_int_expr(val_node, ctx)))
+            # Float unboxing: `: Float` annotated locals use raw double
+            # allocas. Like int, but for floating-point. Also infer from
+            # float-valued initializer (e.g., `var x = 0.0`).
+            # (Checker rejects later type changes, so the double alloca
+            # stays sound.)
+            is_float_local = (s.name not in ctx.cell_vars
+                              and s.name not in ctx.string_builders
+                              and (self._te_is_float(s.ann)
+                                   or self._is_float_expr(val_node, ctx)))
             int_local = is_int_local
             if int_local:
                 save = b.block
@@ -1889,6 +2039,18 @@ class Emitter:
                 ctx.scope.declare(s.name, a)
                 ctx.int_vars.add(s.name)
                 ctx.raw_int_vars.add(s.name)
+            elif is_float_local:
+                # Float unboxing: raw double alloca
+                save = b.block
+                b.position_at_start(ctx.fn.basic_blocks[0])
+                a = b.alloca(DBL, name=f"f_{s.name}")
+                b.position_at_end(save)
+                # Unbox if needed (v may be MVal*)
+                if v.type != DBL:
+                    v = self._unbox_float(b, v, name=f"init_{s.name}")
+                b.store(v, a)
+                ctx.scope.declare(s.name, a)
+                ctx.raw_float_vars.add(s.name)
             else:
                 a = self.alloca_var(ctx, s.name)
                 if s.name in ctx.cell_vars:
@@ -1915,6 +2077,25 @@ class Emitter:
             # struct literals, get static FFI types (struct field
             # reads via GEP, vararg marshalling).
             self._track_ffi_var(ctx, s.name, s.ann)
+            # Record field index optimization: track var type.
+            # If ann is present, use it. Otherwise, infer from RHS:
+            # - If RHS is Ident(var2) with known type, propagate.
+            # - If RHS is Index(Ident(var2)) and var2: [T], then var: T.
+            if s.ann is not None:
+                ctx.var_types[s.name] = s.ann
+            elif isinstance(val_node, A.Ident):
+                src_type = ctx.var_types.get(val_node.name)
+                if src_type is not None:
+                    ctx.var_types[s.name] = src_type
+            elif isinstance(val_node, A.Index):
+                base = val_node.obj
+                if isinstance(base, A.Ident):
+                    arr_type = ctx.var_types.get(base.name)
+                    # Extract element type from [T]
+                    if arr_type is not None and hasattr(arr_type, 'name'):
+                        if arr_type.name == 'List' and hasattr(arr_type, 'args'):
+                            if arr_type.args:
+                                ctx.var_types[s.name] = arr_type.args[0]
             if isinstance(val_node, A.StructLit) \
                     and val_node.name in self.extern_structs:
                 ctx.ffi_types[s.name] = val_node.name
@@ -1926,6 +2107,22 @@ class Emitter:
                         and rdecl.ret.name in self.extern_structs:
                     ctx.ffi_types[s.name] = rdecl.ret.name
         elif isinstance(s, A.AssignStmt):
+            # String builder optimization: `s = s + x` where s is a
+            # builder → `s.append(x)`
+            tgt = s.target
+            if (isinstance(tgt, A.Ident) and tgt.name in ctx.string_builders):
+                v = s.value
+                if (isinstance(v, A.BinOp) and v.op == "+" and
+                    isinstance(v.left, A.Ident) and v.left.name == tgt.name):
+                    # s = s + x → s.append(x)
+                    builder_val = self.emit_expr(tgt, ctx, _no_builder_build=True)
+                    x_val = self.emit_expr(v.right, ctx)
+                    self.check(ctx, s)
+                    x_val = self._ensure_mval(x_val, v.right, ctx)
+                    line, col = self.loc(s)
+                    self.call(ctx, "misa_builder_append",
+                              [builder_val, x_val, line, col], s)
+                    return
             v = self.emit_expr(s.value, ctx)
             self.check(ctx, s)
             tgt = s.target
@@ -1961,6 +2158,11 @@ class Emitter:
                             if v.type != I64:
                                 v = self._unbox_int(
                                     b, v, name=f"assign_{tgt.name}")
+                        elif tgt.name in ctx.raw_float_vars:
+                            # Float unboxing: raw double vars store double directly.
+                            if v.type != DBL:
+                                v = self._unbox_float(
+                                    b, v, name=f"assign_{tgt.name}")
                         else:
                             v = self._ensure_mval(v, s.value, ctx)
                         b.store(v, a)
@@ -1978,17 +2180,27 @@ class Emitter:
             elif isinstance(tgt, A.Field):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
+                # box the value if it's a raw int/bool
+                bv = self._ensure_mval(v, s.value, ctx)
                 line, col = self.loc(s)
                 self.call(ctx, "misa_record_set",
-                          [obj, self.cstr(tgt.field), v, line, col], s)
+                          [obj, self.cstr(tgt.field), bv, line, col], s)
             elif isinstance(tgt, A.Index):
                 obj = self.emit_expr(tgt.obj, ctx)
                 self.check(ctx, s)
                 idx = self.emit_expr(tgt.idx, ctx)
                 self.check(ctx, s)
                 line, col = self.loc(s)
-                self.call(ctx, "misa_index_set",
-                          [obj, idx, v, line, col], s)
+                # box the value
+                bv = self._ensure_mval(v, s.value, ctx)
+                # Fast path: raw i64 index avoids boxing
+                if idx.type == I64:
+                    self.call(ctx, "misa_list_set_raw",
+                              [obj, idx, bv, line, col], s)
+                else:
+                    idx = self._ensure_mval(idx, tgt.idx, ctx)
+                    self.call(ctx, "misa_index_set",
+                              [obj, idx, bv, line, col], s)
             else:
                 raise AOTError("E201", "invalid assignment target",
                                s.line, s.col)
@@ -2152,11 +2364,21 @@ class Emitter:
 
     # -- expressions ------------------------------------------------------
 
-    def emit_expr(self, e, ctx: FnCtx):
+    def emit_expr(self, e, ctx: FnCtx, _no_builder_build=False):
         b = ctx.builder
         # P-2 Level 2: in int_mode, Int-typed expressions produce raw i64.
         if ctx.int_mode and self._is_int_expr(e, ctx):
             return self._emit_int(e, ctx)
+        # String builder optimization: loading a builder variable
+        # inserts .build() automatically (unless suppressed).
+        if (isinstance(e, A.Ident) and not _no_builder_build and
+            e.name in ctx.string_builders):
+            # Load the builder, then build it to Text
+            a = ctx.scope.lookup(e.name)
+            builder_val = b.load(a, name=f"l_{e.name}")
+            line, col = self.loc(e)
+            return self.call(ctx, "misa_builder_build",
+                             [builder_val, line, col], e)
         if isinstance(e, A.IntLit):
             return self.call(ctx, "misa_int",
                              [self.const_i64(e.value)], e, check=False)
@@ -2226,6 +2448,9 @@ class Emitter:
             # _ensure_mval when a boxed MVal* is required).
             if e.name in ctx.raw_int_vars:
                 return v
+            # Float unboxing: raw double locals stay unboxed.
+            if e.name in ctx.raw_float_vars:
+                return v
             if e.name in ctx.cell_vars:
                 # Phase 5a: read through the shared heap cell.
                 v = self.call(ctx, "misa_list_get",
@@ -2256,9 +2481,15 @@ class Emitter:
                                   ctx.id_slots[e.obj.name])],
                               e, check=False)
                 return self.call(ctx, "misa_ui_get_text", [ui, w], e)
+            # Fast path: if obj is Index(Ident(var)) and var has a
+            # statically-known [RecordType], use misa_record_get_idx.
+            idx = self._record_field_index(e.obj, e.field, ctx)
             obj = self.emit_expr(e.obj, ctx)
             self.check(ctx, e)
             line, col = self.loc(e)
+            if idx is not None:
+                return self.call(ctx, "misa_record_get_idx",
+                                 [obj, self.const_i64(idx), line, col], e)
             return self.call(ctx, "misa_record_get",
                              [obj, self.cstr(e.field), line, col], e)
         if isinstance(e, A.Index):
@@ -2267,11 +2498,28 @@ class Emitter:
             obj = self._ensure_mval(obj, e.obj, ctx)
             idx = self.emit_expr(e.idx, ctx)
             self.check(ctx, e)
-            idx = self._ensure_mval(idx, e.idx, ctx)
             line, col = self.loc(e)
+            # Fast path: raw i64 index avoids boxing
+            if idx.type == I64:
+                return self.call(ctx, "misa_list_get_raw",
+                                 [obj, idx, line, col], e)
+            idx = self._ensure_mval(idx, e.idx, ctx)
             return self.call(ctx, "misa_index_get",
                              [obj, idx, line, col], e)
         if isinstance(e, A.ListLit):
+            # Check if all elements are Bool literals -> use unboxed [Bool] list
+            # (int unboxing reverted: caused regressions in json/richards via
+            # mixed-type concat paths; bool unboxing is the proven win)
+            all_bool = e.items and all(
+                isinstance(it, A.BoolLit) for it in e.items
+            )
+            if all_bool:
+                l = self.call(ctx, "misa_list_bool_new", [], e, check=False)
+                for it in e.items:
+                    v = 1 if it.value else 0
+                    self.call(ctx, "misa_list_bool_push",
+                              [l, self.const_i32(v)], e, check=False)
+                return l
             l = self.call(ctx, "misa_list_new", [], e, check=False)
             for it in e.items:
                 v = self.emit_expr(it, ctx)
@@ -2381,6 +2629,20 @@ class Emitter:
                 and not te.is_map and not te.is_func
                 and not te.optional and not te.type_args)
 
+    @staticmethod
+    def _te_is_float(te) -> bool:
+        """True if a TypeExpr is exactly `Float` (not optional/list/etc)."""
+        return (te is not None and te.name == "Float" and not te.is_list
+                and not te.is_map and not te.is_func
+                and not te.optional and not te.type_args)
+
+    @staticmethod
+    def _te_is_int_list(te) -> bool:
+        """True if a TypeExpr is exactly `[Int]`."""
+        return (te is not None and te.name == "Int" and te.is_list
+                and not te.is_map and not te.is_func
+                and not te.optional and not te.type_args)
+
     def _is_int_expr(self, e, ctx: FnCtx) -> bool:
         """Conservative provability: is e definitely an Int value?"""
         if isinstance(e, A.IntLit):
@@ -2408,12 +2670,46 @@ class Emitter:
             return False
         return False
 
+    def _is_float_expr(self, e, ctx: FnCtx) -> bool:
+        """Conservative provability: is e definitely a Float value?"""
+        if isinstance(e, A.FloatLit):
+            return True
+        if isinstance(e, A.Ident):
+            return e.name in ctx.raw_float_vars
+        if isinstance(e, A.BinOp):
+            if e.op in ("+", "-", "*", "/"):
+                return (self._is_float_expr(e.left, ctx)
+                        and self._is_float_expr(e.right, ctx))
+            return False
+        return False
+
+    def _to_f64(self, e, ctx: FnCtx):
+        """Emit e and produce its double value (unboxing if boxed)."""
+        if isinstance(e, A.FloatLit):
+            return ir.Constant(DBL, e.value)
+        v = self.emit_expr(e, ctx)
+        if v.type == DBL:
+            return v
+        b = ctx.builder
+        return self._unbox_float(b, v, name="tof64")
+
     def _unbox_int(self, b, mval, name="unbox"):
         """Unchecked i64 extraction from an MVal* known to be Int."""
         p = b.bitcast(mval, _MVAL_T.as_pointer())
         ptr = b.gep(p, [self.const_i32(0), self.const_i32(2)],
                     name=f"{name}.ptr")
         return b.load(ptr, name=name)
+
+    def _unbox_float(self, b, mval, name="unbox"):
+        """Unchecked double extraction from an MVal* known to be Float."""
+        # MVal layout: tag (i8), pad[7], union { ... double f; ... }
+        # The double is at the same offset as i64 in the union.
+        p = b.bitcast(mval, _MVAL_T.as_pointer())
+        ptr = b.gep(p, [self.const_i32(0), self.const_i32(2)],
+                    name=f"{name}.ptr")
+        # Bitcast the i64* to double* and load
+        dptr = b.bitcast(ptr, DBL.as_pointer(), name=f"{name}.dptr")
+        return b.load(dptr, name=name)
 
     def _to_i64(self, e, ctx: FnCtx):
         """Emit e and produce its i64 value (unboxing if boxed)."""
@@ -2426,9 +2722,16 @@ class Emitter:
         return self._unbox_int(ctx.builder, v)
 
     def _ensure_mval(self, v, e, ctx: FnCtx):
-        """Box a raw i64 to MVal* when a boxed value is required."""
+        """Box raw i64/i1/double to MVal* when a boxed value is required."""
         if v.type == I64:
             return self.call(ctx, "misa_int", [v], e, check=False)
+        if v.type == I1:
+            # booleans are i1; extend to i32 for misa_bool
+            b = ctx.builder
+            ext = b.zext(v, ir.IntType(32), name="_bext")
+            return self.call(ctx, "misa_bool", [ext], e, check=False)
+        if v.type == DBL:
+            return self.call(ctx, "misa_float", [v], e, check=False)
         return v
 
     # -- Level 2: raw i64 function specialization ----------------------
@@ -2560,6 +2863,35 @@ class Emitter:
             self.check(ctx, e)
             return {"+": b.add, "-": b.sub, "*": b.mul}[op](li, ri,
                                                           name="iop")
+        # Float unboxing: both operands are raw doubles -> direct LLVM
+        # fadd/fsub/fmul/fdiv. Returns raw double; callers box via
+        # _ensure_mval when MVal* is needed.
+        if op in ("+", "-", "*", "/") and self._is_float_expr(e.left, ctx) \
+                and self._is_float_expr(e.right, ctx):
+            lf = self._to_f64(e.left, ctx)
+            self.check(ctx, e)
+            rf = self._to_f64(e.right, ctx)
+            self.check(ctx, e)
+            return {"+": b.fadd, "-": b.fsub, "*": b.fmul, "/": b.fdiv}[op](
+                lf, rf, name="fop")
+        # Bitwise ops on raw i64 (both operands provably Int)
+        if op in ("&", "|", "^", "<<", ">>") \
+                and self._is_int_expr(e.left, ctx) \
+                and self._is_int_expr(e.right, ctx):
+            li = self._to_i64(e.left, ctx)
+            self.check(ctx, e)
+            ri = self._to_i64(e.right, ctx)
+            self.check(ctx, e)
+            if op == "&":
+                return b.and_(li, ri, name="band")
+            if op == "|":
+                return b.or_(li, ri, name="bor")
+            if op == "^":
+                return b.xor(li, ri, name="bxor")
+            if op == "<<":
+                return b.shl(li, ri, name="shl")
+            if op == ">>":
+                return b.ashr(li, ri, name="ashr")
         if op in ("<", "<=", ">", ">=", "==", "!=") \
                 and self._is_int_expr(e.left, ctx) \
                 and self._is_int_expr(e.right, ctx):
@@ -2767,6 +3099,19 @@ class Emitter:
         if name == "len":
             return self.call(ctx, "misa_builtin_len", [arg(0), line, col],
                              e)
+        if name == "range":
+            # range(n) / range(a, b) / range(a, b, step)
+            nargs = len(e.args)
+            a0 = arg(0)
+            # Use nil placeholder for missing args
+            nil = self.get_nil(ctx)
+            a1 = arg(1) if nargs > 1 else nil
+            a2 = arg(2) if nargs > 2 else nil
+            return self.call(ctx, "misa_builtin_range",
+                             [a0, a1, a2,
+                              self.const_i32(1 if nargs > 1 else 0),
+                              self.const_i32(1 if nargs > 2 else 0)],
+                             e)
         if name == "str":
             return self.call(ctx, "misa_builtin_str", [arg(0)], e,
                              check=False)
@@ -2891,6 +3236,15 @@ class Emitter:
                              [arg(0), arg(1), line, col], e)
         if name == "math.sqrt":
             return self.call(ctx, "misa_math_sqrt",
+                             [arg(0), line, col], e)
+        if name == "math.cos":
+            return self.call(ctx, "misa_math_cos",
+                             [arg(0), line, col], e)
+        if name == "math.sin":
+            return self.call(ctx, "misa_math_sin",
+                             [arg(0), line, col], e)
+        if name == "math.tan":
+            return self.call(ctx, "misa_math_tan",
                              [arg(0), line, col], e)
         if name == "math.pow":
             return self.call(ctx, "misa_math_pow",

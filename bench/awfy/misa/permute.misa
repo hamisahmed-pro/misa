@@ -1,0 +1,55 @@
+// Are We Fast Yet — Permute benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/permute.py
+// The count and vector are threaded explicitly via a state record.
+
+type PermState {
+  count: Int,
+  v: [Int],
+}
+
+fn swap(st: PermState, i: Int, j: Int) {
+  var vv = st.v
+  let tmp = vv[i]
+  vv[i] = vv[j]
+  vv[j] = tmp
+}
+
+fn permute(st: PermState, n: Int) {
+  var s = st
+  s.count = s.count + 1
+  if n != 0 {
+    let n1 = n - 1
+    permute(st, n1)
+    var i = n1
+    while i >= 0 {
+      swap(st, n1, i)
+      permute(st, n1)
+      swap(st, n1, i)
+      i = i - 1
+    }
+  }
+}
+
+fn make_vec(n: Int) -> [Int] {
+  var out: [Int] = []
+  var i = 0
+  while i < n {
+    out = out + [0]
+    i = i + 1
+  }
+  return out
+}
+
+fn benchmark() -> Int {
+  var st: PermState = { count: 0, v: make_vec(6) }
+  permute(st, 6)
+  return st.count
+}
+
+let result = benchmark()
+print("RESULT: {result}")
+if result == 8660 {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL")
+}

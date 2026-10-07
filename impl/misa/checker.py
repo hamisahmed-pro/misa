@@ -46,12 +46,15 @@ BUILTINS = {
     "navigate": (["any"], "Text"),
     # Text.Builder: amortized O(1) string building (perf gap P-1).
     "builder": ([], "Builder"),
+    # range(n) -> [Int] or range(start, stop[, step])
+    "range": (["Int"], "[Int]"),
 }
 BUILTIN_ARITY = {
     "print": (1, 1), "len": (1, 1), "str": (1, 1), "int": (1, 1),
     "float": (1, 1), "assert": (1, 2), "assert_eq": (2, 2),
     "assert_ne": (2, 2), "argv": (0, 0),
     "env": (1, 1), "navigate": (1, 1), "builder": (0, 0),
+    "range": (1, 3),
 }
 # namespaced builtins: name -> (param types, return type)
 NS_BUILTINS = {
@@ -133,6 +136,9 @@ NS_BUILTINS = {
     "time.format": (["Int", "Text"], "Text"),
     "time.parse": (["Text", "Text"], "Int"),
     "math.sqrt": (["Float"], "Float"),
+    "math.cos": (["Float"], "Float"),
+    "math.sin": (["Float"], "Float"),
+    "math.tan": (["Float"], "Float"),
     "math.pow": (["Float", "Float"], "Float"),
     "math.abs": (["Float"], "Float"),
     "math.floor": (["Float"], "Int"),
@@ -2484,6 +2490,14 @@ class Checker:
                             f"{lt} and {rt}", e.line, e.col)
                         return "unknown"
                 return "Bool"
+            # Bitwise operators: Int only
+            if e.op in ("&", "|", "^", "<<", ">>"):
+                if lt not in ("Int", "unknown") or rt not in ("Int", "unknown"):
+                    self.error("E211",
+                               f"operator '{e.op}' cannot be applied to "
+                               f"{lt} and {rt}", e.line, e.col)
+                    return "unknown"
+                return "Int"
             # C-6: validate arithmetic operand types. Known-incompatible
             # types are E211; "unknown" (dynamic) is allowed through.
             if e.op == "+":
@@ -2492,6 +2506,12 @@ class Checker:
                 if lt.startswith("[") and rt.startswith("["):
                     return lt if lt == rt else "unknown"
             if e.op in ("+", "-", "*", "/", "%"):
+                # List repetition: [T] * Int -> [T]
+                if e.op == "*":
+                    if lt.startswith("[") and rt == "Int":
+                        return lt
+                    if lt == "Int" and rt.startswith("["):
+                        return rt
                 numeric = ("Int", "Float", "unknown")
                 if lt not in numeric or rt not in numeric:
                     self.error("E211",

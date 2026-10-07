@@ -1,0 +1,82 @@
+// Are We Fast Yet — Queens benchmark, ported from Python.
+// Reference: /tmp/awfy/benchmarks/Python/queens.py
+// State is threaded explicitly (Misa functions cannot see module-level vars).
+
+fn make_bools(n: Int, v: Bool) -> [Bool] {
+  var out: [Bool] = []
+  var i = 0
+  while i < n {
+    out = out + [v]
+    i = i + 1
+  }
+  return out
+}
+
+fn make_ints(n: Int, v: Int) -> [Int] {
+  var out: [Int] = []
+  var i = 0
+  while i < n {
+    out = out + [v]
+    i = i + 1
+  }
+  return out
+}
+
+fn get_row_column(free_rows: [Bool], free_maxs: [Bool], free_mins: [Bool], r: Int, c: Int) -> Bool {
+  return free_rows[r] and free_maxs[c + r] and free_mins[c - r + 7]
+}
+
+fn set_row_column(free_rows: [Bool], free_maxs: [Bool], free_mins: [Bool], r: Int, c: Int, v: Bool) {
+  var fr = free_rows
+  var fm = free_maxs
+  var fn_ = free_mins
+  fr[r] = v
+  fm[c + r] = v
+  fn_[c - r + 7] = v
+}
+
+fn place_queen(free_rows: [Bool], free_maxs: [Bool], free_mins: [Bool], queen_rows: [Int], c: Int) -> Bool {
+  var r = 0
+  while r < 8 {
+    if get_row_column(free_rows, free_maxs, free_mins, r, c) {
+      var qr = queen_rows
+      qr[r] = c
+      set_row_column(free_rows, free_maxs, free_mins, r, c, false)
+      if c == 7 {
+        return true
+      }
+      if place_queen(free_rows, free_maxs, free_mins, queen_rows, c + 1) {
+        return true
+      }
+      set_row_column(free_rows, free_maxs, free_mins, r, c, true)
+    }
+    r = r + 1
+  }
+  return false
+}
+
+fn queens() -> Bool {
+  let free_rows = make_bools(8, true)
+  let free_maxs = make_bools(16, true)
+  let free_mins = make_bools(16, true)
+  let queen_rows = make_ints(8, -1)
+  return place_queen(free_rows, free_maxs, free_mins, queen_rows, 0)
+}
+
+fn benchmark() -> Bool {
+  var result = true
+  var i = 0
+  while i < 10 {
+    result = result and queens()
+    i = i + 1
+  }
+  return result
+}
+
+let result = benchmark()
+print("RESULT: {result}")
+if result {
+  print("VERIFY: PASS")
+} else {
+  print("VERIFY: FAIL")
+}
