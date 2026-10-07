@@ -1,0 +1,15 @@
+// sysinfo — shell-echo helper (seed package).
+// Declares NO capabilities; the registry's checker must infer `process`
+// from the process.run call and upgrade the record with a warning.
+fn sh_echo(msg: Text) -> Text throws E300, E303 {
+  let r = process.run(["echo", msg])
+  if r.code != 0 {
+    throw {code: "E303", message: "echo failed"}
+  }
+  return str.trim(r.stdout)
+}
+
+fn true_status() -> Int throws E303 {
+  let r = process.run(["true"])
+  return r.code
+}

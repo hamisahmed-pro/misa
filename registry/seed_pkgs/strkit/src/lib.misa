@@ -1,0 +1,28 @@
+// strkit — tiny string helpers + a Shouter interface (seed package).
+interface Shouter {
+  fn shout(self) -> Text
+}
+
+type Loud { word: Text }
+
+impl Shouter for Loud {
+  fn shout(self) -> Text { return self.word + "!" }
+}
+
+fn shout_of(s: Shouter) -> Text { return s.shout() }
+
+fn repeat_word(w: Text, n: Int) -> Text {
+  var out: Text = ""
+  var i: Int = 0
+  while i < n {
+    out = out + w
+    i = i + 1
+  }
+  return out
+}
+
+fn yell_all(items: [Loud]) -> [Text] {
+  var out: [Text] = []
+  for it in items { out = out + [it.shout()] }
+  return out
+}

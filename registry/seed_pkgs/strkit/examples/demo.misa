@@ -1,0 +1,7 @@
+// strkit example: exercised by the registry at publish time.
+import "../src/lib.misa"
+
+let l: Loud = { word: "hey" }
+print(l.shout())
+print(shout_of(l))
+print(repeat_word("ab", 3))

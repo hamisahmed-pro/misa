@@ -1,0 +1,6 @@
+[package]
+name = "@demo/mathkit"
+version = "0.1.0"
+description = "Tiny arithmetic helpers used to exercise the registry publish pipeline."
+license = "MIT"
+lib = "src/lib.misa"

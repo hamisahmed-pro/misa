@@ -13,7 +13,7 @@ Usage:
   misa build --list-targets
   misa serve <file.misa> [--port PORT] [--key KEY] [--key-env VAR] [--base-url URL]
   misa lsp
-  misa pkg <init|add|install|list|remove> [...]
+  misa pkg <command> [...] [--registry URL] [--offline] [--json]
 """
 import json
 import os
@@ -355,7 +355,10 @@ def main(argv):
     cmd = argv[1]
     args = argv[2:]
     as_json = "--json" in args
-    args = [a for a in args if a != "--json"]
+    # `misa pkg` parses --json itself (per-command and global flag);
+    # stripping it here would lose the flag before pkg sees it.
+    if cmd != "pkg":
+        args = [a for a in args if a != "--json"]
     if cmd == "check" and len(args) == 1:
         return cmd_check(args[0], as_json)
     if cmd == "fmt" and 1 <= len(args) <= 2:

@@ -188,7 +188,7 @@ something no multi-backend language even promises.
 | # | Area | Python | Rust | Go | Misa today | Rating |
 |---|---|---|---|---|---|---|
 | I1 | Module system | Packages, relative + absolute imports | Modules + crates, `use` | Packages, qualified | Flat imports (`import "./u.misa"`, lookup is `fib()` not `u.fib()`) — one spelling, no namespaces | **LAG** |
-| I2 | Package manager / registry | pip + PyPI | cargo + crates.io — best | modules + proxy | `misa pkg init/add/install/list/remove` (git/path only). **No registry** (deferred to public phase) | **LAG** |
+| I2 | Package manager / registry | pip + PyPI | cargo + crates.io — best | modules + proxy | `misa pkg` full registry client (publish/add/install/search/yank/audit/vendor, semver, hash-locked `misa.lock` v2) + Misa-written registry server (`/v1/` REST, typed semantic search, throws indexing, verified capabilities, computed breaking changes). Deploying to Render free tier (ephemeral SQLite mitigated by seed script + admin backup). | **PAR** |
 
 ### Overtake proposals (modules/packages)
 
@@ -223,16 +223,20 @@ These are not gaps — they are the moat. Any overtake plan should
 | **PAR** | 19 | A1, A2, A4, A5, A8, B2, B3, B5, B7, B9, B10, B11, B12, D1, D2, F2, F3, F5, H |
 | **LEAD** | 11 | A6 (checked throws), B1 (check-time regex), F1 (FFI structs: nested/unions/bitfields, GCC-verified), + the 8 moat rows in §J |
 
-(Original 2026-10-06: 34 LAG / 7 PAR / 7 LEAD. Flipped since: 11 LAG→PAR,
-1 LAG→LEAD, 2 PAR→LEAD.)
+(Original 2026-10-06: 34 LAG / 7 PAR / 7 LEAD. Flipped since: 12 LAG→PAR,
+1 LAG→LEAD, 2 PAR→LEAD. Current: **16 LAG / 20 PAR / 11 LEAD** —
+I2 (registry) flipped to PAR with the v1 build.)
 
 ---
 
 ## Top lags by importance (updated 2026-10-07)
 
-1. **No package registry (I2).** Spec written (`spec/REGISTRY.md`);
-   build blocked on hosting (Hamis's Oracle signup). This is the
-   ecosystem flywheel — everything else compounds through it.
+1. **Ecosystem size (I2's count, not its design).** The registry is
+   BUILT (`misa pkg` client + Misa-written server, typed semantic
+   search, verified capabilities, computed breaking changes —
+   design-wise ahead of the incumbents); the package COUNT is still
+   ~0 vs 500k/2M. That gap closes with time and the content flywheel,
+   not more code.
 2. **Metaprogramming (G1–G3).** No macros, no attributes, no
    derivation. The zero-attribute-derivation proposal (G3) is still
    the highest-leverage unbuilt language feature: `json.stringify`

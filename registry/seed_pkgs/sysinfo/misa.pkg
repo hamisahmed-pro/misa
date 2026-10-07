@@ -1,0 +1,8 @@
+[package]
+name = "@demo/sysinfo"
+version = "0.1.0"
+description = "Tiny shell-echo helper. Declares no capabilities; the registry must infer {process} and warn."
+license = "MIT"
+lib = "src/lib.misa"
+
+[capabilities]

@@ -1,0 +1,10 @@
+// sysinfo unit tests.
+import "../src/lib.misa"
+
+test sh_echo {
+  assert_eq(sh_echo("hi"), "hi")
+}
+
+test true_status {
+  assert_eq(true_status(), 0)
+}

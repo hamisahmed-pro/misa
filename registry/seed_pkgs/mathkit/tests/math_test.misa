@@ -1,0 +1,12 @@
+// mathkit unit tests.
+import "../src/lib.misa"
+
+test arithmetic {
+  assert_eq(add(2, 3), 5)
+  assert_eq(mul(3, 4), 12)
+}
+
+test factorial {
+  assert_eq(factorial(0), 1)
+  assert_eq(factorial(5), 120)
+}

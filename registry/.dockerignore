@@ -1,0 +1,6 @@
+# Keep the image lean: the LLVM AOT backend (misa build only) and
+# Python bytecode caches are never needed by the registry server.
+impl/misa/aot
+**/__pycache__
+**/*.pyc
+**/*.pyo

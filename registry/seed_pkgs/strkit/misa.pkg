@@ -1,0 +1,8 @@
+[package]
+name = "@demo/strkit"
+version = "0.2.0"
+description = "Tiny string helpers plus a Shouter interface (exercises interface/impl indexing)."
+license = "MIT"
+lib = "src/lib.misa"
+
+[capabilities]

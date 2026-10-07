@@ -1,0 +1,5 @@
+// sysinfo example: exercised by the registry at publish time.
+import "../src/lib.misa"
+
+print(sh_echo("hello registry"))
+print(true_status())

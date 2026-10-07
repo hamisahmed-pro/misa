@@ -1,0 +1,13 @@
+// strkit unit tests.
+import "../src/lib.misa"
+
+test repeat_word {
+  assert_eq(repeat_word("ab", 3), "ababab")
+  assert_eq(repeat_word("x", 0), "")
+}
+
+test shouter {
+  let l: Loud = { word: "hey" }
+  assert_eq(l.shout(), "hey!")
+  assert_eq(shout_of(l), "hey!")
+}

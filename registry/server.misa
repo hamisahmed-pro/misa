@@ -1,0 +1,3522 @@
+// ============================================================================
+// Misa Package Registry — registry server (v1).
+//
+// A Misa program: `http.serve` + SQLite (`db.*`) + `crypto.sha256`.
+// Implements spec/REGISTRY.md §8 (server), §6.1 (typed search), §6.3
+// (verified capabilities), §6.5 (computed breaking changes), §7.2/7.3/7.5.
+//
+// Run:
+//   MISA_ROOT=/path/to/misa PORT=8080 REGISTRY_DATA=./data \
+//     python3 impl/bin/misa run registry/server.misa
+//
+// Configuration is env-only, never hardcoded:
+//   PORT                 listen port (default 8080)
+//   REGISTRY_DATA        data dir: registry.db + tarballs/ + blobs/ (default ./data)
+//   REGISTRY_URL         public URL used in responses/docs links
+//                        (default https://pkg.misa.website)
+//   MISA_ROOT            Misa toolchain root for publish-pipeline subprocesses
+//                        (default ".", i.e. the Docker workdir)
+//   REGISTRY_ADMIN_TOKEN if set, an admin-scoped token is ensured at boot
+//                        (used by GET /v1/admin/backup)
+//
+// Design notes:
+// - Single-threaded accept loop (the interpreter's http.serve model):
+//   one request at a time. Publish runs subprocesses (misa check/test)
+//   and can take ~30-60s; other requests wait. Fine for v1 scale.
+// - Handlers throw {code: "Rxxx", message} records; route() maps them to
+//   HTTP statuses. Unexpected errors become 500 JSON via the lambda.
+// - Bodies are UTF-8 Text only (interpreter limit): tarballs travel as
+//   base64 inside JSON; binary handling is delegated to small Python
+//   helpers via process.run (never through Misa Text values).
+// ============================================================================
+
+// ---------------- configuration ----------------
+
+type Cfg {
+  port: Int,
+  data_dir: Text,
+  registry_url: Text,
+  misa_root: Text,
+  admin_token: Text,
+}
+
+type Resp {
+  status: Int,
+  headers: Map<Text, Text>,
+  body: Text,
+}
+
+type Auth {
+  ok: Bool,
+  publisher: Text,
+  scopes: Text,
+  token_sha: Text,
+}
+
+fn getenv_or(name: Text, dflt: Text) -> Text {
+  var out: Text = dflt
+  try {
+    out = env(name)
+  } catch e {
+    out = dflt
+  }
+  return out
+}
+
+fn parse_port(s: Text) -> Int {
+  var p: Int = 8080
+  try {
+    p = int(s)
+  } catch e {
+    p = 8080
+  }
+  if p <= 0 {
+    p = 8080
+  }
+  if p > 65535 {
+    p = 8080
+  }
+  return p
+}
+
+fn load_cfg() -> Cfg {
+  let c: Cfg = {
+    port: parse_port(getenv_or("PORT", "8080")),
+    data_dir: getenv_or("REGISTRY_DATA", "./data"),
+    registry_url: getenv_or("REGISTRY_URL", "https://pkg.misa.website"),
+    misa_root: getenv_or("MISA_ROOT", "."),
+    admin_token: getenv_or("REGISTRY_ADMIN_TOKEN", ""),
+  }
+  return c
+}
+
+fn misa_bin(cfg: Cfg) -> Text {
+  return cfg.misa_root + "/impl/bin/misa"
+}
+
+fn helpers_dir(cfg: Cfg) -> Text {
+  return cfg.misa_root + "/registry/helpers"
+}
+
+// ---------------- tiny utilities ----------------
+
+fn irange(n: Int) -> [Int] {
+  var out: [Int] = []
+  var i: Int = 0
+  while i < n {
+    out = out + [i]
+    i = i + 1
+  }
+  return out
+}
+
+fn now_s() -> Int {
+  return time.now()
+}
+
+fn today_utc() -> Text throws E300 {
+  return time.format(time.now(), "%Y-%m-%d")
+}
+
+// Constant-time string equality (for token hash comparison).
+fn ct_eq(a: Text, b: Text) -> Bool throws E300 {
+  let ca = str.chars(a)
+  let cb = str.chars(b)
+  if len(ca) != len(cb) {
+    return false
+  }
+  var diff: Int = 0
+  for i in irange(len(ca)) {
+    if ca[i] != cb[i] {
+      diff = diff + 1
+    }
+  }
+  return diff == 0
+}
+
+fn sql_quote(s: Text) -> Text {
+  return "'" + str.replace(s, "'", "''") + "'"
+}
+
+fn has_prefix(s: Text, pre: Text) -> Bool throws E300 {
+  return str.starts_with(s, pre)
+}
+
+// ---------------- JSON + response helpers ----------------
+
+fn jerr(code: Text, msg: Text) -> Text throws E300 {
+  return json.stringify({error: {code: code, message: msg}})
+}
+
+fn jresp(status: Int, body: Text) -> Resp throws E300 {
+  let r: Resp = {
+    status: status,
+    headers: {"Content-Type": "application/json"},
+    body: body,
+  }
+  return r
+}
+
+fn text_resp(status: Int, ctype: Text, body: Text) -> Resp throws E300 {
+  let r: Resp = {
+    status: status,
+    headers: {"Content-Type": ctype},
+    body: body,
+  }
+  return r
+}
+
+fn err_resp(status: Int, code: Text, msg: Text) -> Resp throws E300 {
+  return jresp(status, jerr(code, msg))
+}
+
+// R-codes thrown by handlers -> HTTP status.
+fn status_for(code: Text) -> Int {
+  if code == "R400" {
+    return 400
+  }
+  if code == "R401" {
+    return 401
+  }
+  if code == "R403" {
+    return 403
+  }
+  if code == "R404" {
+    return 404
+  }
+  if code == "R409" {
+    return 409
+  }
+  if code == "R422" {
+    return 422
+  }
+  if code == "R429" {
+    return 429
+  }
+  return 500
+}
+
+fn rthrow(code: Text, msg: Text) throws E300 {
+  throw {code: code, message: msg}
+}
+
+// ---------------- database schema (spec §8.1, 11 tables) ----------------
+
+fn schema_ddl() -> [Text] {
+  return [
+    r"""CREATE TABLE IF NOT EXISTS packages (
+      name TEXT PRIMARY KEY,
+      namespace TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      homepage TEXT NOT NULL DEFAULT '',
+      repository TEXT NOT NULL DEFAULT '',
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      deprecated_msg TEXT
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS versions (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      semver_key INTEGER NOT NULL,
+      sha256 TEXT NOT NULL,
+      tarball_path TEXT NOT NULL,
+      published_at INTEGER NOT NULL,
+      publisher TEXT NOT NULL,
+      license TEXT NOT NULL DEFAULT '',
+      yanked INTEGER NOT NULL DEFAULT 0,
+      yank_reason TEXT,
+      breaking_computed TEXT NOT NULL DEFAULT 'none',
+      caps_declared TEXT NOT NULL DEFAULT '[]',
+      caps_verified TEXT NOT NULL DEFAULT '[]',
+      examples_pass INTEGER NOT NULL DEFAULT 0,
+      examples_total INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS dependencies (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      dep TEXT NOT NULL,
+      range TEXT NOT NULL,
+      dev INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version, dep)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS signatures (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      params TEXT NOT NULL DEFAULT '[]',
+      ret TEXT NOT NULL DEFAULT '',
+      throws TEXT NOT NULL DEFAULT '[]',
+      doc TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (pkg, version, kind, name)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS capabilities (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      cap TEXT NOT NULL,
+      declared INTEGER NOT NULL,
+      verified INTEGER NOT NULL,
+      PRIMARY KEY (pkg, version, cap)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS examples (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      name TEXT NOT NULL,
+      passing INTEGER NOT NULL,
+      last_run_at INTEGER NOT NULL,
+      PRIMARY KEY (pkg, version, name)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS downloads (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      day TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version, day)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS advisories (
+      id TEXT PRIMARY KEY,
+      pkg TEXT NOT NULL,
+      affected TEXT NOT NULL,
+      fixed_in TEXT NOT NULL DEFAULT '',
+      severity TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      published_at INTEGER NOT NULL,
+      state TEXT NOT NULL DEFAULT 'published'
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS publishers (
+      id TEXT PRIMARY KEY,
+      handle TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      pubkey TEXT NOT NULL DEFAULT ''
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS tokens (
+      token_sha TEXT PRIMARY KEY,
+      publisher_id TEXT NOT NULL,
+      scopes TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked INTEGER NOT NULL DEFAULT 0
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open',
+      created_at INTEGER NOT NULL
+    )""",
+  ]
+}
+
+fn init_schema(dbh: Db) throws E303 {
+  for ddl in schema_ddl() {
+    db.exec(dbh, ddl, [])
+  }
+}
+
+// ---------------- subprocess helpers ----------------
+
+fn run_text(cfg: Cfg, cmd: [Text]) -> Text throws E300, E303 {
+  let r = process.run(cmd)
+  if r.code != 0 {
+    rthrow("R500", "subprocess failed: " + cmd[0] + ": " + str.trim(r.stderr))
+  }
+  return r.stdout
+}
+
+fn run_json(cfg: Cfg, cmd: [Text]) -> Text throws E300, E303 {
+  let out = run_text(cfg, cmd)
+  var v: Text = ""
+  try {
+    v = json.parse(out)
+  } catch e {
+    rthrow("R500", "subprocess returned invalid JSON: " + cmd[0])
+  }
+  return v
+}
+
+fn run_ok(cfg: Cfg, cmd: [Text]) throws E300, E303 {
+  let r = process.run(cmd)
+  if r.code != 0 {
+    rthrow("R500", "subprocess failed (" + str(r.code) + "): " + cmd[0] +
+      ": " + str.trim(r.stderr))
+  }
+}
+
+// ---------------- auth (spec §8.3) ----------------
+
+fn bearer_token(req: Request) -> Text throws E300 {
+  var t: Text = ""
+  try {
+    let h = req.headers["authorization"]
+    if str.starts_with(h, "Bearer ") {
+      t = str.slice(h, 7, len(h))
+    }
+  } catch e {
+    t = ""
+  }
+  return str.trim(t)
+}
+
+// (token lookup is inlined in authenticate below)
+
+fn authenticate(dbh: Db, req: Request) -> Auth throws E300, E303 {
+  let a0: Auth = {ok: false, publisher: "", scopes: "[]", token_sha: ""}
+  let tok = bearer_token(req)
+  if tok == "" {
+    return a0
+  }
+  // Tokens are never logged; only the sha256 ever touches the DB.
+  let sha = crypto.sha256(tok)
+  let rows = db.query(dbh,
+    "SELECT token_sha, publisher_id, scopes, expires_at, revoked FROM tokens WHERE token_sha = ?",
+    [sha])
+  if len(rows) == 0 {
+    return a0
+  }
+  let row = rows[0]
+  var revoked: Int = 0
+  var expires_at: Int = 0
+  var publisher_id: Text = ""
+  var scopes: Text = "[]"
+  var stored_sha: Text = ""
+  try {
+    revoked = row.revoked
+  } catch e {
+    revoked = 0
+  }
+  try {
+    expires_at = row.expires_at
+  } catch e {
+    expires_at = 0
+  }
+  try {
+    publisher_id = row.publisher_id
+  } catch e {
+    publisher_id = ""
+  }
+  try {
+    scopes = row.scopes
+  } catch e {
+    scopes = "[]"
+  }
+  try {
+    stored_sha = row.token_sha
+  } catch e {
+    stored_sha = ""
+  }
+  if revoked != 0 {
+    return a0
+  }
+  if expires_at <= now_s() {
+    return a0
+  }
+  // Constant-time comparison of the stored hash (defense in depth:
+  // the SELECT already matched, but this guards hash-prefix tricks).
+  if not ct_eq(stored_sha, sha) {
+    return a0
+  }
+  // Publisher row is created implicitly on first use (the OAuth login
+  // flow of §8.3 would create it explicitly; v1 bootstraps it here).
+  let prow = db.query(dbh, "SELECT id FROM publishers WHERE id = ?",
+    [publisher_id])
+  if len(prow) == 0 {
+    db.exec(dbh,
+      "INSERT INTO publishers (id, handle, created_at) VALUES (?, ?, ?)",
+      [publisher_id, "publisher-" + str.slice(publisher_id, 0, 8),
+       now_s()])
+  }
+  let a: Auth = {ok: true, publisher: publisher_id,
+                 scopes: scopes, token_sha: sha}
+  return a
+}
+
+fn need_auth(dbh: Db, req: Request) -> Auth throws E300, E303 {
+  let a = authenticate(dbh, req)
+  if not a.ok {
+    rthrow("R401", "missing or invalid bearer token")
+  }
+  return a
+}
+
+// scopes is the JSON array text from the tokens table.
+fn scope_allows(scopes_json: Text, need: Text) -> Bool throws E300 {
+  var scopes: [Text] = []
+  try {
+    let v = json.parse(scopes_json)
+    for s in v {
+      scopes = scopes + [s]
+    }
+  } catch e {
+    return false
+  }
+  let parts = str.split(need, ":")
+  if len(parts) != 2 {
+    return false
+  }
+  let nverb = parts[0]
+  let npat = parts[1]
+  for s in scopes {
+    if s == "admin:*" {
+      return true
+    }
+    let sp = str.split(s, ":")
+    if len(sp) == 2 {
+      if sp[0] == nverb {
+        if sp[1] == "*" {
+          return true
+        }
+        if sp[1] == npat {
+          return true
+        }
+        // "publish:@acme/*" grants "publish:@acme/router"
+        let slen = len(sp[1])
+        if slen >= 2 {
+          if str.slice(sp[1], slen - 2, slen) == "/*" {
+            let pre = str.slice(sp[1], 0, slen - 2)
+            if str.starts_with(npat, pre + "/") {
+              return true
+            }
+          }
+        }
+      }
+    }
+  }
+  return false
+}
+
+fn need_scope(a: Auth, need: Text) throws E300 {
+  if not scope_allows(a.scopes, need) {
+    rthrow("R403", "token lacks required scope: " + need)
+  }
+}
+
+// ---------------- rate limiting (in-memory counters) ----------------
+// st is the server's shared Map; keys embed the window so no cleanup
+// pass is needed: "rl:<key>:<window>" -> count.
+
+fn rate_ok(st: Map<Text, Text>, key: Text, limit: Int,
+           window_s: Int) -> Bool throws E300 {
+  // st is a param (immutable binding); alias it to a var so the shared
+  // MapValue can be mutated through the alias.
+  var mst = st
+  let w = now_s() / window_s
+  let k = "rl:" + key + ":" + str(w)
+  var n: Int = 0
+  try {
+    n = int(mst[k])
+  } catch e {
+    n = 0
+  }
+  if n >= limit {
+    return false
+  }
+  mst[k] = str(n + 1)
+  return true
+}
+
+fn client_key(req: Request) -> Text {
+  var ip: Text = ""
+  try {
+    ip = req.headers["x-forwarded-for"]
+  } catch e {
+    ip = ""
+  }
+  if ip == "" {
+    try {
+      ip = req.headers["x-real-ip"]
+    } catch e {
+      ip = ""
+    }
+  }
+  if ip == "" {
+    ip = "anon"
+  }
+  return "ip:" + ip
+}
+
+fn check_rate(req: Request, st: Map<Text, Text>, a: Auth) throws E300 {
+  // Rate-limit identity is not returned; limits are enforced by throw.
+  if a.ok {
+    if not rate_ok(st, "t:" + a.token_sha, 600, 60) {
+      rthrow("R429", "rate limit exceeded: 600 req/min for authenticated clients")
+    }
+    return
+  }
+  if not rate_ok(st, client_key(req), 60, 60) {
+    rthrow("R429", "rate limit exceeded: 60 req/min for anonymous clients")
+  }
+}
+
+// Publish anti-spam: 5/hour/namespace (spec §8.2; raisable on request).
+fn check_publish_rate(st: Map<Text, Text>, ns: Text) throws E300 {
+  if not rate_ok(st, "pub:" + ns, 5, 3600) {
+    rthrow("R429", "publish rate limit exceeded: 5/hour for namespace " + ns)
+  }
+}
+
+// ---------------- semver ----------------
+
+fn parse_semver(v: Text) -> [Int] throws E300 {
+  let parts = str.split(str.trim(v), ".")
+  if len(parts) != 3 {
+    rthrow("R422", "version must be MAJOR.MINOR.PATCH, got: " + v)
+  }
+  var out: [Int] = []
+  for p in parts {
+    var n: Int = 0
+    try {
+      n = int(p)
+    } catch e {
+      rthrow("R422", "version must be MAJOR.MINOR.PATCH, got: " + v)
+    }
+    if n < 0 {
+      rthrow("R422", "version must be MAJOR.MINOR.PATCH, got: " + v)
+    }
+    out = out + [n]
+  }
+  return out
+}
+
+// Sortable key: major*10^12 + minor*10^6 + patch.
+fn semver_key(v: Text) -> Int throws E300 {
+  let p = parse_semver(v)
+  return p[0] * 1000000000000 + p[1] * 1000000 + p[2]
+}
+
+// Declared bump between two version strings.
+fn bump_level(old_v: Text, new_v: Text) -> Text throws E300 {
+  let o = parse_semver(old_v)
+  let n = parse_semver(new_v)
+  if n[0] != o[0] {
+    return "major"
+  }
+  if n[1] != o[1] {
+    return "minor"
+  }
+  if n[2] != o[2] {
+    return "patch"
+  }
+  return "none"
+}
+
+fn bump_rank(b: Text) -> Int {
+  if b == "major" {
+    return 3
+  }
+  if b == "minor" {
+    return 2
+  }
+  if b == "patch" {
+    return 1
+  }
+  return 0
+}
+
+fn valid_range(r: Text) -> Bool throws E300 {
+  let t = str.trim(r)
+  if t == "" {
+    return false
+  }
+  if t == "*" {
+    return true
+  }
+  var v: Text = t
+  let c0 = str.slice(t, 0, 1)
+  if c0 == "^" {
+    v = str.slice(t, 1, len(t))
+  } else if c0 == "~" {
+    v = str.slice(t, 1, len(t))
+  } else if c0 == "=" {
+    v = str.slice(t, 1, len(t))
+  }
+  let parts = str.split(v, ".")
+  if len(parts) != 3 {
+    return false
+  }
+  for p in parts {
+    var n: Int = -1
+    try {
+      n = int(p)
+    } catch e {
+      return false
+    }
+    if n < 0 {
+      return false
+    }
+  }
+  return true
+}
+
+// ---------------- package name / manifest validation (E113 rules) ----------------
+
+fn valid_pkg_name(n: Text) -> Bool throws E300 {
+  return regex.matches(regex(r"@[A-Za-z0-9][A-Za-z0-9_-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"), n)
+}
+
+fn valid_namespace(ns: Text) -> Bool throws E300 {
+  return regex.matches(regex(r"@[A-Za-z0-9][A-Za-z0-9_-]*"), ns)
+}
+
+fn namespace_of(full: Text) -> Text throws E300 {
+  let parts = str.split(full, "/")
+  return parts[0]
+}
+
+// Field extraction from json.parse values: JSON objects are plain dicts,
+// so only STATIC field access (o.name) works — dynamic o[k] does not.
+// Pattern used throughout (missing field -> R400, wrong shape -> R422):
+//
+//   var name: Text = ""
+//   try {
+//     name = body.manifest.package.name
+//   } catch e {
+//     rthrow("R400", "manifest.package.name is required")
+//   }
+//   if name == "" { rthrow("R400", "manifest.package.name must not be empty") }
+//
+// Note: dynamic values coerce into typed slots (Int 42 -> "42"), so every
+// extracted value is re-validated by SHAPE (regex/semver), never by type.
+
+// ---------------- manifest ----------------
+
+type Manifest {
+  name: Text,
+  version: Text,
+  description: Text,
+  license: Text,
+  homepage: Text,
+  repository: Text,
+  lib: Text,
+  caps_declared: [Text],
+  dep_names: [Text],
+  dep_ranges: [Text],
+  dep_dev: [Int],
+}
+
+fn known_cap(c: Text) -> Bool {
+  return c == "network" or c == "fs" or c == "process" or c == "model"
+}
+
+// body is the parsed publish JSON. manifest must be a JSON object
+// mirroring misa.pkg (produced by registry/helpers/pkg_to_json.py).
+// (Param typed Text: the checker lets "unknown" JSON values flow into
+// any param type, and field access stays dynamic.)
+fn parse_manifest(body: Text) -> Manifest throws E300 {
+  var mraw = nil
+  try {
+    mraw = body.manifest
+  } catch e {
+    rthrow("R400", "body.manifest is required")
+  }
+  var pkg = nil
+  try {
+    pkg = mraw.package
+  } catch e {
+    rthrow("R400", "manifest.package is required")
+  }
+  var name: Text = ""
+  try {
+    name = pkg.name
+  } catch e {
+    rthrow("R400", "manifest.package.name is required")
+  }
+  if not valid_pkg_name(name) {
+    rthrow("R422", "bad package name (E113): want @namespace/name, got: " + name)
+  }
+  var version: Text = ""
+  try {
+    version = pkg.version
+  } catch e {
+    rthrow("R400", "manifest.package.version is required")
+  }
+  // shape-checked now; semver_key re-validates strictly
+  var sem_ok: Bool = true
+  try {
+    semver_key(version)
+  } catch e {
+    sem_ok = false
+  }
+  if not sem_ok {
+    rthrow("R422", "bad version (E113): want MAJOR.MINOR.PATCH, got: " + version)
+  }
+  var description: Text = ""
+  try {
+    description = pkg.description
+  } catch e {
+    rthrow("R422", "manifest.package.description is required for publish (E113)")
+  }
+  if description == "" {
+    rthrow("R422", "manifest.package.description is required for publish (E113)")
+  }
+  var license: Text = ""
+  try {
+    license = pkg.license
+  } catch e {
+    rthrow("R422", "manifest.package.license is required for publish (E113)")
+  }
+  if license == "" {
+    rthrow("R422", "manifest.package.license is required for publish (E113)")
+  }
+  var homepage: Text = ""
+  try {
+    homepage = pkg.homepage
+  } catch e {
+    homepage = ""
+  }
+  var repository: Text = ""
+  try {
+    repository = pkg.repository
+  } catch e {
+    repository = ""
+  }
+  var lib: Text = "src/lib.misa"
+  try {
+    lib = pkg.lib
+  } catch e {
+    lib = "src/lib.misa"
+  }
+  if lib == "" {
+    lib = "src/lib.misa"
+  }
+  // capabilities: explicit true flags only.
+  // (Field access can't name `.model` — it's a keyword — and dynamic
+  // o[k] is unsupported, so match on the compact JSON text, which
+  // json.stringify always renders without spaces.)
+  var caps: [Text] = []
+  var capraw = nil
+  try {
+    capraw = mraw.capabilities
+  } catch e {
+    capraw = nil
+  }
+  if capraw != nil {
+    var caps_j: Text = ""
+    try {
+      caps_j = json.stringify(capraw)
+    } catch e {
+      caps_j = ""
+    }
+    for c in ["network", "fs", "process", "model"] {
+      let rx = regex("\"" + c + "\":true")
+      var found = nil
+      try {
+        found = regex.find(rx, caps_j)
+      } catch e {
+        found = nil
+      }
+      if found != nil {
+        caps = caps + [c]
+      }
+    }
+  }
+  // dependencies: list of {name, range} (pkg_to_json.py normalizes the
+  // TOML tables to this form).
+  var dep_names: [Text] = []
+  var dep_ranges: [Text] = []
+  var dep_dev: [Int] = []
+  var depraw = nil
+  try {
+    depraw = mraw.dependencies
+  } catch e {
+    depraw = nil
+  }
+  if depraw != nil {
+    var dl = nil
+    try {
+      // must be a list; anything else is a client error
+      for d in depraw {
+        dl = d
+      }
+    } catch e {
+      rthrow("R400",
+        "manifest.dependencies must be a list of {{name, range}}")
+    }
+    for d in depraw {
+      var dn: Text = ""
+      var dr: Text = ""
+      try {
+        dn = d.name
+      } catch e {
+        rthrow("R422", "dependency entry needs a name")
+      }
+      try {
+        dr = d.range
+      } catch e {
+        rthrow("R422", "dependency entry needs a range")
+      }
+      if not valid_pkg_name(dn) {
+        rthrow("R422", "bad dependency name: " + dn)
+      }
+      if not valid_range(dr) {
+        rthrow("R422", "bad dependency range for " + dn + ": " + dr)
+      }
+      dep_names = dep_names + [dn]
+      dep_ranges = dep_ranges + [dr]
+      dep_dev = dep_dev + [0]
+    }
+  }
+  var devraw = nil
+  try {
+    devraw = mraw.dev_dependencies
+  } catch e {
+    devraw = nil
+  }
+  if devraw == nil {
+    try {
+      devraw = mraw.devDependencies
+    } catch e {
+      devraw = nil
+    }
+  }
+  if devraw != nil {
+    for d in devraw {
+      var dn: Text = ""
+      var dr: Text = ""
+      try {
+        dn = d.name
+      } catch e {
+        rthrow("R422", "dev-dependency entry needs a name")
+      }
+      try {
+        dr = d.range
+      } catch e {
+        rthrow("R422", "dev-dependency entry needs a range")
+      }
+      if not valid_pkg_name(dn) {
+        rthrow("R422", "bad dev-dependency name: " + dn)
+      }
+      if not valid_range(dr) {
+        rthrow("R422", "bad dev-dependency range for " + dn + ": " + dr)
+      }
+      dep_names = dep_names + [dn]
+      dep_ranges = dep_ranges + [dr]
+      dep_dev = dep_dev + [1]
+    }
+  }
+  let m: Manifest = {
+    name: name, version: version, description: description,
+    license: license, homepage: homepage, repository: repository,
+    lib: lib, caps_declared: caps,
+    dep_names: dep_names, dep_ranges: dep_ranges, dep_dev: dep_dev,
+  }
+  return m
+}
+
+// ---------------- capability inference (spec §6.3) ----------------
+// Inferred from the checker's-eye view: namespaced builtin calls found
+// in function bodies by registry/helpers/extract_sigs.py.
+
+fn add_cap(caps: [Text], c: Text) -> [Text] {
+  for x in caps {
+    if x == c {
+      return caps
+    }
+  }
+  return caps + [c]
+}
+
+// sigs: extractor records (dynamic list). Returns sorted capability list.
+fn infer_caps(sigs: Text) -> [Text] throws E300 {
+  var caps: [Text] = []
+  for s in sigs {
+    var calls = nil
+    try {
+      calls = s.calls
+    } catch e {
+      calls = nil
+    }
+    if calls != nil {
+      for c in calls {
+        var cn: Text = ""
+        try {
+          cn = c
+        } catch e {
+          cn = ""
+        }
+        if str.starts_with(cn, "fs.") {
+          caps = add_cap(caps, "fs")
+        } else if str.starts_with(cn, "process.") {
+          caps = add_cap(caps, "process")
+        } else if str.starts_with(cn, "db.") {
+          caps = add_cap(caps, "process")
+          caps = add_cap(caps, "fs")
+        } else if str.starts_with(cn, "http.") or str.starts_with(cn, "net.") or str.starts_with(cn, "socket.") {
+          caps = add_cap(caps, "network")
+        } else if str.starts_with(cn, "model.") {
+          caps = add_cap(caps, "model")
+          caps = add_cap(caps, "network")
+        }
+      }
+    }
+  }
+  return caps
+}
+
+fn subtract(a: [Text], b: [Text]) -> [Text] {
+  var out: [Text] = []
+  for x in a {
+    var found: Bool = false
+    for y in b {
+      if x == y {
+        found = true
+      }
+    }
+    if not found {
+      out = out + [x]
+    }
+  }
+  return out
+}
+
+// ---------------- computable breaking changes (spec §6.5) ----------------
+
+type DiffRes {
+  level: Text,
+  notes: [Text],
+}
+
+// canonical "shape" of a fn signature for diffing:
+// name|p1type,p2type|ret|throws (throws sorted)
+fn canon_fn(name: Text, ptypes: [Text], ret: Text, throws: [Text]) -> Text {
+  return name + "|" + str.join(ptypes, ",") + "|" + ret + "|" +
+    str.join(throws, ",")
+}
+
+fn str_list(v: Text) -> [Text] throws E300 {
+  // v: dynamic JSON list of Text
+  var out: [Text] = []
+  for x in v {
+    var s: Text = ""
+    try {
+      s = x
+    } catch e {
+      s = ""
+    }
+    out = out + [s]
+  }
+  return out
+}
+
+// old_json: DB signature rows serialized via json.stringify
+//   ([{kind,name,params,ret,throws}] with params/ret/throws as JSON text).
+// new_sigs: extractor records (dynamic list).
+fn breaking_diff(old_json: Text, new_sigs: Text) -> DiffRes throws E300 {
+  var old_rows = nil
+  try {
+    old_rows = json.parse(old_json)
+  } catch e {
+    rthrow("R500", "breaking diff: bad old signatures")
+  }
+  var notes: [Text] = []
+  var level: Text = "patch"
+  // index old rows by "kind|name" -> canon shape + raw JSON
+  var oldm: Map<Text, Text> = {}
+  var oldkeys: [Text] = []
+  for r in old_rows {
+    var kind: Text = ""
+    var name: Text = ""
+    var params_j: Text = "[]"
+    var ret: Text = ""
+    var throws_j: Text = "[]"
+    try {
+      kind = r.kind
+    } catch e {
+      kind = ""
+    }
+    try {
+      name = r.name
+    } catch e {
+      name = ""
+    }
+    try {
+      params_j = r.params
+    } catch e {
+      params_j = "[]"
+    }
+    try {
+      ret = r.ret
+    } catch e {
+      ret = ""
+    }
+    try {
+      throws_j = r.throws
+    } catch e {
+      throws_j = "[]"
+    }
+    let key = kind + "|" + name
+    if kind == "fn" {
+      var ptypes: [Text] = []
+      try {
+        let ps = json.parse(params_j)
+        for p in ps {
+          var t: Text = ""
+          try {
+            t = p[1]
+          } catch e {
+            t = ""
+          }
+          ptypes = ptypes + [t]
+        }
+      } catch e {
+        ptypes = []
+      }
+      var th: [Text] = []
+      try {
+        th = str_list(json.parse(throws_j))
+      } catch e {
+        th = []
+      }
+      oldm[key] = canon_fn(name, ptypes, ret, th)
+    } else if kind == "interface" {
+      // params JSON holds the method list [{name, type, throws}]
+      oldm[key] = params_j
+    } else if kind == "impl" {
+      oldm[key] = "impl"
+    }
+    oldkeys = oldkeys + [key]
+  }
+  // index new sigs the same way
+  var newm: Map<Text, Text> = {}
+  var newkeys: [Text] = []
+  for s in new_sigs {
+    var kind: Text = ""
+    var name: Text = ""
+    try {
+      kind = s.kind
+    } catch e {
+      kind = ""
+    }
+    try {
+      name = s.name
+    } catch e {
+      name = ""
+    }
+    let key = kind + "|" + name
+    if kind == "fn" {
+      var ptypes: [Text] = []
+      try {
+        for p in s.params {
+          var t: Text = ""
+          try {
+            t = p[1]
+          } catch e {
+            t = ""
+          }
+          ptypes = ptypes + [t]
+        }
+      } catch e {
+        ptypes = []
+      }
+      var th: [Text] = []
+      try {
+        th = str_list(s.throws_inferred)
+      } catch e {
+        th = []
+      }
+      var ret: Text = ""
+      try {
+        ret = s.ret
+      } catch e {
+        ret = ""
+      }
+      newm[key] = canon_fn(name, ptypes, ret, th)
+    } else if kind == "interface" {
+      var ms: [Text] = []
+      try {
+        for m in s.params {
+          var mn: Text = ""
+          try {
+            mn = m.name
+          } catch e {
+            mn = ""
+          }
+          var mt: Text = ""
+          try {
+            mt = m.sig
+          } catch e {
+            mt = ""
+          }
+          ms = ms + [mn + ":" + mt]
+        }
+      } catch e {
+        ms = []
+      }
+      newm[key] = str.join(ms, ";")
+    } else if kind == "impl" {
+      newm[key] = "impl"
+    }
+    newkeys = newkeys + [key]
+  }
+  // 1. removals + changes
+  for key in oldkeys {
+    var oldshape: Text = ""
+    try {
+      oldshape = oldm[key]
+    } catch e {
+      oldshape = ""
+    }
+    var newshape: Text = ""
+    var gone: Bool = false
+    try {
+      newshape = newm[key]
+    } catch e {
+      gone = true
+    }
+    let parts = str.split(key, "|")
+    let kind = parts[0]
+    let name = parts[1]
+    if gone {
+      if kind == "fn" {
+        notes = notes + ["removed fn " + name]
+        level = "major"
+      } else if kind == "interface" {
+        notes = notes + ["removed interface " + name]
+        level = "major"
+      }
+    } else if oldshape != newshape {
+      if kind == "fn" {
+        notes = notes + ["fn " + name + " signature changed"]
+        level = "major"
+      } else if kind == "interface" {
+        // method added or removed -> breaking (existing impls/callers)
+        notes = notes + ["interface " + name + " method set changed"]
+        level = "major"
+      }
+    }
+  }
+  // 2. additions (new - old)
+  for key in newkeys {
+    var seen: Bool = false
+    try {
+      let tmp = oldm[key]
+      seen = true
+    } catch e {
+      seen = false
+    }
+    if not seen {
+      let parts = str.split(key, "|")
+      let kind = parts[0]
+      let name = parts[1]
+      if kind == "fn" {
+        notes = notes + ["added fn " + name]
+        if level == "patch" {
+          level = "minor"
+        }
+      } else if kind == "impl" {
+        notes = notes + ["added impl " + name]
+        if level == "patch" {
+          level = "minor"
+        }
+      } else if kind == "interface" {
+        notes = notes + ["added interface " + name]
+        if level == "patch" {
+          level = "minor"
+        }
+      }
+    }
+  }
+  let d: DiffRes = {level: level, notes: notes}
+  return d
+}
+
+// ---------------- secret scan ----------------
+// ERE for grep -E: private keys, AWS keys, GitHub tokens, Slack tokens,
+// Google API keys, OpenAI-style keys.
+fn secret_pattern() -> Text {
+  return r"sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36,}|" +
+    r"gho_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]+|" +
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}"
+}
+
+fn validate_tarball(listing: Text, lib: Text) throws E300 {
+  var has_pkg: Bool = false
+  var has_lib: Bool = false
+  var has_example: Bool = false
+  for line in str.split(str.trim(listing), "\n") {
+    var m: Text = str.trim(line)
+    if str.starts_with(m, "./") {
+      m = str.slice(m, 2, len(m))
+    }
+    if m == "" {
+      // skip empty lines (restructured: no `continue` in Misa)
+    } else if str.starts_with(m, "/") {
+      rthrow("R422", "tarball must not contain absolute paths: " + m)
+    } else if m == ".." or str.starts_with(m, "../") or has_dotdot(m) {
+      rthrow("R422", "tarball must not contain '..' members: " + m)
+    } else {
+      if m == "misa.pkg" {
+        has_pkg = true
+      }
+      if m == lib {
+        has_lib = true
+      }
+      if str.starts_with(m, "examples/") {
+        if ends_with_dotmisa(m) {
+          has_example = true
+        }
+      }
+    }
+  }
+  if not has_pkg {
+    rthrow("R422", "tarball must contain misa.pkg at its root")
+  }
+  if not has_lib {
+    rthrow("R422", "tarball is missing the lib entry: " + lib)
+  }
+  if not has_example {
+    rthrow("R422", "at least one example in examples/*.misa is required")
+  }
+}
+
+fn has_dotdot(m: Text) -> Bool throws E300 {
+  // "/../" or "/.." inside, or trailing "/.."
+  let parts = str.split(m, "/")
+  for p in parts {
+    if p == ".." {
+      return true
+    }
+  }
+  return false
+}
+
+fn ends_with_dotmisa(m: Text) -> Bool throws E300 {
+  let suf: Text = ".misa"
+  if len(m) < len(suf) {
+    return false
+  }
+  return str.slice(m, len(m) - len(suf), len(m)) == suf
+}
+
+// ---------------- POST /v1/publish ----------------
+// The publish pipeline (spec §8.5): auth+scope -> manifest validation ->
+// namespace ownership -> sha256 verify -> unpack -> misa check ->
+// signatures -> capability verify -> examples+tests -> breaking diff ->
+// secret scan -> one atomic SQLite transaction -> blob storage.
+fn handle_publish(dbh: Db, cfg: Cfg, st: Map<Text, Text>, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  var body: Text = ""
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  let m = parse_manifest(body)
+  let full = m.name
+  let ns = namespace_of(full)
+  need_scope(a, "publish:" + ns + "/*")
+  check_publish_rate(st, ns)
+
+  // namespace ownership: first-claim wins (§2)
+  let owner_rows = db.query(dbh,
+    "SELECT claimed_by FROM packages WHERE namespace = ?", [ns])
+  for orow in owner_rows {
+    var cb: Text = ""
+    try {
+      cb = orow.claimed_by
+    } catch e {
+      cb = ""
+    }
+    if cb != "" {
+      if cb != a.publisher {
+        rthrow("R403", "namespace " + ns + " is owned by another publisher")
+      }
+    }
+  }
+  // version must be new
+  let ex = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND version = ?",
+    [full, m.version])
+  if len(ex) > 0 {
+    rthrow("R409",
+      "version " + m.version + " of " + full + " is already published")
+  }
+  let sk = semver_key(m.version)
+  // previous version (for the breaking-change diff)
+  let prev_rows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND semver_key < ? ORDER BY semver_key DESC LIMIT 1",
+    [full, sk])
+  var prev_ver: Text = ""
+  if len(prev_rows) > 0 {
+    try {
+      prev_ver = prev_rows[0].version
+    } catch e {
+      prev_ver = ""
+    }
+  }
+
+  // ---- tarball: decode (binary stays out of Misa Text) + verify ----
+  var tb64: Text = ""
+  try {
+    tb64 = body.tarball_b64
+  } catch e {
+    rthrow("R400", "body.tarball_b64 is required")
+  }
+  var tsha: Text = ""
+  try {
+    tsha = body.tarball_sha256
+  } catch e {
+    rthrow("R400", "body.tarball_sha256 is required")
+  }
+  if tb64 == "" {
+    rthrow("R400", "body.tarball_b64 must not be empty")
+  }
+  if tsha == "" {
+    rthrow("R400", "body.tarball_sha256 must not be empty")
+  }
+  let tmp = fs.temp_dir()
+  fs.write(tmp + "/payload.b64", tb64)
+  let dec = run_json(cfg, ["python3",
+    helpers_dir(cfg) + "/decode_tarball.py",
+    tmp + "/payload.b64", tmp + "/pkg.tar.gz"])
+  var got_sha: Text = ""
+  try {
+    got_sha = dec.sha256
+  } catch e {
+    rthrow("R500", "tarball decode helper failed")
+  }
+  if str.to_lower(tsha) != got_sha {
+    rthrow("R422", "tarball_sha256 mismatch: claimed " + tsha +
+      ", actual " + got_sha)
+  }
+
+  // ---- unpack: list, validate, extract ----
+  let listing = run_text(cfg, ["tar", "-tzf", tmp + "/pkg.tar.gz"])
+  validate_tarball(listing, m.lib)
+  run_ok(cfg, ["mkdir", "-p", tmp + "/pkg"])
+  run_ok(cfg, ["tar", "-xzf", tmp + "/pkg.tar.gz", "-C", tmp + "/pkg"])
+  let pkgdir = tmp + "/pkg"
+
+  // ---- secret scan (block on hit) ----
+  let gr = process.run(
+    ["grep", "-rIlE", secret_pattern(), pkgdir])
+  if gr.code == 0 {
+    rthrow("R422", "secret scan blocked publish; possible leaked " +
+      "secrets in: " + str.trim(gr.stdout))
+  }
+  if gr.code != 1 {
+    rthrow("R500", "secret scan failed: " + str.trim(gr.stderr))
+  }
+
+  // ---- misa check must be clean; extract the throws graph ----
+  let chk = process.run(["python3", misa_bin(cfg), "check", "--json",
+    pkgdir + "/" + m.lib])
+  var chk_json = nil
+  try {
+    chk_json = json.parse(chk.stdout)
+  } catch e {
+    rthrow("R422",
+      "misa check produced no usable output: " + str.trim(chk.stderr))
+  }
+  var chk_ok: Bool = false
+  try {
+    chk_ok = chk_json.ok == true
+  } catch e {
+    chk_ok = false
+  }
+  if not chk_ok {
+    var msg: Text = ""
+    try {
+      for er in chk_json.errors {
+        var ec: Text = ""
+        var em: Text = ""
+        try {
+          ec = er.code
+        } catch e {
+          ec = ""
+        }
+        try {
+          em = er.message
+        } catch e {
+          em = ""
+        }
+        msg = msg + ec + " " + em + "; "
+      }
+    } catch e {
+      msg = ""
+    }
+    if msg == "" {
+      msg = str.trim(chk.stderr)
+    }
+    rthrow("R422", "misa check failed: " + msg)
+  }
+  fs.write(tmp + "/check.json", chk.stdout)
+
+  // ---- signatures + inferred throws (computed, not trusted) ----
+  let sigs = run_json(cfg, ["python3",
+    helpers_dir(cfg) + "/extract_sigs.py",
+    pkgdir, tmp + "/check.json", "--misa-root=" + cfg.misa_root])
+  var sig_list: Text = ""
+  try {
+    sig_list = sigs.signatures
+  } catch e {
+    rthrow("R500", "signature extraction failed")
+  }
+
+  // ---- capabilities: declared vs inferred (§6.3) ----
+  let inferred = infer_caps(sig_list)
+  let extra = subtract(m.caps_declared, inferred)
+  if len(extra) > 0 {
+    rthrow("R422", "declared capabilities exceed inferred (E113): [" +
+      str.join(extra, ", ") + "] claimed but nothing in the package uses them")
+  }
+  let missing = subtract(inferred, m.caps_declared)
+  var warnings: [Text] = []
+  if len(missing) > 0 {
+    warnings = warnings + ["capabilities upgraded: verified [" +
+      str.join(inferred, ", ") + "] exceeds declared [" +
+      str.join(m.caps_declared, ", ") + "]"]
+  }
+
+  // ---- examples: every examples/*.misa must execute clean (60s each) ----
+  let ex_list = run_text(cfg,
+    ["find", pkgdir + "/examples", "-type", "f", "-name", "*.misa"])
+  var ex_names: [Text] = []
+  for line in str.split(str.trim(ex_list), "\n") {
+    let t = str.trim(line)
+    if t != "" {
+      var rel: Text = t
+      let pfx = pkgdir + "/"
+      if str.starts_with(t, pfx) {
+        rel = str.slice(t, len(pfx), len(t))
+      }
+      ex_names = ex_names + [rel]
+    }
+  }
+  if len(ex_names) == 0 {
+    rthrow("R422", "at least one example in examples/*.misa is required")
+  }
+  var ex_pass: Int = 0
+  var ex_flags: [Int] = []
+  for rel in ex_names {
+    let r = process.run(["timeout", "60", "python3", misa_bin(cfg), "run",
+      pkgdir + "/" + rel])
+    if r.code == 0 {
+      ex_pass = ex_pass + 1
+      ex_flags = ex_flags + [1]
+    } else {
+      ex_flags = ex_flags + [0]
+    }
+  }
+  // ---- misa test over the package (when it has test files) ----
+  let test_list = run_text(cfg,
+    ["find", pkgdir, "-type", "f", "-name", "*_test.misa"])
+  if str.trim(test_list) == "" {
+    warnings = warnings + ["no test files (*_test.misa) found; examples still executed"]
+  } else {
+    let tst = process.run(
+      ["timeout", "120", "python3", misa_bin(cfg), "test", pkgdir])
+    if tst.code != 0 {
+      rthrow("R422",
+        "misa test failed: " + str.trim(tst.stdout + tst.stderr))
+    }
+  }
+
+  // ---- breaking diff vs previous version (§6.5) ----
+  var breaking: Text = "none"
+  var diff_notes: [Text] = []
+  if prev_ver != "" {
+    let old_rows = db.query(dbh,
+      "SELECT kind, name, params, ret, throws FROM signatures WHERE pkg = ? AND version = ?",
+      [full, prev_ver])
+    let d = breaking_diff(json.stringify(old_rows), sig_list)
+    breaking = d.level
+    diff_notes = d.notes
+    let declared_bump = bump_level(prev_ver, m.version)
+    if bump_rank(declared_bump) < bump_rank(breaking) {
+      rthrow("R422", "declared version bump (" + declared_bump +
+        ") is less than the computed breaking change (" + breaking + "): " +
+        str.join(diff_notes, "; "))
+    }
+  }
+
+  // ---- store blobs (before the DB transaction; cleaned up on failure) ----
+  let now = now_s()
+  let tb_rel = "tarballs/" + full + "/" + m.version + ".tar.gz"
+  let blob_rel = "blobs/sha256/" + str.slice(got_sha, 0, 2) + "/" +
+    str.slice(got_sha, 2, 4) + "/" + got_sha
+  run_ok(cfg, ["mkdir", "-p", cfg.data_dir + "/tarballs/" + full])
+  run_ok(cfg, ["mkdir", "-p", cfg.data_dir + "/blobs/sha256/" +
+    str.slice(got_sha, 0, 2) + "/" + str.slice(got_sha, 2, 4)])
+  run_ok(cfg, ["cp", tmp + "/pkg.tar.gz", cfg.data_dir + "/" + tb_rel])
+  run_ok(cfg, ["cp", tmp + "/pkg.tar.gz", cfg.data_dir + "/" + blob_rel])
+
+  // ---- one atomic SQLite transaction ----
+  let caps_j = json.stringify(inferred)
+  let dcaps_j = json.stringify(m.caps_declared)
+  db.begin(dbh)
+  try {
+    let prow = db.query(dbh,
+      "SELECT name FROM packages WHERE name = ?", [full])
+    if len(prow) == 0 {
+      db.exec(dbh,
+        "INSERT INTO packages (name, namespace, description, homepage, repository, claimed_by, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [full, ns, m.description, m.homepage, m.repository, a.publisher,
+          now])
+    } else {
+      db.exec(dbh,
+        "UPDATE packages SET description = ?, homepage = ?, repository = ? WHERE name = ?",
+        [m.description, m.homepage, m.repository, full])
+    }
+    db.exec(dbh,
+      "INSERT INTO versions (pkg, version, semver_key, sha256, tarball_path, published_at, publisher, license, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [full, m.version, sk, got_sha, tb_rel, now, a.publisher, m.license,
+        breaking, dcaps_j, caps_j, ex_pass, len(ex_names)])
+    for i in irange(len(m.dep_names)) {
+      db.exec(dbh,
+        "INSERT INTO dependencies (pkg, version, dep, range, dev) VALUES (?, ?, ?, ?, ?)",
+        [full, m.version, m.dep_names[i], m.dep_ranges[i], m.dep_dev[i]])
+    }
+    for s in sig_list {
+      var kind: Text = ""
+      var sname: Text = ""
+      try {
+        kind = s.kind
+      } catch e {
+        kind = ""
+      }
+      try {
+        sname = s.name
+      } catch e {
+        sname = ""
+      }
+      if kind != "" {
+        if sname != "" {
+          var params_j: Text = "[]"
+          var ret: Text = ""
+          var throws_j: Text = "[]"
+          var doc: Text = ""
+          var pj = nil
+          try {
+            pj = s.params
+          } catch e {
+            pj = nil
+          }
+          if pj != nil {
+            try {
+              params_j = json.stringify(pj)
+            } catch e {
+              params_j = "[]"
+            }
+          }
+          try {
+            ret = s.ret
+          } catch e {
+            ret = ""
+          }
+          var tj = nil
+          try {
+            tj = s.throws_inferred
+          } catch e {
+            tj = nil
+          }
+          if tj != nil {
+            try {
+              throws_j = json.stringify(tj)
+            } catch e {
+              throws_j = "[]"
+            }
+          }
+          try {
+            doc = s.doc
+          } catch e {
+            doc = ""
+          }
+          db.exec(dbh,
+            "INSERT INTO signatures (pkg, version, kind, name, params, ret, throws, doc) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [full, m.version, kind, sname, params_j, ret, throws_j, doc])
+        }
+      }
+    }
+    for c in inferred {
+      var declared: Int = 0
+      for d in m.caps_declared {
+        if d == c {
+          declared = 1
+        }
+      }
+      db.exec(dbh,
+        "INSERT INTO capabilities (pkg, version, cap, declared, verified) VALUES (?, ?, ?, ?, ?)",
+        [full, m.version, c, declared, 1])
+    }
+    for i in irange(len(ex_names)) {
+      db.exec(dbh,
+        "INSERT INTO examples (pkg, version, name, passing, last_run_at) VALUES (?, ?, ?, ?, ?)",
+        [full, m.version, ex_names[i], ex_flags[i], now])
+    }
+    db.commit(dbh)
+  } catch e {
+    try {
+      db.rollback(dbh)
+    } catch e2 {
+    }
+    try {
+      process.run(["rm", "-f", cfg.data_dir + "/" + tb_rel])
+    } catch e3 {
+    }
+    try {
+      process.run(["rm", "-f", cfg.data_dir + "/" + blob_rel])
+    } catch e3 {
+    }
+    throw e
+  }
+
+  // best-effort scratch cleanup
+  try {
+    process.run(["rm", "-rf", tmp])
+  } catch e {
+  }
+
+  let resp_body = json.stringify({
+    package: full,
+    version: m.version,
+    sha256: got_sha,
+    tarball: cfg.registry_url + "/v1/tarballs/" + full + "/" + m.version,
+    capabilities: {declared: m.caps_declared, verified: inferred},
+    examples: {pass: ex_pass, total: len(ex_names)},
+    breaking_computed: breaking,
+    breaking_notes: diff_notes,
+    warnings: warnings,
+  })
+  return jresp(201, resp_body)
+}
+
+// ---------------- GET /v1/ ----------------
+fn handle_info(cfg: Cfg) -> Resp throws E300 {
+  return jresp(200, json.stringify({
+    name: "misa-registry",
+    api: "v1",
+    registry: cfg.registry_url,
+    docs: cfg.registry_url + "/v1",
+    note: "typed semantic search: GET /v1/search?q=fn(Text)->[Text]&kind=semantic",
+  }))
+}
+
+// ---------------- GET /v1/packages/:ns/:name ----------------
+fn handle_package(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
+  let prow = db.query(dbh,
+    "SELECT name, namespace, description, homepage, repository, claimed_by, deprecated_msg FROM packages WHERE name = ?",
+    [full])
+  if len(prow) == 0 {
+    rthrow("R404", "package not found: " + full)
+  }
+  let p = prow[0]
+  var ns: Text = ""
+  var description: Text = ""
+  var homepage: Text = ""
+  var repository: Text = ""
+  var deprecated: Text = ""
+  try {
+    ns = p.namespace
+  } catch e {
+    ns = ""
+  }
+  try {
+    description = p.description
+  } catch e {
+    description = ""
+  }
+  try {
+    homepage = p.homepage
+  } catch e {
+    homepage = ""
+  }
+  try {
+    repository = p.repository
+  } catch e {
+    repository = ""
+  }
+  try {
+    deprecated = p.deprecated_msg
+  } catch e {
+    deprecated = ""
+  }
+  if deprecated == nil {
+    deprecated = ""
+  }
+  var vs = []
+  let vrows = db.query(dbh,
+    "SELECT version, published_at, license, yanked, breaking_computed, caps_verified, examples_pass, examples_total FROM versions WHERE pkg = ? ORDER BY semver_key DESC",
+    [full])
+  for v in vrows {
+    var ver: Text = ""
+    var yanked: Int = 0
+    var pub_at: Int = 0
+    var lic: Text = ""
+    var brk: Text = "none"
+    var caps_j: Text = "[]"
+    var ex_p: Int = 0
+    var ex_t: Int = 0
+    try {
+      ver = v.version
+    } catch e {
+      ver = ""
+    }
+    try {
+      yanked = v.yanked
+    } catch e {
+      yanked = 0
+    }
+    try {
+      pub_at = v.published_at
+    } catch e {
+      pub_at = 0
+    }
+    try {
+      lic = v.license
+    } catch e {
+      lic = ""
+    }
+    try {
+      brk = v.breaking_computed
+    } catch e {
+      brk = "none"
+    }
+    try {
+      caps_j = v.caps_verified
+    } catch e {
+      caps_j = "[]"
+    }
+    try {
+      ex_p = v.examples_pass
+    } catch e {
+      ex_p = 0
+    }
+    try {
+      ex_t = v.examples_total
+    } catch e {
+      ex_t = 0
+    }
+    var caps = []
+    try {
+      caps = json.parse(caps_j)
+    } catch e {
+      caps = []
+    }
+    vs = vs + [{
+      version: ver,
+      yanked: yanked == 1,
+      published_at: pub_at,
+      license: lic,
+      breaking_computed: brk,
+      capabilities: caps,
+      examples: {pass: ex_p, total: ex_t},
+    }]
+  }
+  return jresp(200, json.stringify({
+    package: full,
+    namespace: ns,
+    description: description,
+    homepage: homepage,
+    repository: repository,
+    latest: latest_version(dbh, full),
+    deprecated: deprecated,
+    versions: vs,
+  }))
+}
+
+// latest non-yanked version, "" when none
+fn latest_version(dbh: Db, full: Text) -> Text throws E303 {
+  let rows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND yanked = 0 ORDER BY semver_key DESC LIMIT 1",
+    [full])
+  if len(rows) == 0 {
+    return ""
+  }
+  var v: Text = ""
+  try {
+    v = rows[0].version
+  } catch e {
+    v = ""
+  }
+  return v
+}
+
+// ---------------- GET /v1/packages/:ns/:name/:version ----------------
+fn handle_version(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
+  let vrows = db.query(dbh,
+    "SELECT pkg, version, sha256, tarball_path, published_at, publisher, license, yanked, yank_reason, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total FROM versions WHERE pkg = ? AND version = ?",
+    [full, version])
+  if len(vrows) == 0 {
+    rthrow("R404", "version not found: " + full + "@" + version)
+  }
+  let v = vrows[0]
+  var yanked: Int = 0
+  var yank_reason: Text = ""
+  var caps_d = []
+  var caps_v = []
+  var sigs = []
+  try {
+    yanked = v.yanked
+  } catch e {
+    yanked = 0
+  }
+  try {
+    yank_reason = v.yank_reason
+  } catch e {
+    yank_reason = ""
+  }
+  if yank_reason == nil {
+    yank_reason = ""
+  }
+  try {
+    caps_d = json.parse(v.caps_declared)
+  } catch e {
+    caps_d = []
+  }
+  try {
+    caps_v = json.parse(v.caps_verified)
+  } catch e {
+    caps_v = []
+  }
+  // throws surface: per-fn inferred throws
+  let srows = db.query(dbh,
+    "SELECT name, params, ret, throws FROM signatures WHERE pkg = ? AND version = ? AND kind = 'fn' ORDER BY name",
+    [full, version])
+  for s in srows {
+    var nm: Text = ""
+    var params_j: Text = "[]"
+    var ret: Text = ""
+    var throws_j: Text = "[]"
+    try {
+      nm = s.name
+    } catch e {
+      nm = ""
+    }
+    try {
+      params_j = s.params
+    } catch e {
+      params_j = "[]"
+    }
+    try {
+      ret = s.ret
+    } catch e {
+      ret = ""
+    }
+    try {
+      throws_j = s.throws
+    } catch e {
+      throws_j = "[]"
+    }
+    var ps: [Text] = []
+    try {
+      let plist = json.parse(params_j)
+      for q in plist {
+        var pn: Text = ""
+        var pt: Text = ""
+        try {
+          pn = q[0]
+        } catch e {
+          pn = ""
+        }
+        try {
+          pt = q[1]
+        } catch e {
+          pt = ""
+        }
+        ps = ps + [pn + ": " + pt]
+      }
+    } catch e {
+      ps = []
+    }
+    var th = []
+    try {
+      th = json.parse(throws_j)
+    } catch e {
+      th = []
+    }
+    sigs = sigs + [{
+      name: nm,
+      signature: nm + "(" + str.join(ps, ", ") + ") -> " + ret,
+      throws: th,
+    }]
+  }
+  let drows = db.query(dbh,
+    "SELECT dep, range, dev FROM dependencies WHERE pkg = ? AND version = ? ORDER BY dep",
+    [full, version])
+  var deps = []
+  for d in drows {
+    var dn: Text = ""
+    var dr: Text = ""
+    var dev: Int = 0
+    try {
+      dn = d.dep
+    } catch e {
+      dn = ""
+    }
+    try {
+      dr = d.range
+    } catch e {
+      dr = ""
+    }
+    try {
+      dev = d.dev
+    } catch e {
+      dev = 0
+    }
+    deps = deps + [{package: dn, range: dr, dev: dev == 1}]
+  }
+  var sha: Text = ""
+  var pub_at: Int = 0
+  var lic: Text = ""
+  var brk: Text = "none"
+  var ex_p: Int = 0
+  var ex_t: Int = 0
+  try {
+    sha = v.sha256
+  } catch e {
+    sha = ""
+  }
+  try {
+    pub_at = v.published_at
+  } catch e {
+    pub_at = 0
+  }
+  try {
+    lic = v.license
+  } catch e {
+    lic = ""
+  }
+  try {
+    brk = v.breaking_computed
+  } catch e {
+    brk = "none"
+  }
+  try {
+    ex_p = v.examples_pass
+  } catch e {
+    ex_p = 0
+  }
+  try {
+    ex_t = v.examples_total
+  } catch e {
+    ex_t = 0
+  }
+  return jresp(200, json.stringify({
+    package: full,
+    version: version,
+    sha256: sha,
+    tarball: cfg.registry_url + "/v1/tarballs/" + full + "/" + version,
+    published_at: pub_at,
+    license: lic,
+    yanked: yanked == 1,
+    yank_reason: yank_reason,
+    breaking_computed: brk,
+    capabilities: {declared: caps_d, verified: caps_v},
+    throws_surface: sigs,
+    dependencies: deps,
+    examples: {pass: ex_p, total: ex_t},
+  }))
+}
+
+// ---------------- GET /v1/packages/:ns/:name/:version/signatures ----------------
+fn handle_signatures(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
+  let vrows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND version = ?",
+    [full, version])
+  if len(vrows) == 0 {
+    rthrow("R404", "version not found: " + full + "@" + version)
+  }
+  let srows = db.query(dbh,
+    "SELECT kind, name, params, ret, throws, doc FROM signatures WHERE pkg = ? AND version = ? ORDER BY kind, name",
+    [full, version])
+  var out = []
+  for s in srows {
+    var kind: Text = ""
+    var nm: Text = ""
+    var params_j: Text = "[]"
+    var ret: Text = ""
+    var throws_j: Text = "[]"
+    var doc: Text = ""
+    try {
+      kind = s.kind
+    } catch e {
+      kind = ""
+    }
+    try {
+      nm = s.name
+    } catch e {
+      nm = ""
+    }
+    try {
+      params_j = s.params
+    } catch e {
+      params_j = "[]"
+    }
+    try {
+      ret = s.ret
+    } catch e {
+      ret = ""
+    }
+    try {
+      throws_j = s.throws
+    } catch e {
+      throws_j = "[]"
+    }
+    try {
+      doc = s.doc
+    } catch e {
+      doc = ""
+    }
+    var params = []
+    try {
+      params = json.parse(params_j)
+    } catch e {
+      params = []
+    }
+    var th = []
+    try {
+      th = json.parse(throws_j)
+    } catch e {
+      th = []
+    }
+    out = out + [{
+      kind: kind, name: nm, params: params, ret: ret,
+      throws: th, doc: doc,
+    }]
+  }
+  return jresp(200, json.stringify({
+    package: full, version: version, signatures: out,
+  }))
+}
+
+// ---------------- GET /v1/packages/:ns/:name/dependents ----------------
+fn handle_dependents(dbh: Db, cfg: Cfg, full: Text) -> Resp throws E300, E303 {
+  let prow = db.query(dbh, "SELECT name FROM packages WHERE name = ?",
+    [full])
+  if len(prow) == 0 {
+    rthrow("R404", "package not found: " + full)
+  }
+  let rows = db.query(dbh,
+    "SELECT d.pkg, d.version, d.range FROM dependencies d JOIN versions v ON v.pkg = d.pkg AND v.version = d.version WHERE d.dep = ? AND v.yanked = 0 ORDER BY d.pkg, d.version",
+    [full])
+  var out = []
+  for r in rows {
+    var p: Text = ""
+    var v: Text = ""
+    var rg: Text = ""
+    try {
+      p = r.pkg
+    } catch e {
+      p = ""
+    }
+    try {
+      v = r.version
+    } catch e {
+      v = ""
+    }
+    try {
+      rg = r.range
+    } catch e {
+      rg = ""
+    }
+    out = out + [{package: p, version: v, range: rg}]
+  }
+  return jresp(200, json.stringify({
+    package: full, dependents: out, count: len(out),
+  }))
+}
+
+// ---------------- GET /v1/packages/:ns/:name/downloads?range=30d ----------------
+fn handle_downloads(dbh: Db, cfg: Cfg, full: Text, req: Request) -> Resp throws E300, E303 {
+  let prow = db.query(dbh, "SELECT name FROM packages WHERE name = ?",
+    [full])
+  if len(prow) == 0 {
+    rthrow("R404", "package not found: " + full)
+  }
+  var range_s: Text = "30d"
+  try {
+    range_s = req.query["range"]
+  } catch e {
+    range_s = "30d"
+  }
+  var days: Int = 30
+  if ends_with_d(range_s) {
+    try {
+      days = int(str.slice(range_s, 0, len(range_s) - 1))
+    } catch e {
+      days = 30
+    }
+  }
+  if days <= 0 {
+    days = 30
+  }
+  if days > 365 {
+    days = 365
+  }
+  // sum per day over the window
+  let rows = db.query(dbh,
+    "SELECT day, SUM(count) AS c FROM downloads WHERE pkg = ? AND day >= date('now', ?) GROUP BY day ORDER BY day",
+    [full, "-" + str(days) + " days"])
+  var total: Int = 0
+  var byday = []
+  for r in rows {
+    var d: Text = ""
+    var c: Int = 0
+    try {
+      d = r.day
+    } catch e {
+      d = ""
+    }
+    try {
+      c = r.c
+    } catch e {
+      c = 0
+    }
+    total = total + c
+    byday = byday + [{day: d, count: c}]
+  }
+  return jresp(200, json.stringify({
+    package: full, range: str(days) + "d", total: total, days: byday,
+  }))
+}
+
+fn ends_with_d(s: Text) -> Bool throws E300 {
+  if len(s) < 1 {
+    return false
+  }
+  return str.slice(s, len(s) - 1, len(s)) == "d"
+}
+
+// ---------------- GET /v1/tarballs/:ns/:name/:version ----------------
+// v1 deviation from spec §8.2 (raw bytes): Misa response bodies are
+// UTF-8 Text only, so the tarball travels as base64 inside JSON.
+fn handle_tarball(dbh: Db, cfg: Cfg, full: Text, version: Text) -> Resp throws E300, E303 {
+  let vrows = db.query(dbh,
+    "SELECT sha256, tarball_path FROM versions WHERE pkg = ? AND version = ?",
+    [full, version])
+  if len(vrows) == 0 {
+    rthrow("R404", "version not found: " + full + "@" + version)
+  }
+  var sha: Text = ""
+  var tb_rel: Text = ""
+  try {
+    sha = vrows[0].sha256
+  } catch e {
+    sha = ""
+  }
+  try {
+    tb_rel = vrows[0].tarball_path
+  } catch e {
+    tb_rel = ""
+  }
+  let path = cfg.data_dir + "/" + tb_rel
+  // base64 via helper (binary never enters Misa Text)
+  let r = process.run(["python3", "-c",
+    "import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1],'rb').read()).decode('ascii'))",
+    path])
+  if r.code != 0 {
+    rthrow("R500", "tarball file missing for " + full + "@" + version)
+  }
+  // record the download (daily aggregate)
+  var day: Text = ""
+  try {
+    day = today_utc()
+  } catch e {
+    day = "1970-01-01"
+  }
+  db.exec(dbh,
+    "INSERT INTO downloads (pkg, version, day, count) VALUES (?, ?, ?, 1) ON CONFLICT (pkg, version, day) DO UPDATE SET count = count + 1",
+    [full, version, day])
+  return jresp(200, json.stringify({sha256: sha, tarball_b64: r.stdout}))
+}
+
+// ---------------- GET /v1/search (spec §6.1) ----------------
+// Typed query subset: fn(...) -> ..., throws E..., impl X, interface X,
+// capability:x, -capability:y, examples:passing, plain keywords.
+// Compiles to SQL over the signatures table; the structural fn-type
+// match is refined in Misa (type syntax is structural, not SQL-shaped).
+
+fn tokenize_q(q: Text) -> [Text] throws E300 {
+  var clean: Text = q
+  clean = str.replace(clean, "\t", " ")
+  clean = str.replace(clean, "\n", " ")
+  clean = str.replace(clean, "\r", " ")
+  var toks: [Text] = []
+  for t in str.split(clean, " ") {
+    let tt = str.trim(t)
+    if tt != "" {
+      toks = toks + [tt]
+    }
+  }
+  return toks
+}
+
+fn norm_ty(t: Text) -> Text throws E300 {
+  return str.replace(str.trim(t), " ", "")
+}
+
+fn like_esc(s: Text) -> Text throws E300 {
+  var o: Text = s
+  o = str.replace(o, "\\", "\\\\")
+  o = str.replace(o, "%", "\\%")
+  o = str.replace(o, "_", "\\_")
+  return o
+}
+
+// Returns the filter list as JSON text (dynamic values can't cross fn
+// boundaries except as Text).
+fn parse_filters(q: Text) -> Text throws E300 {
+  var filters = []
+  let toks = tokenize_q(q)
+  var i: Int = 0
+  while i < len(toks) {
+    let t = toks[i]
+    if str.starts_with(t, "fn(") {
+      // Reassemble across whitespace: `fn(Int, Int) -> Int` tokenizes
+      // with spaces inside the parens; join until the closing paren.
+      var ft: Text = t
+      while len(str.split(ft, ")")) < 2 and i + 1 < len(toks) {
+        i = i + 1
+        ft = ft + " " + toks[i]
+      }
+      let parts = str.split(ft, ")")
+      let pin = str.slice(parts[0], 3, len(parts[0]))
+      var params: [Text] = []
+      let ptr = str.trim(pin)
+      if ptr == "*" {
+        params = ["*"]
+      } else if ptr != "" {
+        for p in str.split(ptr, ",") {
+          params = params + [str.trim(p)]
+        }
+      }
+      var rest: Text = ""
+      if len(parts) > 1 {
+        rest = parts[1]
+      }
+      var ret: Text = "*"
+      if str.starts_with(rest, "->") {
+        ret = str.trim(str.slice(rest, 2, len(rest)))
+        i = i + 1
+      } else if i + 1 < len(toks) {
+        if toks[i + 1] == "->" {
+          if i + 2 < len(toks) {
+            ret = toks[i + 2]
+            i = i + 3
+          } else {
+            i = i + 2
+          }
+        } else {
+          i = i + 1
+        }
+      } else {
+        i = i + 1
+      }
+      filters = filters + [{t: "fn", params: params, ret: ret}]
+    } else if t == "throws" {
+      if i + 1 < len(toks) {
+        filters = filters + [{t: "throws", code: toks[i + 1]}]
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+    } else if t == "impl" {
+      if i + 1 < len(toks) {
+        filters = filters + [{t: "impl", name: toks[i + 1]}]
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+    } else if t == "interface" {
+      if i + 1 < len(toks) {
+        filters = filters + [{t: "interface", name: toks[i + 1]}]
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+    } else if str.starts_with(t, "-capability:") {
+      filters = filters + [{
+        t: "cap",
+        name: str.slice(t, 12, len(t)),
+        neg: true,
+      }]
+      i = i + 1
+    } else if str.starts_with(t, "capability:") {
+      filters = filters + [{
+        t: "cap",
+        name: str.slice(t, 11, len(t)),
+        neg: false,
+      }]
+      i = i + 1
+    } else if t == "examples:passing" {
+      filters = filters + [{t: "examples_passing"}]
+      i = i + 1
+    } else {
+      filters = filters + [{t: "kw", word: t}]
+      i = i + 1
+    }
+  }
+  return json.stringify(filters)
+}
+
+// Structural fn-type match: param count + per-position types ("*" = any).
+fn fn_matches(sig_params_j: Text, sig_ret: Text, fparams: [Text], fret: Text) -> Bool throws E300 {
+  var ptypes: [Text] = []
+  try {
+    let ps = json.parse(sig_params_j)
+    for p in ps {
+      var pt: Text = ""
+      try {
+        pt = p[1]
+      } catch e {
+        pt = ""
+      }
+      ptypes = ptypes + [norm_ty(pt)]
+    }
+  } catch e {
+    return false
+  }
+  if len(ptypes) != len(fparams) {
+    return false
+  }
+  for i in irange(len(ptypes)) {
+    if fparams[i] != "*" {
+      if ptypes[i] != norm_ty(fparams[i]) {
+        return false
+      }
+    }
+  }
+  if fret != "*" {
+    if norm_ty(sig_ret) != norm_ty(fret) {
+      return false
+    }
+  }
+  return true
+}
+
+fn latest_ver_subq(alias_pkg: Text) -> Text {
+  return "(SELECT v.version FROM versions v WHERE v.pkg = " + alias_pkg +
+    " AND v.yanked = 0 ORDER BY v.semver_key DESC LIMIT 1)"
+}
+
+fn handle_search(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  var q: Text = ""
+  try {
+    q = req.query["q"]
+  } catch e {
+    q = ""
+  }
+  var kind: Text = "keyword"
+  try {
+    kind = req.query["kind"]
+  } catch e {
+    kind = "keyword"
+  }
+  if kind != "semantic" {
+    kind = "keyword"
+  }
+  let filters = json.parse(parse_filters(q))
+  if kind == "keyword" {
+    return search_keyword(dbh, filters, q)
+  }
+  return search_semantic(dbh, filters, q)
+}
+
+fn search_keyword(dbh: Db, filters: Text, q: Text) -> Resp throws E300, E303 {
+  var sql = "SELECT DISTINCT p.name, p.description, v.version, v.caps_verified, v.examples_pass, v.examples_total FROM packages p " +
+    "JOIN versions v ON v.pkg = p.name " +
+    "LEFT JOIN signatures s ON s.pkg = p.name AND s.version = v.version " +
+    "WHERE v.version = " + latest_ver_subq("p.name")
+  for f in filters {
+    var w: Text = ""
+    try {
+      w = f.word
+    } catch e {
+      w = ""
+    }
+    if w != "" {
+      let pat = sql_quote("%" + like_esc(w) + "%")
+      sql = sql + " AND (p.name LIKE " + pat + " ESCAPE '\\' OR p.description LIKE " + pat + " ESCAPE '\\' OR s.name LIKE " + pat + " ESCAPE '\\')"
+    }
+  }
+  sql = sql + " ORDER BY p.name LIMIT 100"
+  let rows = db.query(dbh, sql, [])
+  var out = []
+  for r in rows {
+    var nm: Text = ""
+    var desc: Text = ""
+    var ver: Text = ""
+    var caps_j: Text = "[]"
+    var ex_p: Int = 0
+    var ex_t: Int = 0
+    try {
+      nm = r.name
+    } catch e {
+      nm = ""
+    }
+    try {
+      desc = r.description
+    } catch e {
+      desc = ""
+    }
+    try {
+      ver = r.version
+    } catch e {
+      ver = ""
+    }
+    try {
+      caps_j = r.caps_verified
+    } catch e {
+      caps_j = "[]"
+    }
+    try {
+      ex_p = r.examples_pass
+    } catch e {
+      ex_p = 0
+    }
+    try {
+      ex_t = r.examples_total
+    } catch e {
+      ex_t = 0
+    }
+    var caps = []
+    try {
+      caps = json.parse(caps_j)
+    } catch e {
+      caps = []
+    }
+    out = out + [{
+      package: nm,
+      version: ver,
+      description: desc,
+      capabilities: caps,
+      examples: {pass: ex_p, total: ex_t},
+      matched: [],
+    }]
+  }
+  return jresp(200, json.stringify({query: q, kind: "keyword", results: out}))
+}
+
+fn search_semantic(dbh: Db, filters: Text, q: Text) -> Resp throws E300, E303 {
+  var sql = "SELECT s.pkg, s.version, s.kind, s.name, s.params, s.ret, s.throws, s.doc, p.description " +
+    "FROM signatures s JOIN packages p ON p.name = s.pkg " +
+    "WHERE s.version = " + latest_ver_subq("s.pkg")
+  var fn_params: [Text] = []
+  var fn_ret: Text = "*"
+  var has_fn: Bool = false
+  for f in filters {
+    var t: Text = ""
+    try {
+      t = f.t
+    } catch e {
+      t = ""
+    }
+    if t == "fn" {
+      sql = sql + " AND s.kind = 'fn'"
+      has_fn = true
+      try {
+        fn_params = []
+        for p in f.params {
+          var ps: Text = ""
+          try {
+            ps = p
+          } catch e {
+            ps = "*"
+          }
+          fn_params = fn_params + [ps]
+        }
+      } catch e {
+        fn_params = []
+      }
+      try {
+        fn_ret = f.ret
+      } catch e {
+        fn_ret = "*"
+      }
+    } else if t == "throws" {
+      var code: Text = ""
+      try {
+        code = f.code
+      } catch e {
+        code = ""
+      }
+      sql = sql + " AND s.throws LIKE " + sql_quote("%\"" + code + "\"%")
+    } else if t == "impl" {
+      var nm: Text = ""
+      try {
+        nm = f.name
+      } catch e {
+        nm = ""
+      }
+      sql = sql + " AND s.kind = 'impl' AND s.name = " + sql_quote(nm)
+    } else if t == "interface" {
+      var nm: Text = ""
+      try {
+        nm = f.name
+      } catch e {
+        nm = ""
+      }
+      sql = sql + " AND s.kind = 'interface' AND s.name = " + sql_quote(nm)
+    } else if t == "cap" {
+      var cn: Text = ""
+      var neg: Bool = false
+      try {
+        cn = f.name
+      } catch e {
+        cn = ""
+      }
+      try {
+        neg = f.neg == true
+      } catch e {
+        neg = false
+      }
+      let ex = "EXISTS (SELECT 1 FROM capabilities c WHERE c.pkg = s.pkg AND c.version = s.version AND c.cap = " +
+        sql_quote(cn) + " AND c.verified = 1)"
+      if neg {
+        sql = sql + " AND NOT " + ex
+      } else {
+        sql = sql + " AND " + ex
+      }
+    } else if t == "examples_passing" {
+      sql = sql + " AND EXISTS (SELECT 1 FROM versions v WHERE v.pkg = s.pkg AND v.version = s.version AND v.examples_total > 0 AND v.examples_pass = v.examples_total)"
+    } else if t == "kw" {
+      var w: Text = ""
+      try {
+        w = f.word
+      } catch e {
+        w = ""
+      }
+      if w != "" {
+        let pat = sql_quote("%" + like_esc(w) + "%")
+        sql = sql + " AND (p.name LIKE " + pat + " ESCAPE '\\' OR p.description LIKE " + pat + " ESCAPE '\\' OR s.name LIKE " + pat + " ESCAPE '\\')"
+      }
+    }
+  }
+  sql = sql + " ORDER BY s.pkg, s.kind, s.name LIMIT 200"
+  let rows = db.query(dbh, sql, [])
+  // group by package, applying the structural fn-type filter in Misa
+  var out = []
+  var cur_pkg: Text = ""
+  var cur_ver: Text = ""
+  var cur_desc: Text = ""
+  var cur_matched = []
+  for r in rows {
+    var pkg: Text = ""
+    var ver: Text = ""
+    var kind: Text = ""
+    var nm: Text = ""
+    var params_j: Text = "[]"
+    var ret: Text = ""
+    var throws_j: Text = "[]"
+    var doc: Text = ""
+    var desc: Text = ""
+    try {
+      pkg = r.pkg
+    } catch e {
+      pkg = ""
+    }
+    try {
+      ver = r.version
+    } catch e {
+      ver = ""
+    }
+    try {
+      kind = r.kind
+    } catch e {
+      kind = ""
+    }
+    try {
+      nm = r.name
+    } catch e {
+      nm = ""
+    }
+    try {
+      params_j = r.params
+    } catch e {
+      params_j = "[]"
+    }
+    try {
+      ret = r.ret
+    } catch e {
+      ret = ""
+    }
+    try {
+      throws_j = r.throws
+    } catch e {
+      throws_j = "[]"
+    }
+    try {
+      doc = r.doc
+    } catch e {
+      doc = ""
+    }
+    try {
+      desc = r.description
+    } catch e {
+      desc = ""
+    }
+    var keep: Bool = true
+    if has_fn {
+      if kind != "fn" {
+        keep = false
+      } else if not fn_matches(params_j, ret, fn_params, fn_ret) {
+        keep = false
+      }
+    }
+    if keep {
+      if pkg != cur_pkg {
+        if cur_pkg != "" {
+          out = out + [{
+            package: cur_pkg,
+            version: cur_ver,
+            description: cur_desc,
+            matched: cur_matched,
+          }]
+        }
+        cur_pkg = pkg
+        cur_ver = ver
+        cur_desc = desc
+        cur_matched = []
+      }
+      var th = []
+      try {
+        th = json.parse(throws_j)
+      } catch e {
+        th = []
+      }
+      var ps: [Text] = []
+      try {
+        let plist = json.parse(params_j)
+        for qq in plist {
+          var pn: Text = ""
+          var pt: Text = ""
+          try {
+            pn = qq[0]
+          } catch e {
+            pn = ""
+          }
+          try {
+            pt = qq[1]
+          } catch e {
+            pt = ""
+          }
+          ps = ps + [pn + ": " + pt]
+        }
+      } catch e {
+        ps = []
+      }
+      cur_matched = cur_matched + [{
+        kind: kind,
+        name: nm,
+        signature: nm + "(" + str.join(ps, ", ") + ") -> " + ret,
+        throws: th,
+      }]
+    }
+  }
+  if cur_pkg != "" {
+    out = out + [{
+      package: cur_pkg,
+      version: cur_ver,
+      description: cur_desc,
+      matched: cur_matched,
+    }]
+  }
+  return jresp(200, json.stringify({query: q, kind: "semantic", results: out}))
+}
+
+// ---------------- POST /v1/yank ----------------
+fn handle_yank(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var full: Text = ""
+  var version: Text = ""
+  var reason: Text = ""
+  try {
+    full = body.pkg
+  } catch e {
+    rthrow("R400", "body.pkg is required")
+  }
+  try {
+    version = body.version
+  } catch e {
+    rthrow("R400", "body.version is required")
+  }
+  try {
+    reason = body.reason
+  } catch e {
+    rthrow("R400", "body.reason is required")
+  }
+  if reason == "" {
+    rthrow("R400", "body.reason must not be empty")
+  }
+  let ns = namespace_of(full)
+  need_scope(a, "yank:" + ns + "/*")
+  let vrows = db.query(dbh,
+    "SELECT version FROM versions WHERE pkg = ? AND version = ?",
+    [full, version])
+  if len(vrows) == 0 {
+    rthrow("R404", "version not found: " + full + "@" + version)
+  }
+  db.exec(dbh, "UPDATE versions SET yanked = 1, yank_reason = ? WHERE pkg = ? AND version = ?",
+    [reason, full, version])
+  // blast radius: dependents on this package (spec §7.3)
+  let drows = db.query(dbh,
+    "SELECT COUNT(*) AS c FROM dependencies d JOIN versions v ON v.pkg = d.pkg AND v.version = d.version WHERE d.dep = ? AND v.yanked = 0",
+    [full])
+  var affected: Int = 0
+  if len(drows) > 0 {
+    try {
+      affected = drows[0].c
+    } catch e {
+      affected = 0
+    }
+  }
+  return jresp(200, json.stringify({
+    package: full,
+    version: version,
+    yanked: true,
+    reason: reason,
+    note: "yanked versions stay installable from existing lockfiles",
+    dependents_affected: affected,
+  }))
+}
+
+// ---------------- POST /v1/deprecate ----------------
+fn handle_deprecate(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var full: Text = ""
+  var message: Text = ""
+  try {
+    full = body.pkg
+  } catch e {
+    rthrow("R400", "body.pkg is required")
+  }
+  try {
+    message = body.message
+  } catch e {
+    rthrow("R400", "body.message is required")
+  }
+  let ns = namespace_of(full)
+  need_scope(a, "publish:" + ns + "/*")
+  let prow = db.query(dbh, "SELECT name FROM packages WHERE name = ?",
+    [full])
+  if len(prow) == 0 {
+    rthrow("R404", "package not found: " + full)
+  }
+  db.exec(dbh, "UPDATE packages SET deprecated_msg = ? WHERE name = ?",
+    [message, full])
+  return jresp(200, json.stringify({
+    package: full, deprecated: true, message: message,
+  }))
+}
+
+// ---------------- POST /v1/namespace/claim ----------------
+// First-claim wins (§2). Recorded as a sentinel packages row whose name
+// is the namespace itself (never a valid package name, so it can't
+// collide with real packages).
+fn handle_claim(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var ns: Text = ""
+  try {
+    ns = body.namespace
+  } catch e {
+    rthrow("R400", "body.namespace is required")
+  }
+  if not valid_namespace(ns) {
+    rthrow("R422", "bad namespace: want @name, got: " + ns)
+  }
+  let rows = db.query(dbh,
+    "SELECT name, claimed_by FROM packages WHERE namespace = ?", [ns])
+  for r in rows {
+    var cb: Text = ""
+    try {
+      cb = r.claimed_by
+    } catch e {
+      cb = ""
+    }
+    if cb != "" {
+      if cb == a.publisher {
+        return jresp(200, json.stringify({
+          namespace: ns, claimed: true, by: cb,
+          note: "already claimed by you",
+        }))
+      }
+      rthrow("R409", "namespace " + ns + " is already claimed")
+    }
+  }
+  db.exec(dbh,
+    "INSERT INTO packages (name, namespace, description, claimed_by, claimed_at) VALUES (?, ?, '', ?, ?)",
+    [ns + "/", ns, a.publisher, now_s()])
+  return jresp(201, json.stringify({
+    namespace: ns, claimed: true, by: a.publisher,
+  }))
+}
+
+// ---------------- POST /v1/report (no auth, rate-limited) ----------------
+fn handle_report(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var full: Text = ""
+  var version: Text = ""
+  var reason: Text = ""
+  try {
+    full = body.pkg
+  } catch e {
+    rthrow("R400", "body.pkg is required")
+  }
+  try {
+    version = body.version
+  } catch e {
+    version = ""
+  }
+  if version == nil {
+    version = ""
+  }
+  try {
+    reason = body.reason
+  } catch e {
+    rthrow("R400", "body.reason is required")
+  }
+  if reason == "" {
+    rthrow("R400", "body.reason must not be empty")
+  }
+  let id = "r_" + str.slice(crypto.sha256(
+    str(now_s()) + full + version + reason), 0, 16)
+  db.exec(dbh,
+    "INSERT INTO reports (id, pkg, version, reason, state, created_at) VALUES (?, ?, ?, ?, 'open', ?)",
+    [id, full, version, reason, now_s()])
+  return jresp(201, json.stringify({
+    id: id, state: "open",
+    note: "thank you — moderators triage reports in the open",
+  }))
+}
+
+// ---------------- GET /v1/advisories ----------------
+fn handle_advisories(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  var pkg: Text = ""
+  try {
+    pkg = req.query["package"]
+  } catch e {
+    pkg = ""
+  }
+  var sql: Text = "SELECT id, pkg, affected, fixed_in, severity, summary, published_at, state FROM advisories"
+  var args: [Text] = []
+  if pkg != "" {
+    sql = sql + " WHERE pkg = ?"
+    args = [pkg]
+  }
+  sql = sql + " ORDER BY published_at DESC LIMIT 200"
+  let rows = db.query(dbh, sql, args)
+  var out = []
+  for r in rows {
+    var id: Text = ""
+    var p: Text = ""
+    var aff: Text = ""
+    var fix: Text = ""
+    var sev: Text = ""
+    var sum: Text = ""
+    var pat: Int = 0
+    var state: Text = ""
+    try {
+      id = r.id
+    } catch e {
+      id = ""
+    }
+    try {
+      p = r.pkg
+    } catch e {
+      p = ""
+    }
+    try {
+      aff = r.affected
+    } catch e {
+      aff = ""
+    }
+    try {
+      fix = r.fixed_in
+    } catch e {
+      fix = ""
+    }
+    if fix == nil {
+      fix = ""
+    }
+    try {
+      sev = r.severity
+    } catch e {
+      sev = ""
+    }
+    try {
+      sum = r.summary
+    } catch e {
+      sum = ""
+    }
+    try {
+      pat = r.published_at
+    } catch e {
+      pat = 0
+    }
+    try {
+      state = r.state
+    } catch e {
+      state = ""
+    }
+    out = out + [{
+      id: id, package: p, affected: aff, fixed_in: fix,
+      severity: sev, summary: sum, published_at: pat, state: state,
+    }]
+  }
+  return jresp(200, json.stringify({advisories: out}))
+}
+
+// ---------------- POST /v1/advisories (admin: curation) ----------------
+fn handle_advisory_create(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  need_scope(a, "admin:*")
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var full: Text = ""
+  var affected: Text = ""
+  var severity: Text = ""
+  var summary: Text = ""
+  var fixed_in: Text = ""
+  try {
+    full = body.pkg
+  } catch e {
+    rthrow("R400", "body.pkg is required")
+  }
+  try {
+    affected = body.affected
+  } catch e {
+    rthrow("R400", "body.affected is required (e.g. <1.2.0)")
+  }
+  try {
+    severity = body.severity
+  } catch e {
+    rthrow("R400", "body.severity is required")
+  }
+  try {
+    summary = body.summary
+  } catch e {
+    rthrow("R400", "body.summary is required")
+  }
+  try {
+    fixed_in = body.fixed_in
+  } catch e {
+    fixed_in = ""
+  }
+  if fixed_in == nil {
+    fixed_in = ""
+  }
+  let id = "GHSA-" + str.slice(crypto.sha256(
+    full + affected + summary + str(now_s())), 0, 12)
+  db.exec(dbh,
+    "INSERT INTO advisories (id, pkg, affected, fixed_in, severity, summary, published_at, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'published')",
+    [id, full, affected, fixed_in, severity, summary, now_s()])
+  return jresp(201, json.stringify({id: id, state: "published"}))
+}
+
+// ---------------- GET /v1/admin/backup (admin token only) ----------------
+// Full SQLite dump as SQL text (db.* has no backup API, so the dump is
+// computed: sqlite_master DDL + INSERTs, §8.2 task note).
+// Row access uses static field selection per table: JSON/dict values do
+// not support dynamic o[k] indexing, so the column lists are explicit.
+fn handle_backup(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  need_scope(a, "admin:*")
+  var out: Text = "-- misa-registry backup\n"
+  out = out + "-- registry: " + cfg.registry_url + "\n"
+  try {
+    out = out + "-- at: " + time.format(now_s(), "%Y-%m-%dT%H:%M:%SZ") + "\n"
+  } catch e {
+    out = out + "-- at: " + str(now_s()) + "\n"
+  }
+  out = out + "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n"
+  let tables = db.query(dbh,
+    "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    [])
+  for t in tables {
+    var tname: Text = ""
+    var dddl: Text = ""
+    try {
+      tname = t.name
+    } catch e {
+      tname = ""
+    }
+    try {
+      dddl = t.sql
+    } catch e {
+      dddl = ""
+    }
+    if tname != "" {
+      if dddl != "" {
+        out = out + dddl + ";\n"
+      }
+      out = out + dump_table(dbh, tname)
+    }
+  }
+  out = out + "COMMIT;\n"
+  return text_resp(200, "application/sql", out)
+}
+
+fn dump_table(dbh: Db, tname: Text) -> Text throws E300, E303 {
+  var out: Text = ""
+  if tname == "packages" {
+    let rows = db.query(dbh,
+      "SELECT name, namespace, description, homepage, repository, claimed_by, claimed_at, deprecated_msg FROM packages ORDER BY name",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"packages\" VALUES (" +
+        sql_val(r.name, "TEXT") + ", " + sql_val(r.namespace, "TEXT") +
+        ", " + sql_val(r.description, "TEXT") + ", " +
+        sql_val(r.homepage, "TEXT") + ", " +
+        sql_val(r.repository, "TEXT") + ", " +
+        sql_val(r.claimed_by, "TEXT") + ", " +
+        sql_val(r.claimed_at, "INTEGER") + ", " +
+        sql_val(r.deprecated_msg, "TEXT") + ");\n"
+    }
+  } else if tname == "versions" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, semver_key, sha256, tarball_path, published_at, publisher, license, yanked, yank_reason, breaking_computed, caps_declared, caps_verified, examples_pass, examples_total FROM versions ORDER BY pkg, semver_key",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"versions\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.semver_key, "INTEGER") + ", " +
+        sql_val(r.sha256, "TEXT") + ", " +
+        sql_val(r.tarball_path, "TEXT") + ", " +
+        sql_val(r.published_at, "INTEGER") + ", " +
+        sql_val(r.publisher, "TEXT") + ", " + sql_val(r.license, "TEXT") +
+        ", " + sql_val(r.yanked, "INTEGER") + ", " +
+        sql_val(r.yank_reason, "TEXT") + ", " +
+        sql_val(r.breaking_computed, "TEXT") + ", " +
+        sql_val(r.caps_declared, "TEXT") + ", " +
+        sql_val(r.caps_verified, "TEXT") + ", " +
+        sql_val(r.examples_pass, "INTEGER") + ", " +
+        sql_val(r.examples_total, "INTEGER") + ");\n"
+    }
+  } else if tname == "dependencies" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, dep, range, dev FROM dependencies ORDER BY pkg, version, dep",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"dependencies\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.dep, "TEXT") + ", " + sql_val(r.range, "TEXT") + ", " +
+        sql_val(r.dev, "INTEGER") + ");\n"
+    }
+  } else if tname == "signatures" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, kind, name, params, ret, throws, doc FROM signatures ORDER BY pkg, version, kind, name",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"signatures\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.kind, "TEXT") + ", " + sql_val(r.name, "TEXT") + ", " +
+        sql_val(r.params, "TEXT") + ", " + sql_val(r.ret, "TEXT") + ", " +
+        sql_val(r.throws, "TEXT") + ", " + sql_val(r.doc, "TEXT") + ");\n"
+    }
+  } else if tname == "capabilities" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, cap, declared, verified FROM capabilities ORDER BY pkg, version, cap",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"capabilities\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.cap, "TEXT") + ", " + sql_val(r.declared, "INTEGER") +
+        ", " + sql_val(r.verified, "INTEGER") + ");\n"
+    }
+  } else if tname == "examples" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, name, passing, last_run_at FROM examples ORDER BY pkg, version, name",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"examples\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.name, "TEXT") + ", " +
+        sql_val(r.passing, "INTEGER") + ", " +
+        sql_val(r.last_run_at, "INTEGER") + ");\n"
+    }
+  } else if tname == "downloads" {
+    let rows = db.query(dbh,
+      "SELECT pkg, version, day, count FROM downloads ORDER BY pkg, version, day",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"downloads\" VALUES (" +
+        sql_val(r.pkg, "TEXT") + ", " + sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.day, "TEXT") + ", " + sql_val(r.count, "INTEGER") +
+        ");\n"
+    }
+  } else if tname == "advisories" {
+    let rows = db.query(dbh,
+      "SELECT id, pkg, affected, fixed_in, severity, summary, published_at, state FROM advisories ORDER BY published_at",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"advisories\" VALUES (" +
+        sql_val(r.id, "TEXT") + ", " + sql_val(r.pkg, "TEXT") + ", " +
+        sql_val(r.affected, "TEXT") + ", " +
+        sql_val(r.fixed_in, "TEXT") + ", " +
+        sql_val(r.severity, "TEXT") + ", " +
+        sql_val(r.summary, "TEXT") + ", " +
+        sql_val(r.published_at, "INTEGER") + ", " +
+        sql_val(r.state, "TEXT") + ");\n"
+    }
+  } else if tname == "publishers" {
+    let rows = db.query(dbh,
+      "SELECT id, handle, created_at, pubkey FROM publishers ORDER BY id",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"publishers\" VALUES (" +
+        sql_val(r.id, "TEXT") + ", " + sql_val(r.handle, "TEXT") + ", " +
+        sql_val(r.created_at, "INTEGER") + ", " +
+        sql_val(r.pubkey, "TEXT") + ");\n"
+    }
+  } else if tname == "tokens" {
+    let rows = db.query(dbh,
+      "SELECT token_sha, publisher_id, scopes, created_at, expires_at, revoked FROM tokens ORDER BY created_at",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"tokens\" VALUES (" +
+        sql_val(r.token_sha, "TEXT") + ", " +
+        sql_val(r.publisher_id, "TEXT") + ", " +
+        sql_val(r.scopes, "TEXT") + ", " +
+        sql_val(r.created_at, "INTEGER") + ", " +
+        sql_val(r.expires_at, "INTEGER") + ", " +
+        sql_val(r.revoked, "INTEGER") + ");\n"
+    }
+  } else if tname == "reports" {
+    let rows = db.query(dbh,
+      "SELECT id, pkg, version, reason, state, created_at FROM reports ORDER BY created_at",
+      [])
+    for r in rows {
+      out = out + "INSERT INTO \"reports\" VALUES (" +
+        sql_val(r.id, "TEXT") + ", " + sql_val(r.pkg, "TEXT") + ", " +
+        sql_val(r.version, "TEXT") + ", " +
+        sql_val(r.reason, "TEXT") + ", " + sql_val(r.state, "TEXT") +
+        ", " + sql_val(r.created_at, "INTEGER") + ");\n"
+    }
+  } else {
+    out = out + "-- unknown table skipped: " + tname + "\n"
+  }
+  return out
+}
+
+// Render one SQLite value for the dump, guided by the declared column
+// type (INTEGER -> bare, else quoted text; nil -> NULL).
+// (v typed Text: unknown DB values flow into any param type; nil is
+// checked explicitly before any text operation.)
+fn sql_val(v: Text, ctype: Text) -> Text {
+  if v == nil {
+    return "NULL"
+  }
+  if str.to_upper(ctype) == "INTEGER" {
+    // v holds an Int at runtime here (nil handled above)
+    return str(v)
+  }
+  return sql_quote(v)
+}
+
+// ---------------- POST /v1/admin/tokens (admin: mint scoped tokens) ----------------
+// Returns the raw token ONCE; the server stores only its sha256.
+fn handle_mint_token(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  need_scope(a, "admin:*")
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var scopes_j: Text = "[]"
+  try {
+    scopes_j = json.stringify(body.scopes)
+  } catch e {
+    rthrow("R400", "body.scopes is required (list of scope strings)")
+  }
+  var handle: Text = ""
+  try {
+    handle = body.handle
+  } catch e {
+    handle = ""
+  }
+  if handle == nil {
+    handle = ""
+  }
+  // validate scope shapes: "verb:pattern"
+  var scopes: [Text] = []
+  try {
+    let sl = json.parse(scopes_j)
+    for s in sl {
+      var ss: Text = ""
+      try {
+        ss = s
+      } catch e {
+        ss = ""
+      }
+      let parts = str.split(ss, ":")
+      if len(parts) != 2 {
+        rthrow("R422", "bad scope (want verb:pattern): " + ss)
+      }
+      scopes = scopes + [ss]
+    }
+  } catch e {
+    if str.starts_with(e.code, "R") {
+      throw e
+    }
+    rthrow("R400", "body.scopes must be a list of strings")
+  }
+  if len(scopes) == 0 {
+    rthrow("R400", "body.scopes must not be empty")
+  }
+  // secure random token (never logged; only sha256 is stored)
+  let gr = process.run(["python3", "-c",
+    "import secrets; print(secrets.token_hex(32))"])
+  if gr.code != 0 {
+    rthrow("R500", "token generation failed")
+  }
+  let token: Text = str.trim(gr.stdout)
+  let sha: Text = crypto.sha256(token)
+  let pub_id = "pub_" + str.slice(sha, 0, 12)
+  let now = now_s()
+  var pub_handle: Text = handle
+  if pub_handle == "" {
+    pub_handle = "token-" + str.slice(sha, 0, 8)
+  }
+  db.exec(dbh,
+    "INSERT INTO publishers (id, handle, created_at) VALUES (?, ?, ?)",
+    [pub_id, pub_handle, now])
+  db.exec(dbh,
+    "INSERT INTO tokens (token_sha, publisher_id, scopes, created_at, expires_at, revoked) VALUES (?, ?, ?, ?, ?, 0)",
+    [sha, pub_id, scopes_j, now, now + 365 * 86400])
+  return jresp(201, json.stringify({
+    token: token,
+    publisher: pub_id,
+    scopes: scopes,
+    expires_at: now + 365 * 86400,
+    warning: "this token is shown once; the server stores only its sha256",
+  }))
+}
+
+// ---------------- POST /v1/tokens/revoke ----------------
+// Revokes a token by its sha256. The caller must present a Bearer <redacted>
+// and may revoke only its own token, unless it holds admin:*.
+// (Client-defined endpoint for `misa pkg logout --revoke`; the spec has
+// no revoke endpoint.)
+fn handle_revoke_token(dbh: Db, cfg: Cfg, req: Request) -> Resp throws E300, E303 {
+  let a = need_auth(dbh, req)
+  var body = nil
+  try {
+    body = json.parse(req.body)
+  } catch e {
+    rthrow("R400", "invalid JSON body")
+  }
+  var sha: Text = ""
+  try {
+    sha = body.token_sha256
+  } catch e {
+    sha = ""
+  }
+  if sha == nil or sha == "" {
+    rthrow("R400", "body.token_sha256 is required")
+  }
+  let rows = db.query(dbh,
+    "SELECT publisher_id FROM tokens WHERE token_sha = ? AND revoked = 0",
+    [sha])
+  if len(rows) == 0 {
+    rthrow("R404", "token not found or already revoked")
+  }
+  var owner: Text = ""
+  try {
+    owner = rows[0].publisher_id
+  } catch e {
+    owner = ""
+  }
+  if owner != a.publisher {
+    // Only the token owner or an admin may revoke it.
+    need_scope(a, "admin:*")
+  }
+  db.exec(dbh, "UPDATE tokens SET revoked = 1 WHERE token_sha = ?", [sha])
+  return jresp(200, json.stringify({revoked: true}))
+}
+
+// ---------------- router ----------------
+
+fn strip_tar_gz(v: Text) -> Text throws E300 {
+  let suf: Text = ".tar.gz"
+  if len(v) >= len(suf) {
+    if str.slice(v, len(v) - len(suf), len(v)) == suf {
+      return str.slice(v, 0, len(v) - len(suf))
+    }
+  }
+  return v
+}
+
+fn route(req: Request, dbh: Db, cfg: Cfg, st: Map<Text, Text>) -> Resp throws E300, E303 {
+  let a = authenticate(dbh, req)
+  check_rate(req, st, a)
+  var segs = str.split(req.path, "/")
+  // tolerate one trailing slash
+  if len(segs) > 1 {
+    if segs[len(segs) - 1] == "" {
+      segs = str.split(str.slice(req.path, 0, len(req.path) - 1), "/")
+    }
+  }
+  let n = len(segs)
+  let method = req.method
+  if method == "GET" {
+    if n == 2 and segs[1] == "v1" {
+      return handle_info(cfg)
+    }
+    if n == 3 and segs[1] == "v1" {
+      if segs[2] == "search" {
+        return handle_search(dbh, cfg, req)
+      }
+      if segs[2] == "advisories" {
+        return handle_advisories(dbh, cfg, req)
+      }
+    }
+    if n == 4 and segs[1] == "v1" and segs[2] == "admin" {
+      if segs[3] == "backup" {
+        return handle_backup(dbh, cfg, req)
+      }
+    }
+    if n == 5 and segs[1] == "v1" and segs[2] == "packages" {
+      let full = segs[3] + "/" + segs[4]
+      return handle_package(dbh, cfg, full)
+    }
+    if n == 6 and segs[1] == "v1" {
+      if segs[2] == "packages" {
+        let full = segs[3] + "/" + segs[4]
+        if segs[5] == "dependents" {
+          return handle_dependents(dbh, cfg, full)
+        }
+        if segs[5] == "downloads" {
+          return handle_downloads(dbh, cfg, full, req)
+        }
+        return handle_version(dbh, cfg, full, segs[5])
+      }
+      if segs[2] == "tarballs" {
+        let full = segs[3] + "/" + segs[4]
+        return handle_tarball(dbh, cfg, full, strip_tar_gz(segs[5]))
+      }
+    }
+    if n == 7 and segs[1] == "v1" and segs[2] == "packages" {
+      if segs[6] == "signatures" {
+        let full = segs[3] + "/" + segs[4]
+        return handle_signatures(dbh, cfg, full, segs[5])
+      }
+    }
+    rthrow("R404", "not found: " + method + " " + req.path)
+  }
+  if method == "POST" {
+    if n == 3 and segs[1] == "v1" {
+      if segs[2] == "publish" {
+        return handle_publish(dbh, cfg, st, req)
+      }
+      if segs[2] == "yank" {
+        return handle_yank(dbh, cfg, req)
+      }
+      if segs[2] == "deprecate" {
+        return handle_deprecate(dbh, cfg, req)
+      }
+      if segs[2] == "report" {
+        return handle_report(dbh, cfg, req)
+      }
+      if segs[2] == "advisories" {
+        return handle_advisory_create(dbh, cfg, req)
+      }
+    }
+    if n == 4 and segs[1] == "v1" {
+      if segs[2] == "tokens" and segs[3] == "revoke" {
+        return handle_revoke_token(dbh, cfg, req)
+      }
+      if segs[2] == "namespace" and segs[3] == "claim" {
+        return handle_claim(dbh, cfg, req)
+      }
+      if segs[2] == "admin" and segs[3] == "tokens" {
+        return handle_mint_token(dbh, cfg, req)
+      }
+    }
+    rthrow("R404", "not found: " + method + " " + req.path)
+  }
+  return err_resp(405, "R405", "method not allowed: " + method)
+}
+
+// ---------------- boot ----------------
+
+fn ensure_admin_token(dbh: Db, cfg: Cfg) throws E300, E303 {
+  if cfg.admin_token == "" {
+    return
+  }
+  let sha = crypto.sha256(cfg.admin_token)
+  let prow = db.query(dbh, "SELECT id FROM publishers WHERE id = 'admin'",
+    [])
+  if len(prow) == 0 {
+    db.exec(dbh,
+      "INSERT INTO publishers (id, handle, created_at) VALUES ('admin', 'admin', ?)",
+      [now_s()])
+  }
+  let trow = db.query(dbh,
+    "SELECT token_sha FROM tokens WHERE token_sha = ?", [sha])
+  if len(trow) == 0 {
+    let now = now_s()
+    db.exec(dbh,
+      "INSERT INTO tokens (token_sha, publisher_id, scopes, created_at, expires_at, revoked) VALUES (?, 'admin', ?, ?, ?, 0)",
+      [sha, r"""["admin:*"]""", now, now + 365 * 86400])
+    print("admin token ensured from REGISTRY_ADMIN_TOKEN")
+  }
+}
+
+fn main() throws E300, E303, E304 {
+  let cfg = load_cfg()
+  let mk = process.run(["mkdir", "-p", cfg.data_dir])
+  if mk.code != 0 {
+    print("fatal: cannot create data dir: " + cfg.data_dir)
+    return
+  }
+  let dbh = db.open(cfg.data_dir + "/registry.db")
+  init_schema(dbh)
+  ensure_admin_token(dbh, cfg)
+  var st: Map<Text, Text> = {}
+  print("misa-registry v1 listening on :" + str(cfg.port))
+  print("data dir: " + cfg.data_dir)
+  print("registry url: " + cfg.registry_url)
+  http.serve(cfg.port, |req: Request| {
+    try {
+      return route(req, dbh, cfg, st)
+    } catch e {
+      let status = status_for(e.code)
+      var body: Text = ""
+      try {
+        body = jerr(e.code, e.message)
+      } catch e2 {
+        body = r"""{"error":{"code":"R500","message":"internal error"}}"""
+      }
+      let r: Resp = {
+        status: status,
+        headers: {"Content-Type": "application/json"},
+        body: body,
+      }
+      return r
+    }
+  })
+  db.close(dbh)
+}
+
+main()

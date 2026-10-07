@@ -42,7 +42,7 @@ build speed vs cargo-with-deps. Full matrix in `bench/GAPS-language.md`.
 
 | # | Lag | Honest size | What it requires |
 |---|---|---|---|
-| 1 | **Ecosystem size** | ~0 packages vs PyPI 500k / npm 2M / crates 130k. Decades of accumulation; cannot be closed by compiler work. | **Distribution + time.** The registry (spec done; build needs hosting) + agents publishing packages at machine speed. This is the #1 thousand-mile item and it is measured in *years*, not waves. |
+| 1 | **Ecosystem size** | ~0 packages vs PyPI 500k / npm 2M / crates 130k. Decades of accumulation; cannot be closed by compiler work. | **Distribution + time.** The registry is BUILT (v1: client + server, typed search, verified capabilities — deploying to Render); now it needs packages. Agents publishing at machine speed is the growth engine. This is the #1 thousand-mile item and it is measured in *years*, not waves. |
 | 2 | **Training-data presence** | No model has Misa in training data. Python's 4.7× CLI-velocity win is pure training data. | **Distribution.** Content engine (Phase 8), docs, examples in the wild. Compounds with #1. |
 | 3 | **Raw compute vs Go/Rust** | Go is 3–30× faster on raw loops; Rust similar. Misa beats *Python*, not the systems languages. | **Code (v2).** Multi-core parallelism, deeper unboxing (interpreter!), SIMD. Diminishing returns vs ecosystem work — do not chase this before #1/#2. |
 | 4 | **No package registry (built)** | Spec done; nothing deployed. | **Code + hosting.** Needs the Oracle signup (Hamis's hands), then the Misa-written server. Weeks, not months. |
@@ -56,13 +56,13 @@ build speed vs cargo-with-deps. Full matrix in `bench/GAPS-language.md`.
 ## The thousand-mile math
 
 Waves 1–3 closed **17 of 34** language lags and all 3 perf gaps and all 3
-tooling gaps. The remaining 17 language lags split into:
+tooling gaps. The registry build (2026-10-07) closed one more: I2 is
+now PAR. The remaining 16 language lags split into:
 
 - **Closable by code (10):** metaprogramming, numbers, fs depth,
   subprocess/AOT, inference, match guards, strings depth, lazy
   iteration, C++ FFI, module namespaces. None is individually large;
   collectively ~2 more waves.
-- **Closable by code + a decision (1):** registry build (needs hosting).
 - **Closable only by time + distribution (3):** ecosystem size,
   training-data presence, iOS hardware verification. These are the
   actual thousand miles.

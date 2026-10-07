@@ -593,6 +593,51 @@ Publish latency target: <60s end-to-end (dominated by example tests).
   R2, second VM for CI runners. The API's 302-redirect design (§8.2)
   already anticipates the blob move.
 
+### 9.1 Deployment (Render free tier) — current
+
+Oracle rejected the trial registration (2026-10-07), so v1 deploys to
+**Render's free tier** instead. Everything in §9 still applies in
+spirit; the differences are below.
+
+- **What runs:** `registry/Dockerfile` (`python:3.12-slim`, repo root
+  as build context). The server runs via the interpreter —
+  `python3 impl/bin/misa run registry/server.misa` — which needs
+  nothing beyond the Python standard library (no gcc, no LLVM; the
+  65MB `impl/misa/aot` tree is excluded via `.dockerignore`).
+- **Port binding:** Render injects `$PORT`. The server reads it from
+  the `PORT` env var (default 8080) and `http.serve` binds `0.0.0.0`
+  (verified: `net_listen` binds `("", port)`).
+- **Ephemeral filesystem (the big tradeoff):** Render free has no
+  persistent disks — the SQLite DB and tarball files **are wiped on
+  every restart/redeploy**. Mitigations, in order:
+  1. **Seed script:** `registry/seed.misa` re-publishes the seed
+     corpus (`registry/seed_pkgs/`) from scratch against a fresh
+     server. Recovery procedure: run `registry/admin.misa` once
+     (mints the admin token), boot the server with
+     `REGISTRY_ADMIN_TOKEN` set, run the seed script. The registry
+     is back to its seed state in minutes.
+  2. **Admin backup endpoint:** `GET /v1/admin/backup` (Bearer
+     admin token, 401 otherwise) streams a full SQLite dump as raw
+     SQL text. Pull it on a schedule from anywhere (a cron on any
+     always-on machine) and keep off-site copies. The dump restores
+     with `sqlite3 registry.db < backup.sql` — verified byte-clean.
+  3. **Tarballs are content-addressed** (`blobs/sha256/xx/yy/rest`),
+     so a future blob store (R2/S3) can be repopulated from any
+     surviving copy by hash; nothing depends on filenames surviving.
+- **Keep-awake:** Render free sleeps after 15 minutes idle. A 5-minute
+  cron ping (any external cron) against `/v1/` keeps it warm — same
+  idle-reclaim guard as §9, different provider.
+- **The registry's own URL is configuration, never hardcoded:**
+  the server reads `REGISTRY_URL` (default
+  `https://pkg.misa.website`); the client resolves `--registry` >
+  `MISA_REGISTRY` env > `~/.misa/config` > the same default. Moving
+  domains later is a config change, not a code change (lockfiles pin
+  content hashes, not URLs).
+- **What this defers:** at public-launch scale the registry needs a
+  persistent disk or a VM (back to §9's shape). The Render deployment
+  is the private-phase home; the API and data model don't change when
+  it moves.
+
 ---
 
 ## 10. Phasing — v1 vs later

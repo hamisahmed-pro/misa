@@ -1,5 +1,5 @@
 /// Builds and throws an Error in one step.
 /// The caught value is an Error with `.code` and `.message`.
-fn throw_err(code: Text, message: Text) {
+fn throw_err(code: Text, message: Text) throws E300 {
     throw { code: code, message: message }
 }

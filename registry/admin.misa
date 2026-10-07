@@ -1,0 +1,185 @@
+// ============================================================================
+// registry/admin.misa — one-shot registry initialization.
+//
+// Creates the data dir + SQLite DB + all 11 tables, then mints the first
+// admin token and prints it (shown once; only its sha256 is stored).
+//
+// Run:
+//   MISA_ROOT=/path/to/misa REGISTRY_DATA=./data \
+//     python3 impl/bin/misa run registry/admin.misa
+//
+// The printed token can then be exported as REGISTRY_ADMIN_TOKEN when
+// booting registry/server.misa, which enables GET /v1/admin/backup.
+// ============================================================================
+
+fn getenv_or(name: Text, dflt: Text) -> Text {
+  var out: Text = dflt
+  try {
+    out = env(name)
+  } catch e {
+    out = dflt
+  }
+  return out
+}
+
+fn schema_ddl() -> [Text] {
+  return [
+    r"""CREATE TABLE IF NOT EXISTS packages (
+      name TEXT PRIMARY KEY,
+      namespace TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      homepage TEXT NOT NULL DEFAULT '',
+      repository TEXT NOT NULL DEFAULT '',
+      claimed_by TEXT,
+      claimed_at INTEGER,
+      deprecated_msg TEXT
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS versions (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      semver_key INTEGER NOT NULL,
+      sha256 TEXT NOT NULL,
+      tarball_path TEXT NOT NULL,
+      published_at INTEGER NOT NULL,
+      publisher TEXT NOT NULL,
+      license TEXT NOT NULL DEFAULT '',
+      yanked INTEGER NOT NULL DEFAULT 0,
+      yank_reason TEXT,
+      breaking_computed TEXT NOT NULL DEFAULT 'none',
+      caps_declared TEXT NOT NULL DEFAULT '[]',
+      caps_verified TEXT NOT NULL DEFAULT '[]',
+      examples_pass INTEGER NOT NULL DEFAULT 0,
+      examples_total INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS dependencies (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      dep TEXT NOT NULL,
+      range TEXT NOT NULL,
+      dev INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version, dep)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS signatures (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      params TEXT NOT NULL DEFAULT '[]',
+      ret TEXT NOT NULL DEFAULT '',
+      throws TEXT NOT NULL DEFAULT '[]',
+      doc TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (pkg, version, kind, name)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS capabilities (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      cap TEXT NOT NULL,
+      declared INTEGER NOT NULL,
+      verified INTEGER NOT NULL,
+      PRIMARY KEY (pkg, version, cap)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS examples (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      name TEXT NOT NULL,
+      passing INTEGER NOT NULL,
+      last_run_at INTEGER NOT NULL,
+      PRIMARY KEY (pkg, version, name)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS downloads (
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL,
+      day TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pkg, version, day)
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS advisories (
+      id TEXT PRIMARY KEY,
+      pkg TEXT NOT NULL,
+      affected TEXT NOT NULL,
+      fixed_in TEXT NOT NULL DEFAULT '',
+      severity TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      published_at INTEGER NOT NULL,
+      state TEXT NOT NULL DEFAULT 'published'
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS publishers (
+      id TEXT PRIMARY KEY,
+      handle TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      pubkey TEXT NOT NULL DEFAULT ''
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS tokens (
+      token_sha TEXT PRIMARY KEY,
+      publisher_id TEXT NOT NULL,
+      scopes TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      revoked INTEGER NOT NULL DEFAULT 0
+    )""",
+    r"""CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      pkg TEXT NOT NULL,
+      version TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open',
+      created_at INTEGER NOT NULL
+    )""",
+  ]
+}
+
+fn main() throws E300, E303 {
+  let data_dir = getenv_or("REGISTRY_DATA", "./data")
+  let mk = process.run(["mkdir", "-p", data_dir])
+  if mk.code != 0 {
+    print("fatal: cannot create data dir: " + data_dir)
+    return
+  }
+  let dbh = db.open(data_dir + "/registry.db")
+  for ddl in schema_ddl() {
+    db.exec(dbh, ddl, [])
+  }
+  print("schema ready: " + data_dir + "/registry.db")
+  // admin publisher
+  let prow = db.query(dbh, "SELECT id FROM publishers WHERE id = 'admin'",
+    [])
+  if len(prow) == 0 {
+    db.exec(dbh,
+      "INSERT INTO publishers (id, handle, created_at) VALUES ('admin', 'admin', ?)",
+      [time.now()])
+  }
+  // mint the admin token (secure random; only the sha256 is stored)
+  let gr = process.run(["python3", "-c",
+    "import secrets; print(secrets.token_hex(32))"])
+  if gr.code != 0 {
+    print("fatal: token generation failed")
+    return
+  }
+  let token: Text = str.trim(gr.stdout)
+  let sha: Text = crypto.sha256(token)
+  let now = time.now()
+  let trow = db.query(dbh,
+    "SELECT token_sha FROM tokens WHERE token_sha = ?", [sha])
+  if len(trow) == 0 {
+    db.exec(dbh,
+      "INSERT INTO tokens (token_sha, publisher_id, scopes, created_at, expires_at, revoked) VALUES (?, 'admin', ?, ?, ?, 0)",
+      [sha, r"""["admin:*"]""", now, now + 365 * 86400])
+  }
+  db.close(dbh)
+  print("")
+  print("ADMIN TOKEN (shown once — store it safely):")
+  print(token)
+  print("")
+  print("Boot the server with it enabled:")
+  print("  REGISTRY_ADMIN_TOKEN=<token> \\")
+  print("    python3 impl/bin/misa run registry/server.misa")
+  print("")
+  print("Then mint scoped publisher tokens via:")
+  print("  curl -X POST localhost:8080/v1/admin/tokens \\")
+  print("    -H 'Authorization: Bearer <token>' \\")
+  print("    -H 'Content-Type: application/json' \\")
+  print(r"""    -d '{"scopes":["publish:@demo/*","yank:@demo/*"]}'""")
+}
+
+main()

@@ -1,0 +1,14 @@
+// mathkit — tiny arithmetic helpers (seed package for the registry).
+fn add(a: Int, b: Int) -> Int { return a + b }
+
+fn mul(a: Int, b: Int) -> Int { return a * b }
+
+fn factorial(n: Int) -> Int {
+  var acc: Int = 1
+  var i: Int = 2
+  while i <= n {
+    acc = acc * i
+    i = i + 1
+  }
+  return acc
+}

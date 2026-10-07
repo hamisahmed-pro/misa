@@ -1,0 +1,139 @@
+// ============================================================================
+// registry/seed.misa — re-publish the seed packages to a running server.
+//
+// Used for ephemeral-filesystem recovery (Render free tier has no
+// persistent disks): after a fresh boot, run admin.misa once, boot the
+// server, then run this to restore the seed corpus.
+//
+// Run:
+//   MISA_ROOT=/path/to/misa REGISTRY_TOKEN=<admin-or-publisher-token> \
+//   SEED_URL=http://127.0.0.1:8080 \
+//     python3 impl/bin/misa run registry/seed.misa
+//
+// Each package in registry/seed_pkgs/* is packed deterministically
+// (sorted entries, fixed mtimes, zeroed ownership), hashed, and POSTed
+// to /v1/publish with a Bearer token.
+// ============================================================================
+
+fn getenv_or(name: Text, dflt: Text) -> Text {
+  var out: Text = dflt
+  try {
+    out = env(name)
+  } catch e {
+    out = dflt
+  }
+  return out
+}
+
+fn run_text(cmd: [Text]) -> Text throws E300, E303 {
+  let r = process.run(cmd)
+  if r.code != 0 {
+    throw {code: "E303",
+      message: "subprocess failed: " + cmd[0] + ": " + str.trim(r.stderr)}
+  }
+  return r.stdout
+}
+
+fn publish_one(misa_root: Text, seed_url: Text, token: Text, pkgdir: Text) throws E300, E303 {
+  let tmp = fs.temp_dir()
+  let tarpath = tmp + "/pkg.tar.gz"
+  print("packing " + pkgdir)
+  // deterministic pack via registry/helpers/pack.py (sorted names,
+  // zeroed mtimes/ownership): not all tar(1) builds support --sort-name.
+  let tr = process.run(["python3",
+    misa_root + "/registry/helpers/pack.py", pkgdir, tarpath])
+  if tr.code != 0 {
+    throw {code: "E303",
+      message: "pack failed for " + pkgdir + ": " + str.trim(tr.stderr)}
+  }
+  if tr.code != 0 {
+    throw {code: "E303",
+      message: "pack failed for " + pkgdir + ": " + str.trim(tr.stderr)}
+  }
+  let sha_full = run_text(["sha256sum", tarpath])
+  let sha = str.split(str.trim(sha_full), " ")[0]
+  let b64 = run_text(["python3", "-c",
+    "import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1],'rb').read()).decode('ascii'))",
+    tarpath])
+  let manifest_j = run_text(["python3",
+    misa_root + "/registry/helpers/pkg_to_json.py", pkgdir])
+  let mval = json.parse(str.trim(manifest_j))
+  let payload = {
+    manifest: mval,
+    tarball_b64: str.trim(b64),
+    tarball_sha256: sha,
+  }
+  fs.write(tmp + "/body.json", json.stringify(payload))
+  print("publishing " + pkgdir + " (" + sha + ")")
+  let resp = run_text(["curl", "-s", "-X", "POST", seed_url + "/v1/publish",
+    "-H", "Authorization: Bearer " + token,
+    "-H", "Content-Type: application/json",
+    "--data", "@" + tmp + "/body.json"])
+  var rj = nil
+  try {
+    rj = json.parse(resp)
+  } catch e {
+    throw {code: "E300",
+      message: "publish returned invalid JSON for " + pkgdir + ": " + resp}
+  }
+  var pkg: Text = ""
+  var ver: Text = ""
+  try {
+    pkg = rj.package
+  } catch e {
+    pkg = ""
+  }
+  try {
+    ver = rj.version
+  } catch e {
+    ver = ""
+  }
+  if pkg == "" {
+    var emsg: Text = resp
+    try {
+      emsg = rj.error.message
+    } catch e {
+      emsg = resp
+    }
+    throw {code: "E300", message: "publish failed for " + pkgdir + ": " + emsg}
+  }
+  print("published " + pkg + "@" + ver)
+  try {
+    process.run(["rm", "-rf", tmp])
+  } catch e {
+  }
+}
+
+fn main() throws E300, E303 {
+  let misa_root = getenv_or("MISA_ROOT", ".")
+  let port = getenv_or("PORT", "8080")
+  let seed_url = getenv_or("SEED_URL", "http://127.0.0.1:" + port)
+  let token = getenv_or("REGISTRY_TOKEN", "")
+  if token == "" {
+    print("fatal: REGISTRY_TOKEN is not set")
+    return
+  }
+  let seed_root = misa_root + "/registry/seed_pkgs"
+  let found = run_text(
+    ["find", seed_root, "-maxdepth", "2", "-name", "misa.pkg"])
+  var pkgdirs: [Text] = []
+  for line in str.split(str.trim(found), "\n") {
+    let t = str.trim(line)
+    if t != "" {
+      // dirname: strip the trailing "/misa.pkg"
+      let dir = str.slice(t, 0, len(t) - 9)
+      pkgdirs = pkgdirs + [dir]
+    }
+  }
+  if len(pkgdirs) == 0 {
+    print("no seed packages found under " + seed_root)
+    return
+  }
+  print("seed target: " + seed_url)
+  for d in pkgdirs {
+    publish_one(misa_root, seed_url, token, d)
+  }
+  print("seed complete: " + str(len(pkgdirs)) + " package(s)")
+}
+
+main()
