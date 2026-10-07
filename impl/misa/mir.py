@@ -86,25 +86,55 @@ class MIRBuilder:
         return result
 
 def verify(module: MIRModule) -> list[str]:
-    """Return structural/type errors; empty means MIR is well-formed."""
+    """Return structural and basic type errors; empty means well-formed."""
     errors = []
     for fn in module.functions:
         if not fn.blocks:
             errors.append(f"{fn.name}: function has no blocks")
             continue
-        ids = set()
+        ids = {}
         for p in fn.params:
-            if p.id in ids: errors.append(f"{fn.name}: duplicate value %{p.id}")
-            ids.add(p.id)
+            if p.id in ids:
+                errors.append(f"{fn.name}: duplicate value %{p.id}")
+            ids[p.id] = p.type
         for block in fn.blocks:
+            if block.terminator is not None and block.instructions and                     block.instructions[-1].op in {"return", "branch", "cond_branch", "throw"}:
+                errors.append(f"{fn.name}:{block.name}: terminator must be stored in block.terminator")
             for ins in block.instructions:
-                if ins.result is not None:
-                    if ins.result.id in ids:
-                        errors.append(f"{fn.name}: duplicate value %{ins.result.id}")
-                    ids.add(ins.result.id)
                 for a in ins.args:
                     if a.id not in ids:
-                        errors.append(f"{fn.name}: use of unknown value %{a.id}")
+                        errors.append(f"{fn.name}:{block.name}: use of unknown value %{a.id}")
+                if ins.result is not None:
+                    if ins.result.id in ids:
+                        errors.append(f"{fn.name}:{block.name}: duplicate value %{ins.result.id}")
+                    ids[ins.result.id] = ins.result.type
+                if ins.op in {"add", "sub", "mul"}:
+                    if len(ins.args) != 2 or ins.result is None:
+                        errors.append(f"{fn.name}:{block.name}: {ins.op} requires two args and a result")
+                    elif ins.args[0].type != ins.args[1].type or ins.args[0].type != ins.result.type:
+                        errors.append(f"{fn.name}:{block.name}: {ins.op} has incompatible types")
+                    elif ins.result.type not in {I64, F64}:
+                        errors.append(f"{fn.name}:{block.name}: {ins.op} requires i64 or f64")
+                elif ins.op == "box":
+                    if len(ins.args) != 1 or ins.result is None or ins.result.type != MVAL:
+                        errors.append(f"{fn.name}:{block.name}: box must produce MVal* from one value")
+                elif ins.op == "unbox":
+                    if len(ins.args) != 1 or ins.result is None or ins.args[0].type != MVAL:
+                        errors.append(f"{fn.name}:{block.name}: unbox requires one MVal* argument")
+                elif ins.op == "return":
+                    if ins.result is not None:
+                        errors.append(f"{fn.name}:{block.name}: return cannot define a result")
+                    if len(ins.args) > 1:
+                        errors.append(f"{fn.name}:{block.name}: return accepts at most one value")
+                    elif fn.return_type == VOID and ins.args:
+                        errors.append(f"{fn.name}:{block.name}: void function cannot return a value")
+                    elif fn.return_type != VOID and (not ins.args or ins.args[0].type != fn.return_type):
+                        errors.append(f"{fn.name}:{block.name}: return type mismatch")
+            if block.terminator is not None:
+                term = block.terminator
+                if term.op == "return":
+                    if len(term.args) > 1 or (fn.return_type == VOID and term.args) or                             (fn.return_type != VOID and (not term.args or term.args[0].type != fn.return_type)):
+                        errors.append(f"{fn.name}:{block.name}: return type mismatch")
     return errors
 
 def dump(module: MIRModule) -> str:
