@@ -19,6 +19,8 @@ jobs:
         run: python3 scripts/fetch_sqlite.py
       - name: MIR structural and optimization gate
         run: python3 tests/test_mir.py
+      - name: AST to MIR lowering gate
+        run: python3 tests/test_mir_lower.py
       - name: Benchmark harness contract gate
         run: python3 tests/test_benchmark.py
       - name: Platform ABI contract gate
