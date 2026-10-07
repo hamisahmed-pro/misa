@@ -17,6 +17,8 @@ jobs:
           tar xzf onnxruntime-linux-x64-1.21.0.tgz
       - name: Fetch SQLite amalgamation (AOT db.*, Phase 5)
         run: python3 scripts/fetch_sqlite.py
+      - name: Platform ABI contract gate
+        run: python3 tests/test_platform_abi.py
       - name: Interpreter suite
         run: |
           chmod +x impl/bin/misa
