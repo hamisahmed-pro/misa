@@ -137,6 +137,7 @@ _RT_SIGS = {
     "misa_list_bool_push": (ir.VoidType(), [PTR, I32]),
     "misa_list_int_push": (ir.VoidType(), [PTR, I64]),
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
+    "misa_list_append": (ir.VoidType(), [PTR, PTR, I32, I32]),
     "misa_list_get": (PTR, [PTR, I64]),
     # Phase 8 (overtake): wrap each element of a list as an interface
     # value with the given impl tag.
@@ -3473,6 +3474,10 @@ class Emitter:
         if name == "sort_by":
             return self.call(ctx, "misa_list_sort_by",
                              [arg(0), arg(1), line, col], e)
+        if name == "list.push":
+            self.call(ctx, "misa_list_append",
+                      [arg(0), arg(1), line, col], e)
+            return self.get_nil(ctx)
         if name == "list.flat":
             return self.call(ctx, "misa_list_flat",
                              [arg(0), line, col], e)

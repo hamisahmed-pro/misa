@@ -1,0 +1,87 @@
+{
+  "schema": "misa-python-aot-benchmark-v1",
+  "timestamp_utc": "2026-10-08T23:13:10Z",
+  "revision": "eab20c23cb60f91fa3c3b4ee8c5f13751fc6e19c",
+  "misa_version": "see repository revision",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "platform": "Linux-6.18.38+-x86_64-with-glibc2.39",
+  "cpu_model": "AMD EPYC",
+  "logical_cpu_count": 6,
+  "compiler_pipeline": "misa build; LLVM module O2 pass pipeline; compilation excluded from timed samples",
+  "method": "wall-clock subprocess timing including startup; warmups excluded; randomized within-trial order; median of raw samples; output checked on every run",
+  "cases": {
+    "nbody": {
+      "input_n": 50000,
+      "sample_count": 3,
+      "warmups": 1,
+      "samples_seconds": {
+        "CPython 3.12": [
+          0.14041982500020822,
+          0.13888234200021543,
+          0.13543917900005908
+        ],
+        "Misa AOT": [
+          0.8334552699998312,
+          0.8340168360000462,
+          0.7919352150001941
+        ]
+      },
+      "median_seconds": {
+        "CPython 3.12": 0.13888234200021543,
+        "Misa AOT": 0.8334552699998312
+      },
+      "python_over_misa_speed_ratio": 0.16663442778428117,
+      "validated_result": -0.169078071
+    },
+    "spectralnorm": {
+      "input_n": 500,
+      "sample_count": 3,
+      "warmups": 1,
+      "samples_seconds": {
+        "CPython 3.12": [
+          1.086275526999998,
+          1.0805456469997807,
+          1.0985043829996357
+        ],
+        "Misa AOT": [
+          4.799954548000642,
+          4.84418419999929,
+          4.827329039999313
+        ]
+      },
+      "median_seconds": {
+        "CPython 3.12": 1.086275526999998,
+        "Misa AOT": 4.827329039999313
+      },
+      "python_over_misa_speed_ratio": 0.22502620351732902,
+      "validated_result": 1.274224116
+    },
+    "fannkuchredux": {
+      "input_n": 10,
+      "sample_count": 3,
+      "warmups": 1,
+      "samples_seconds": {
+        "CPython 3.12": [
+          2.2818573579997974,
+          2.264865591000671,
+          2.2159028500000204
+        ],
+        "Misa AOT": [
+          6.056958723999742,
+          6.025680087999717,
+          5.858437459000015
+        ]
+      },
+      "median_seconds": {
+        "CPython 3.12": 2.264865591000671,
+        "Misa AOT": 6.025680087999717
+      },
+      "python_over_misa_speed_ratio": 0.3758688742057853,
+      "validated_result": [
+        73196,
+        38
+      ]
+    }
+  },
+  "geometric_mean_python_over_misa_speed_ratio": 0.24155242227557358
+}

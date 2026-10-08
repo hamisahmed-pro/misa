@@ -152,6 +152,12 @@ is coherence, speed, portability, reliability, and provability."
 
 **Status:** NOT STARTED. Major milestone.
 
+**Current AOT baseline:** generated LLVM IR now runs the LLVM speed-level
+O2 module pipeline with strict floating-point semantics. The standard
+library also exposes amortized `list.push` for efficient array building.
+These are shipped backend/runtime improvements; the custom MIR
+optimizations below are still planned.
+
 ### 7A. Design
 - [x] `spec/MIR.md`: MIR specification (typed AST → MIR → optimized MIR → LLVM)
 - [x] Initial typed MIR module with explicit box/unbox values

@@ -34,4 +34,4 @@ try {
 } catch e {
     print("caught {e.code}")
 }
-print(load("http://example.com"))
+print(load("http://127.0.0.1:0"))

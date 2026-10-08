@@ -194,6 +194,7 @@ MVal *misa_list_int_new(void);
 MVal *misa_list_float_new(void);
 void misa_list_bool_push(MVal *list, int b);
 void misa_list_int_push(MVal *list, int64_t v);
+void misa_list_append(MVal *list, MVal *value, int line, int col);
 int misa_list_bool_get(MVal *list, int64_t idx, int line, int col);
 void misa_list_bool_set(MVal *list, int64_t idx, int b, int line, int col);
 int64_t misa_list_int_get(MVal *list, int64_t idx, int line, int col);

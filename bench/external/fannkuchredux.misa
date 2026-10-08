@@ -9,13 +9,13 @@ fn fannkuch(n: Int) -> Int throws E300 {
   var perm1: [Int] = []
   var i = 0
   while i < n {
-    perm1 = perm1 + [i]
+    list.push(perm1, i)
     i = i + 1
   }
   var count: [Int] = []
   i = 0
   while i < n {
-    count = count + [perm1[i]]
+    list.push(count, perm1[i])
     i = i + 1
   }
 
@@ -25,7 +25,7 @@ fn fannkuch(n: Int) -> Int throws E300 {
       var perm: [Int] = []
       var pi = 0
       while pi < n {
-        perm = perm + [perm1[pi]]
+        list.push(perm, perm1[pi])
         pi = pi + 1
       }
       var flipsCount = 1
@@ -100,8 +100,8 @@ fn fannkuch(n: Int) -> Int throws E300 {
 fn main() throws E300 {
   var n = 8
   let args = argv()
-  if len(args) > 1 {
-    n = int(args[1])
+  if len(args) > 0 {
+    n = int(args[0])
   }
   let result = fannkuch(n)
   print("Pfannkuchen({n}) = {result}")

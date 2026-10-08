@@ -121,7 +121,7 @@ the same arrangement as Rust.
 | 4 | Concurrency (structured, typed, budgeted) | ✅ complete |
 | 5 | Package Registry | ✅ complete |
 | 6 | Cross-Platform (Android, iOS, WASM) | 🚧 in-progress — Android beta, iOS beta (ABI fixed), WASM broken (time.parse) |
-| 7 | Performance Optimization | 🚧 in-progress — Int/float unboxing done, string builder done, typed arrays pending, MIR planned |
+| 7 | Performance Optimization | 🚧 in-progress — LLVM O2 AOT passes and amortized `list.push` shipped; Int/float unboxing and string builder done; typed arrays and optimizing MIR remain planned |
 | 8 | Ignition (public launch) | ⏳ not-started — Waiting for community, visibility, launch strategy per Hamis |
 | 9 | Flywheel (ecosystem growth) | ⏳ not-started |
 

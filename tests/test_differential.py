@@ -28,6 +28,7 @@ PROGRAMS = [
     ("string", 'let s = "hello"\nprint(s + " world")\nprint(len(s))\n'),
     ("string_builder", 'var s = ""\nvar i = 0\nwhile i < 5 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\nprint(len(s))\n'),
     ("list", 'let l = [1, 2, 3]\nprint(len(l))\nprint(l[0] + l[2])\n'),
+    ("list_push", 'var xs: [Int] = []\nlet alias = xs\nvar i = 0\nwhile i < 1000 {\n  list.push(xs, i)\n  i = i + 1\n}\nprint(len(alias))\nprint(alias[999])\nvar flags = [true]\nlist.push(flags, false)\nprint(flags[1])\n'),
     ("record", 'type P { x: Int, y: Int }\nlet p: P = { x: 1, y: 2 }\nprint(p.x + p.y)\n'),
     ("control", 'var i = 0\nvar s = 0\nwhile i < 10 {\n  if i % 2 == 0 {\n    s = s + i\n  }\n  i = i + 1\n}\nprint(s)\n'),
     ("func", 'fn add(a: Int, b: Int) -> Int {\n  return a + b\n}\nprint(add(3, 4))\n'),

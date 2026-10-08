@@ -31,6 +31,9 @@ import tempfile
 IMPL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RT_DIR = os.path.join(IMPL_DIR, "aot", "rt")
 CACHE_DIR = os.path.join(RT_DIR, "build")
+# LLVM IR optimization level for native AOT output. Keep this explicit so
+# the cache key and benchmark reports can identify the generated code.
+AOT_OPT_LEVEL = 2
 # Vendored native deps (built from source tarballs; see deps/README).
 DEPS_DIR = os.path.join(os.path.expanduser("~"), "workspace", "deps", "gc")
 DEPS_INCLUDE = os.path.join(DEPS_DIR, "include")
@@ -692,9 +695,9 @@ def _err(code: str, message: str):
 def _emit_object(mod, triple: str) -> bytes:
     """Lower the module to a native object for `triple` (llvmlite 0.50).
 
-    Host path is byte-for-byte the v0.3 behavior; the cross path
-    initializes all LLVM targets, resolves the triple, and sets the
-    module triple + data layout (fixes B1/B2).
+    Run LLVM's standard speed-level pipeline before code generation.
+    The pass pipeline uses strict floating-point semantics (no fast-math)
+    so optimizations do not relax Misa's numeric behavior.
     """
     from llvmlite import binding
     if triple == host_triple():
@@ -713,6 +716,7 @@ def _emit_object(mod, triple: str) -> bytes:
             raise ValueError(f"unknown target triple {triple!r}: {e}")
         eff_triple = triple
     tm = target.create_target_machine(
+        opt=AOT_OPT_LEVEL,
         # Phase 4 (M6): Android links the program object into a shared
         # library (libmisa.so inside the APK) — it must be PIC. Host
         # behavior is unchanged.
@@ -722,6 +726,11 @@ def _emit_object(mod, triple: str) -> bytes:
     # was removed — use Target.name, e.g. for diagnostics).
     mod.data_layout = str(tm.target_data)
     bmod = binding.parse_assembly(str(mod))
+    bmod.verify()
+    tuning = binding.PipelineTuningOptions(speed_level=AOT_OPT_LEVEL)
+    pass_builder = binding.PassBuilder(tm, tuning)
+    module_passes = pass_builder.getModulePassManager()
+    module_passes.run(bmod, pass_builder)
     bmod.verify()
     return tm.emit_object(bmod)
 
@@ -987,7 +996,7 @@ def cache_key_for(path: str) -> str:
     from misa import __version__ as _v  # noqa
     from misa.loader import load as load_with_imports
     h = hashlib.sha256()
-    h.update(("misa-aot-cache-v1:" + _v).encode())
+    h.update((f"misa-aot-cache-v2-o{AOT_OPT_LEVEL}:" + _v).encode())
     try:
         _merged, _errs, order, _file_of = load_with_imports(path)
         files = sorted(set(order or []))

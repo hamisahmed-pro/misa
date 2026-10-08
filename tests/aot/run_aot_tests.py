@@ -72,7 +72,10 @@ def main():
         src = os.path.join(PROG, prog)
         mock = spec.get("mock")
         env = {}
-        icmd = [MISA, "run", src]
+        # `misa run` defaults to the AOT cache when the file is
+        # compilable. Force the reference interpreter so cold-cache
+        # build notices do not contaminate stderr parity comparisons.
+        icmd = [MISA, "run", src, "--interp"]
         if mock:
             mp = os.path.join(PROG, mock)
             icmd += ["--mock", mp]

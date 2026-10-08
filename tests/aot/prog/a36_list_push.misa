@@ -1,0 +1,15 @@
+// list.push uses amortized capacity growth and mutates the shared list.
+var xs: [Int] = []
+let xs_alias = xs
+var i = 0
+while i < 1000 {
+  list.push(xs, i)
+  i = i + 1
+}
+print(len(xs_alias))
+print(xs_alias[999])
+
+var flags = [true]
+let flags_alias = flags
+list.push(flags, false)
+print(flags_alias[1])

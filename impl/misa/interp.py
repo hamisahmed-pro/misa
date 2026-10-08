@@ -2245,6 +2245,12 @@ class Interpreter:
                 return 0
 
             return sorted(xs, key=functools.cmp_to_key(_cmp))
+        if name == "list.push":
+            xs, value = args[0], args[1]
+            if not isinstance(xs, list):
+                raise RuntimeError_("list.push needs a list")
+            xs.append(value)
+            return None
         if name == "list.flat":
             xss = args[0]
             if not all(isinstance(xs, list) for xs in xss):

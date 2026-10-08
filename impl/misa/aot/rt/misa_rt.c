@@ -5061,6 +5061,53 @@ void misa_list_int_push(MVal *list, int64_t v) {
     list->u.list_int.items[list->u.list_int.len++] = v;
 }
 
+static void misa_list_float_push(MVal *list, double v) {
+    list->u.list_float.items = (double*)grow_array(
+        list->u.list_float.items, &list->u.list_float.cap,
+        list->u.list_float.len + 1, sizeof(double));
+    list->u.list_float.items[list->u.list_float.len++] = v;
+}
+
+void misa_list_append(MVal *list, MVal *value, int line, int col) {
+    if (!list || !value) {
+        misa_raise("E300", "list.push needs a list and a value", line, col);
+        return;
+    }
+    switch (list->tag) {
+    case M_TAG_LIST:
+        misa_list_push(list, value);
+        return;
+    case M_TAG_LIST_BOOL:
+        if (value->tag != M_TAG_BOOL) {
+            misa_raise("E300", "list.push value type mismatch", line, col);
+            return;
+        }
+        misa_list_bool_push(list, value->u.b);
+        return;
+    case M_TAG_LIST_INT:
+        if (value->tag != M_TAG_INT) {
+            misa_raise("E300", "list.push value type mismatch", line, col);
+            return;
+        }
+        misa_list_int_push(list, value->u.i);
+        return;
+    case M_TAG_LIST_FLOAT:
+        if (value->tag == M_TAG_INT) {
+            misa_list_float_push(list, (double)value->u.i);
+            return;
+        }
+        if (value->tag == M_TAG_FLOAT) {
+            misa_list_float_push(list, value->u.f);
+            return;
+        }
+        misa_raise("E300", "list.push value type mismatch", line, col);
+        return;
+    default:
+        misa_raise("E300", "list.push needs a list", line, col);
+        return;
+    }
+}
+
 // Direct unboxed access (no MVal* boxing)
 int misa_list_bool_get(MVal *list, int64_t idx, int line, int col) {
     if (misa_pending()) return 0;

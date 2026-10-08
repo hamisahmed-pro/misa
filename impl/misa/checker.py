@@ -205,6 +205,7 @@ POLY_BUILTINS = {
     "set.diff": (["Set<T>", "Set<T>"], "Set<T>", {"T"}),
     "set.to_list": (["Set<T>"], "[T]", {"T"}),
     "set.len": (["Set<T>"], "Int", {"T"}),
+    "list.push": (["[T]", "T"], "Void", {"T"}),
     "list.flat": (["[[T]]"], "[T]", {"T"}),
     "list.zip": (["[A]", "[B]"], "[[any]]", {"A", "B"}),
     "list.unique": (["[T]"], "[T]", {"T"}),

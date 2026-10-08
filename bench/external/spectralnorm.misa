@@ -17,7 +17,7 @@ fn eval_A_times_u(u: [Float]) -> [Float] {
       sum = sum + eval_A(i, j) * u[j]
       j = j + 1
     }
-    result = result + [sum]
+    list.push(result, sum)
     i = i + 1
   }
   return result
@@ -34,7 +34,7 @@ fn eval_At_times_u(u: [Float]) -> [Float] {
       sum = sum + eval_A(j, i) * u[j]
       j = j + 1
     }
-    result = result + [sum]
+    list.push(result, sum)
     i = i + 1
   }
   return result
@@ -47,24 +47,24 @@ fn eval_AtA_times_u(u: [Float]) -> [Float] {
 fn main() throws E300 {
   var n = 100
   let args = argv()
-  if len(args) > 1 {
-    n = int(args[1])
+  if len(args) > 0 {
+    n = int(args[0])
   }
   var u: [Float] = []
   var i = 0
   while i < n {
-    u = u + [1.0]
+    list.push(u, 1.0)
     i = i + 1
   }
+  var v: [Float] = []
   var dummy = 0
   while dummy < 10 {
-    let v = eval_AtA_times_u(u)
+    v = eval_AtA_times_u(u)
     u = eval_AtA_times_u(v)
     dummy = dummy + 1
   }
   var vBv = 0.0
   var vv = 0.0
-  let v = eval_AtA_times_u(u)
   i = 0
   while i < n {
     vBv = vBv + u[i] * v[i]
