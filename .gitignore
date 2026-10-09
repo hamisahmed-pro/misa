@@ -1,0 +1,9 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Native AOT runtime object cache
+impl/misa/aot/rt/build/
+
+# Ephemeral CI benchmark artifact (retained results live under bench/external/)
+bench/results/benchmark-ci.json
