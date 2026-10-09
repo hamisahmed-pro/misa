@@ -4,7 +4,7 @@
 Usage:
   misa run <file.misa> [--mock mocks.json] [--json] [-- args...]
   misa debug [--agent] <file.misa> [--mock mocks.json] [-- args...]
-  misa profile <file.misa> [--json] [--mock mocks.json] [--interval-ms N] [-- args...]
+  misa profile <file.misa> [--json] [--memory] [--mock mocks.json] [--interval-ms N] [-- args...]
   misa repl
   misa check <file.misa> [--json]
   misa mir <file.misa> [--opt]
@@ -78,13 +78,40 @@ def emit_warnings(warnings, as_json):
             sys.stderr.write(f"  hint: {w['hint']}\n")
 
 
+def _check_json_payload(ok, errors, warnings, throws_graph=None):
+    """Versioned agent-facing diagnostics; legacy arrays remain unchanged."""
+    diagnostics = []
+    for severity, items in (("error", errors), ("warning", warnings)):
+        for item in items:
+            diagnostics.append({
+                "severity": severity,
+                "code": item.get("code", "E000"),
+                "message": item.get("message", str(item)),
+                "location": {
+                    "line": item.get("line", 0) or 0,
+                    "column": item.get("col", 0) or 0,
+                },
+                "hint": item.get("hint", ""),
+            })
+    payload = {"schema_version": "misa.check.v1", "ok": ok,
+               "diagnostics": diagnostics,
+               "errors": errors, "warnings": warnings}
+    if throws_graph is not None:
+        payload["throws_graph"] = throws_graph
+    return payload
+
+
 def cmd_check(path, as_json, deny_warnings=False):
     # Phase 8 (overtake): keep the Checker so `misa check --json` can
     # also emit the throws graph (declared/inferred E-code sets per
     # function) alongside the diagnostics.
     merged, load_errors, _, file_of = load_with_imports(path)
     if merged is None:
-        emit_errors(load_errors, as_json)
+        if as_json:
+            print(json.dumps(_check_json_payload(
+                False, load_errors, [], {}), indent=2))
+        else:
+            emit_errors(load_errors, False)
         return 1
     checker = Checker()
     errors = list(load_errors)
@@ -100,16 +127,14 @@ def cmd_check(path, as_json, deny_warnings=False):
         warnings = []
     if errors:
         if as_json:
-            print(json.dumps({"ok": False, "errors": errors,
-                              "warnings": warnings,
-                              "throws_graph": checker.throws_graph},
-                             indent=2))
+            print(json.dumps(_check_json_payload(
+                False, errors, warnings, checker.throws_graph), indent=2))
         else:
             emit_errors(errors, as_json)
         return 1
     if as_json:
-        print(json.dumps({"ok": True, "errors": [], "warnings": warnings,
-                          "throws_graph": checker.throws_graph}, indent=2))
+        print(json.dumps(_check_json_payload(
+            True, [], warnings, checker.throws_graph), indent=2))
     else:
         emit_warnings(warnings, as_json)
         print(f"{path}: OK")
@@ -431,9 +456,11 @@ def cmd_debug(path, mock_path, agent, prog_argv=None):
     return debug_file(path, mock_path, agent, prog_argv)
 
 
-def cmd_profile(path, mock_path, as_json, interval_ms, prog_argv=None):
+def cmd_profile(path, mock_path, as_json, interval_ms, prog_argv=None,
+                track_memory=False):
     from misa.profiler import profile_file
-    return profile_file(path, mock_path, as_json, interval_ms, prog_argv)
+    return profile_file(path, mock_path, as_json, interval_ms, prog_argv,
+                        track_memory=track_memory)
 
 
 def cmd_repl():
@@ -802,7 +829,7 @@ def main(argv):
             die("usage: misa debug [--agent] <file.misa> "
                 "[--mock mocks.json] [-- args...]")
         return cmd_debug(rest[0], mock, agent, prog_argv)
-    if cmd == "profile" and 1 <= len(args) <= 6:
+    if cmd == "profile" and 1 <= len(args) <= 8:
         if "--" in args:
             i = args.index("--")
             prog_argv, args = args[i + 1:], args[:i]
@@ -810,6 +837,7 @@ def main(argv):
             prog_argv = []
         mock = None
         interval_ms = 10.0
+        track_memory = False
         rest = []
         i = 0
         while i < len(args):
@@ -824,13 +852,17 @@ def main(argv):
                 if interval_ms <= 0:
                     die("--interval-ms must be positive")
                 i += 2
+            elif args[i] == "--memory":
+                track_memory = True
+                i += 1
             else:
                 rest.append(args[i])
                 i += 1
         if len(rest) != 1:
             die("usage: misa profile <file.misa> [--json] "
-                "[--mock mocks.json] [--interval-ms N] [-- args...]")
-        return cmd_profile(rest[0], mock, as_json, interval_ms, prog_argv)
+                "[--mock mocks.json] [--interval-ms N] [--memory] [-- args...]")
+        return cmd_profile(rest[0], mock, as_json, interval_ms, prog_argv,
+                           track_memory)
     if cmd == "repl" and len(args) == 0:
         return cmd_repl()
     if cmd == "serve" and 1 <= len(args) <= 9:

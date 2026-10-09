@@ -1,0 +1,12 @@
+fn mix(x: Float, y: Float) -> Float {
+  let sum: Float = x + y
+  return sum * 0.5
+}
+
+fn scale(x: Int, y: Int) -> Int {
+  let sum: Int = x + y
+  return sum * 3
+}
+
+print(mix(1.25, 2.75))
+print(scale(7, 5))

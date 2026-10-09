@@ -278,6 +278,7 @@ user-defined function with the same name shadows the builtin.
 | `fold` | `fold(xs: [T], init: U, f: (U, T) -> U) -> U` | Left fold (the one name — there is no `reduce` alias). |
 | `sort_by` | `sort_by(xs: [T], less: (T, T) -> Bool) -> [T]` | Stable sort by a less-than comparator (mergesort). |
 | `list.push` | `list.push(xs: [T], value: T) -> Void` | Mutate `xs` by appending one value (amortized O(1)); aliases observe the append. Prefer this to `xs = xs + [value]` in loops. |
+| `list.reserve` | `list.reserve(xs: [T], capacity: Int) -> Void` | Reserve at least `capacity` element slots without changing length or contents. AOT reserves native storage; the reference interpreter is a semantic no-op because Python lists already over-allocate geometrically. Negative capacities raise `E300`. |
 | `list.flat` | `list.flat(xss: [[T]]) -> [T]` | Concatenate a list of lists. |
 | `list.zip` | `list.zip(xs: [T], ys: [U]) -> [[any]]` | Pair up elements; stops at the shorter list. (Pairs are 2-element lists — Misa has no tuple type.) |
 | `list.unique` | `list.unique(xs: [T]) -> [T]` | Deduplicate, keeping first-occurrence order. |

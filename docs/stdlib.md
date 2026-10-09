@@ -403,6 +403,7 @@ print(fold([1, 2, 3, 4], 0, |a, b| a + b))  // 10
 print(sort_by(["bb", "a"], |a, b| len(a) < len(b))) // [a, bb]
 
 var xs: [Int] = []
+list.reserve(xs, 1000)              // optional AOT allocation hint
 for i in 0..3 { list.push(xs, i) } // amortized O(1) append
 print(xs)                         // [0, 1, 2]
 
@@ -419,6 +420,7 @@ print(list.unique([2, 1, 2]))   // [2, 1]
 |---|---|
 | `map` / `filter` / `fold` / `sort_by` | higher-order list functions (`sort_by` takes a `less` comparator and is stable) |
 | `list.push` | mutate a list by appending one value (amortized O(1); aliases observe the append) |
+| `list.reserve` | `list.reserve(xs: [T], capacity: Int) -> Void` — reserve storage without changing length; interpreter is a validated no-op; negative capacity is E300 |
 | `list.flat` / `list.zip` / `list.unique` | `[[T]] -> [T]` / pair up / dedupe (first-occurrence order) |
 | `set()` | `set() -> Set<T>` — empty set; `s.add(x)` method syntax works too |
 | `set.add` / `set.contains` / `set.remove` | mutate / test / delete |

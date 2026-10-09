@@ -187,6 +187,8 @@ MVal *misa_builtin_len(MVal *v, int line, int col);
 MVal *misa_builtin_range(MVal *a, MVal *b, MVal *c, int has_b, int has_c);
 /* Optimized list access with unboxed index */
 MVal *misa_list_get_raw(MVal *list, int64_t idx, int line, int col);
+int64_t misa_list_get_int_raw(MVal *list, int64_t idx, int line, int col);
+double misa_list_get_float_raw(MVal *list, int64_t idx, int line, int col);
 void misa_list_set_raw(MVal *list, int64_t idx, MVal *val, int line, int col);
 /* Unboxed typed lists */
 MVal *misa_list_bool_new(void);
@@ -195,6 +197,7 @@ MVal *misa_list_float_new(void);
 void misa_list_bool_push(MVal *list, int b);
 void misa_list_int_push(MVal *list, int64_t v);
 void misa_list_append(MVal *list, MVal *value, int line, int col);
+void misa_list_reserve(MVal *list, int64_t capacity, int line, int col);
 int misa_list_bool_get(MVal *list, int64_t idx, int line, int col);
 void misa_list_bool_set(MVal *list, int64_t idx, int b, int line, int col);
 int64_t misa_list_int_get(MVal *list, int64_t idx, int line, int col);

@@ -2251,6 +2251,16 @@ class Interpreter:
                 raise RuntimeError_("list.push needs a list")
             xs.append(value)
             return None
+        if name == "list.reserve":
+            xs, capacity = args[0], args[1]
+            if not isinstance(xs, list):
+                raise RuntimeError_("list.reserve needs a list")
+            if not isinstance(capacity, int) or isinstance(capacity, bool) \
+                    or capacity < 0:
+                raise RuntimeError_("list.reserve capacity must be a non-negative Int")
+            # Python lists already reserve geometrically; this is a semantic
+            # no-op on the reference interpreter.
+            return None
         if name == "list.flat":
             xss = args[0]
             if not all(isinstance(xs, list) for xs in xss):

@@ -10,6 +10,14 @@ from misa import benchmark
 
 
 def main():
+    assert benchmark._same_benchmark_output(
+        "n-body", "-0.16902000037197656\n",
+        "-0.169075164\n-0.169020000\n")
+    assert not benchmark._same_benchmark_output(
+        "n-body", "-0.1690\n", "-0.1689\n")
+    assert benchmark._same_benchmark_output("fannkuch-redux", "7\n", "7\n")
+    assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
+
     # The harness now exposes a five-element run_cmd result including RSS.
     wall, out, err, rc, rss = benchmark.run_cmd(
         [sys.executable, "-c", "print('benchmark-contract')"]

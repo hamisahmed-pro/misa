@@ -42,12 +42,21 @@ tests/aot/      AOT parity suite: native binaries vs the interpreter
 export PATH="$PWD/impl/bin:$PATH"
 
 misa check examples/hello.misa        # type-check
+misa check examples/hello.misa --json # versioned diagnostics for agents
 misa run examples/hello.misa          # run (interpreted)
 misa build examples/hello.misa -o hello  # compile to native binary
 ./hello
 misa fmt examples/hello.misa          # canonical format
 misa test examples/plantcare.misa --mock examples/mocks.json
+misa profile examples/hello.misa --json --memory
 ```
+
+`misa check --json` preserves the compatibility `errors` and `warnings`
+arrays while adding `schema_version: "misa.check.v1"` and a normalized
+`diagnostics` array with severity, code, message, line/column, and hint fields.
+`misa profile --memory` reports the peak traced CPython heap used while
+interpreting (including interpreter overhead); it is not process RSS. Use
+`misa benchmark` for process-level RSS measurements.
 
 `misa build` needs Python `llvmlite==0.50.0` (`pip install -r impl/requirements.txt`), a C
 compiler, and (for model calls / `http.get`) libcurl. The Boehm GC is

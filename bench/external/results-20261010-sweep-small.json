@@ -1,0 +1,200 @@
+{
+  "timestamp": "2026-10-09T23:21:13.927480+00:00",
+  "misa_version": "AOT",
+  "host": "Linux-6.18.38+-x86_64-with-glibc2.39",
+  "cpu": "x86_64",
+  "methodology": {
+    "timing": "external wall-clock per independent process; paired randomized implementation order",
+    "warmups": 3,
+    "measured_runs": 3,
+    "aot_build": "outside runtime measurements",
+    "statistics": [
+      "median",
+      "p95",
+      "min",
+      "max",
+      "stddev"
+    ],
+    "memory": "peak child-process RSS from resource.getrusage in a Python wrapper",
+    "correctness": "exact stdout equality except n-body/spectral-norm compare canonical numeric result within 1e-8",
+    "checksum": "SHA-256 reported on output mismatch"
+  },
+  "scale": "small",
+  "random_seed": 20261009,
+  "python_version": "3.12",
+  "results": [
+    {
+      "name": "n-body",
+      "case_id": "n-body:small",
+      "input_argument": "5000",
+      "status": "ok",
+      "misa": {
+        "median": 0.1,
+        "times": [
+          0.099596,
+          0.097654,
+          0.101253
+        ],
+        "p95": 0.101253,
+        "min": 0.097654,
+        "max": 0.101253,
+        "stddev": 0.001801,
+        "peak_rss_kb": 80208
+      },
+      "python": {
+        "median": 0.041,
+        "times": [
+          0.041499,
+          0.041732,
+          0.039742
+        ],
+        "p95": 0.041732,
+        "min": 0.039742,
+        "max": 0.041732,
+        "stddev": 0.001088,
+        "peak_rss_kb": 11524
+      },
+      "ratio_misa_python": 2.4,
+      "verdict": "slower",
+      "description": "N-body simulation"
+    },
+    {
+      "name": "spectral-norm",
+      "case_id": "spectral-norm:small",
+      "input_argument": "100",
+      "status": "ok",
+      "misa": {
+        "median": 0.179,
+        "times": [
+          0.17943,
+          0.177517,
+          0.195998
+        ],
+        "p95": 0.195998,
+        "min": 0.177517,
+        "max": 0.195998,
+        "stddev": 0.010163,
+        "peak_rss_kb": 207812
+      },
+      "python": {
+        "median": 0.069,
+        "times": [
+          0.067332,
+          0.068997,
+          0.070175
+        ],
+        "p95": 0.070175,
+        "min": 0.067332,
+        "max": 0.070175,
+        "stddev": 0.001429,
+        "peak_rss_kb": 11496
+      },
+      "ratio_misa_python": 2.6,
+      "verdict": "slower",
+      "description": "Spectral norm"
+    },
+    {
+      "name": "fannkuch-redux",
+      "case_id": "fannkuch-redux:small",
+      "input_argument": "8",
+      "status": "ok",
+      "misa": {
+        "median": 0.064,
+        "times": [
+          0.058131,
+          0.064718,
+          0.06362
+        ],
+        "p95": 0.064718,
+        "min": 0.058131,
+        "max": 0.064718,
+        "stddev": 0.003529,
+        "peak_rss_kb": 11496
+      },
+      "python": {
+        "median": 0.06,
+        "times": [
+          0.059991,
+          0.068812,
+          0.058509
+        ],
+        "p95": 0.068812,
+        "min": 0.058509,
+        "max": 0.068812,
+        "stddev": 0.00557,
+        "peak_rss_kb": 11496
+      },
+      "ratio_misa_python": 1.06,
+      "verdict": "slower",
+      "description": "Fannkuch redux"
+    },
+    {
+      "name": "mandelbrot",
+      "status": "checksum-mismatch",
+      "misa_sha256": "9cdeec9af3b153284185c9c6825bdca2a777a91e25a014b2bd845944c9b7cf96",
+      "python_sha256": "7f175e4420909136a603c53ae0bc078fde55d8f32820bdf337186293d09a5e01",
+      "description": "Mandelbrot set"
+    },
+    {
+      "name": "fasta",
+      "status": "checksum-mismatch",
+      "misa_sha256": "876e13f4e07bb39705302c01f445ffd2d2c3b180a207e4d959d6b671c67da09b",
+      "python_sha256": "62d1e8d0df7938d2aefda9a37887e0389231ea72c099c29a51afb6edca1bdc73",
+      "description": "Fasta DNA generation"
+    },
+    {
+      "name": "reverse-complement",
+      "status": "skipped-unmatched-stdin",
+      "reason": "Python reference requires stdin; Misa port does not use the same input fixture",
+      "description": "Reverse complement"
+    },
+    {
+      "name": "binary-trees",
+      "status": "build-failed",
+      "error": "Traceback (most recent call last):\n  File \"/home/ubuntu/misa/impl/bin/misa\", line 881, in <module>\n    sys.exit(main(sys.argv))\n             ^^^^^^^^^^^^^^\n  File \"/home/ubuntu/misa/impl/bin/misa\", li",
+      "description": "Binary trees"
+    },
+    {
+      "name": "knucleotide",
+      "status": "skipped-unmatched-stdin",
+      "reason": "Python reference requires stdin; Misa port does not use the same input fixture",
+      "description": "K-nucleotide counting"
+    },
+    {
+      "name": "regex-redux",
+      "status": "skipped-unmatched-stdin",
+      "reason": "Python reference requires stdin; Misa port does not use the same input fixture",
+      "description": "Regex redux"
+    },
+    {
+      "name": "startup",
+      "description": "Hello-world cold start (launch to output)",
+      "status": "ok",
+      "median": 0.0172,
+      "times": [
+        0.0174,
+        0.0172,
+        0.0166
+      ]
+    },
+    {
+      "name": "compile",
+      "description": "AOT compilation time (nbody.misa)",
+      "status": "ok",
+      "median": 0.383,
+      "times": [
+        0.383,
+        0.379,
+        0.386
+      ],
+      "binary_bytes": 62240
+    }
+  ],
+  "source_revision": "9daff8066f406f14f96ba9fead0b31244f134f2e",
+  "source_dirty": true,
+  "aggregate": {
+    "scored_cases": 3,
+    "score_definition": "geometric mean of Misa median / Python median; >1 means Misa slower",
+    "misa_python_geomean": 1.877
+  }
+}

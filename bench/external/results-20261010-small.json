@@ -1,0 +1,139 @@
+{
+  "timestamp": "2026-10-09T23:22:36.376263+00:00",
+  "misa_version": "AOT",
+  "host": "Linux-6.18.38+-x86_64-with-glibc2.39",
+  "cpu": "x86_64",
+  "methodology": {
+    "timing": "external wall-clock per independent process; paired randomized implementation order",
+    "warmups": 3,
+    "measured_runs": 3,
+    "aot_build": "outside runtime measurements",
+    "statistics": [
+      "median",
+      "p95",
+      "min",
+      "max",
+      "stddev"
+    ],
+    "memory": "peak child-process RSS from resource.getrusage in a Python wrapper",
+    "correctness": "exact stdout equality except n-body/spectral-norm compare canonical numeric result within 1e-8",
+    "checksum": "SHA-256 reported on output mismatch"
+  },
+  "scale": "small",
+  "random_seed": 20261009,
+  "source_revision": "9daff8066f406f14f96ba9fead0b31244f134f2e",
+  "source_dirty": true,
+  "aggregate": {
+    "scored_cases": 3,
+    "score_definition": "geometric mean of Misa median / Python median; >1 means Misa slower",
+    "misa_python_geomean": 2.0074
+  },
+  "python_version": "3.12",
+  "results": [
+    {
+      "name": "n-body",
+      "case_id": "n-body:small",
+      "input_argument": "5000",
+      "status": "ok",
+      "misa": {
+        "median": 0.101,
+        "times": [
+          0.101528,
+          0.10085,
+          0.100935
+        ],
+        "p95": 0.101528,
+        "min": 0.10085,
+        "max": 0.101528,
+        "stddev": 0.00037,
+        "peak_rss_kb": 80204
+      },
+      "python": {
+        "median": 0.04,
+        "times": [
+          0.038793,
+          0.040153,
+          0.042963
+        ],
+        "p95": 0.042963,
+        "min": 0.038793,
+        "max": 0.042963,
+        "stddev": 0.002127,
+        "peak_rss_kb": 11496
+      },
+      "ratio_misa_python": 2.51,
+      "verdict": "slower",
+      "description": "N-body simulation"
+    },
+    {
+      "name": "spectral-norm",
+      "case_id": "spectral-norm:small",
+      "input_argument": "100",
+      "status": "ok",
+      "misa": {
+        "median": 0.196,
+        "times": [
+          0.196016,
+          0.190047,
+          0.200119
+        ],
+        "p95": 0.200119,
+        "min": 0.190047,
+        "max": 0.200119,
+        "stddev": 0.005065,
+        "peak_rss_kb": 207812
+      },
+      "python": {
+        "median": 0.075,
+        "times": [
+          0.069971,
+          0.091681,
+          0.074736
+        ],
+        "p95": 0.091681,
+        "min": 0.069971,
+        "max": 0.091681,
+        "stddev": 0.01141,
+        "peak_rss_kb": 11528
+      },
+      "ratio_misa_python": 2.62,
+      "verdict": "slower",
+      "description": "Spectral norm"
+    },
+    {
+      "name": "fannkuch-redux",
+      "case_id": "fannkuch-redux:small",
+      "input_argument": "8",
+      "status": "ok",
+      "misa": {
+        "median": 0.054,
+        "times": [
+          0.068095,
+          0.054026,
+          0.053215
+        ],
+        "p95": 0.068095,
+        "min": 0.053215,
+        "max": 0.068095,
+        "stddev": 0.008367,
+        "peak_rss_kb": 11720
+      },
+      "python": {
+        "median": 0.044,
+        "times": [
+          0.043885,
+          0.043475,
+          0.043772
+        ],
+        "p95": 0.043885,
+        "min": 0.043475,
+        "max": 0.043885,
+        "stddev": 0.000212,
+        "peak_rss_kb": 11524
+      },
+      "ratio_misa_python": 1.23,
+      "verdict": "slower",
+      "description": "Fannkuch redux"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+let ints: [Int] = [1, 2]
+let floats: [Float] = [1.5, 2.5]
+let texts: [Text] = ["a"]
+list.reserve(ints, 128)
+list.reserve(floats, 64)
+list.reserve(texts, 32)
+print(len(ints))
+print(ints[1])
+print(len(floats))
+print(floats[0])
+print(len(texts))
+print(texts[0])

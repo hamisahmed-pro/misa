@@ -4975,6 +4975,62 @@ MVal *misa_list_get_raw(MVal *list, int64_t idx, int line, int col) {
     return list->u.list.items[idx];
 }
 
+int64_t misa_list_get_int_raw(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return 0;
+    if (!list) {
+        misa_raise("E200", "index on non-list", line, col);
+        return 0;
+    }
+    if (list->tag == M_TAG_LIST_INT) {
+        if (idx < 0 || idx >= list->u.list_int.len) {
+            misa_raise("E300", "index out of range", line, col);
+            return 0;
+        }
+        return list->u.list_int.items[idx];
+    }
+    if (list->tag != M_TAG_LIST) {
+        misa_raise("E200", "expected [Int] list", line, col);
+        return 0;
+    }
+    if (idx < 0 || idx >= list->u.list.len) {
+        misa_raise("E300", "index out of range", line, col);
+        return 0;
+    }
+    MVal *v = list->u.list.items[idx];
+    if (v && v->tag == M_TAG_INT) return v->u.i;
+    misa_raise("E200", "expected Int element in [Int] list", line, col);
+    return 0;
+}
+
+double misa_list_get_float_raw(MVal *list, int64_t idx, int line, int col) {
+    if (misa_pending()) return 0.0;
+    if (!list) {
+        misa_raise("E200", "index on non-list", line, col);
+        return 0.0;
+    }
+    if (list->tag == M_TAG_LIST_FLOAT) {
+        if (idx < 0 || idx >= list->u.list_float.len) {
+            misa_raise("E300", "index out of range", line, col);
+            return 0.0;
+        }
+        return list->u.list_float.items[idx];
+    }
+    if (list->tag != M_TAG_LIST) {
+        misa_raise("E200", "expected [Float] list", line, col);
+        return 0.0;
+    }
+    if (idx < 0 || idx >= list->u.list.len) {
+        misa_raise("E300", "index out of range", line, col);
+        return 0.0;
+    }
+    MVal *v = list->u.list.items[idx];
+    if (v && v->tag == M_TAG_FLOAT) return v->u.f;
+    if (v && v->tag == M_TAG_INT) return (double)v->u.i;
+    misa_raise("E200", "expected numeric element in [Float] list",
+               line, col);
+    return 0.0;
+}
+
 void misa_list_set_raw(MVal *list, int64_t idx, MVal *val, int line, int col) {
     if (misa_pending()) return;
     // Dispatch to unboxed storage if applicable
@@ -5066,6 +5122,50 @@ static void misa_list_float_push(MVal *list, double v) {
         list->u.list_float.items, &list->u.list_float.cap,
         list->u.list_float.len + 1, sizeof(double));
     list->u.list_float.items[list->u.list_float.len++] = v;
+}
+
+void misa_list_reserve(MVal *list, int64_t capacity, int line, int col) {
+    if (misa_pending()) return;
+    if (!list || capacity < 0) {
+        misa_raise("E300", "list.reserve needs a list and non-negative capacity",
+                   line, col);
+        return;
+    }
+    switch (list->tag) {
+    case M_TAG_LIST:
+        if ((uint64_t)capacity > SIZE_MAX / sizeof(MVal *)) goto too_large;
+        list->u.list.items = (MVal **)grow_array(
+            list->u.list.items, &list->u.list.cap,
+            capacity > list->u.list.len ? capacity : list->u.list.len,
+            sizeof(MVal *));
+        return;
+    case M_TAG_LIST_BOOL:
+        if ((uint64_t)capacity > SIZE_MAX / sizeof(uint8_t)) goto too_large;
+        list->u.list_bool.items = (uint8_t *)grow_array(
+            list->u.list_bool.items, &list->u.list_bool.cap,
+            capacity > list->u.list_bool.len ? capacity : list->u.list_bool.len,
+            sizeof(uint8_t));
+        return;
+    case M_TAG_LIST_INT:
+        if ((uint64_t)capacity > SIZE_MAX / sizeof(int64_t)) goto too_large;
+        list->u.list_int.items = (int64_t *)grow_array(
+            list->u.list_int.items, &list->u.list_int.cap,
+            capacity > list->u.list_int.len ? capacity : list->u.list_int.len,
+            sizeof(int64_t));
+        return;
+    case M_TAG_LIST_FLOAT:
+        if ((uint64_t)capacity > SIZE_MAX / sizeof(double)) goto too_large;
+        list->u.list_float.items = (double *)grow_array(
+            list->u.list_float.items, &list->u.list_float.cap,
+            capacity > list->u.list_float.len ? capacity : list->u.list_float.len,
+            sizeof(double));
+        return;
+    default:
+        misa_raise("E300", "list.reserve needs a list", line, col);
+        return;
+    }
+too_large:
+    misa_raise("E300", "list.reserve capacity is too large", line, col);
 }
 
 void misa_list_append(MVal *list, MVal *value, int line, int col) {

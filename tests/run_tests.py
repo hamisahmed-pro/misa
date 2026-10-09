@@ -876,6 +876,30 @@ def _():
     assert "1/1 evals passed" in r.stdout
     r = _cli("check", f"{ex}/hello.misa", "--json")
     eq(r.returncode, 0)
+    payload = json.loads(r.stdout)
+    eq(payload["schema_version"], "misa.check.v1")
+    eq(payload["ok"], True)
+    eq(payload["diagnostics"], [])
+    assert "throws_graph" in payload
+
+
+@test("cli: check JSON diagnostics expose stable locations and hints")
+def _():
+    with tempfile.NamedTemporaryFile("w", suffix=".misa", delete=False) as f:
+        f.write('print(no_such_name)\n')
+        path = f.name
+    try:
+        r = _cli("check", path, "--json")
+        eq(r.returncode, 1)
+        payload = json.loads(r.stdout)
+        diag = payload["diagnostics"][0]
+        eq(payload["schema_version"], "misa.check.v1")
+        eq(diag["severity"], "error")
+        eq(diag["code"], "E101")
+        eq(diag["location"]["line"], 1)
+        assert diag["message"] and "errors" in payload
+    finally:
+        os.unlink(path)
 
 
 @test("cli: check fails cleanly on bad code")
@@ -4765,6 +4789,34 @@ def _():
     row = doc["profile"][0]
     assert set(row) >= {"function", "file", "line", "samples",
                         "pct"}, row
+
+
+@test("profile: --memory reports a scoped traced-heap peak")
+def _():
+    rc, out, err = _profile_run(_FIB_SRC, ("--json", "--memory"))
+    assert rc == 0, err
+    doc = json.loads(out[out.index("{"):])
+    assert doc["schema_version"] == "misa.profile.v1"
+    assert doc["memory"]["kind"] == "tracemalloc_peak"
+    assert doc["memory"]["peak_bytes"] > 0
+    assert "excludes native RSS" in doc["memory"]["scope"]
+
+
+@test("stdlib: list.reserve preserves length, contents, and aliases")
+def _():
+    src = ('var xs: [Int] = [1, 2]\n'
+           'let alias = xs\n'
+           'list.reserve(xs, 1024)\n'
+           'list.push(xs, 3)\n'
+           'print(len(alias))\n'
+           'print(alias[2])\n')
+    eq(run_src(src), "3\n3\n")
+
+
+@test("stdlib: list.reserve rejects negative capacity")
+def _():
+    raises_code(lambda: run_src(
+        "let xs: [Int] = []\nlist.reserve(xs, -1)\n"), "E300")
 
 
 @test("profile: check errors fail cleanly")

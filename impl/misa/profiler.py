@@ -26,6 +26,7 @@ import os
 import sys
 import threading
 import time
+import tracemalloc
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import ast
@@ -117,7 +118,8 @@ class ProfileSession:
                  prog: ast.Program,
                  file_of: Dict[int, str],
                  main_path: str,
-                 interval_ms: float = 10.0):
+                 interval_ms: float = 10.0,
+                 track_memory: bool = False):
         install_hooks()
         self.interp = interp
         self.interval_ms = interval_ms
@@ -136,6 +138,9 @@ class ProfileSession:
         self._stop = threading.Event()
         self._sampler: Optional[threading.Thread] = None
         self.program_failed = False
+        self.track_memory = track_memory
+        self.memory_peak_bytes: Optional[int] = None
+        self._owns_tracemalloc = False
         interp._prof_session = self  # noqa: SLF001 (hook slot)
 
     # -- hooking --------------------------------------------------------
@@ -207,7 +212,13 @@ class ProfileSession:
         if self.total == 0:
             lines.append("(no samples: the program finished before the "
                          "first tick)")
+            if self.memory_peak_bytes is not None:
+                lines.append(f"peak traced Python heap: {self.memory_peak_bytes} bytes "
+                             "(includes interpreter overhead; not process RSS)")
             return "\n".join(lines)
+        if self.memory_peak_bytes is not None:
+            lines.append(f"peak traced Python heap: {self.memory_peak_bytes} bytes "
+                         "(includes interpreter overhead; not process RSS)")
         lines.append(f"{'samples':>7}  {'%':>5}  "
                      f"{'function':<24}  location")
         for r in self.rows():
@@ -217,13 +228,27 @@ class ProfileSession:
         return "\n".join(lines)
 
     def report_json(self) -> str:
-        return json.dumps({"samples": self.total,
-                           "interval_ms": self.interval_ms,
-                           "profile": self.rows()}, indent=2)
+        result = {"schema_version": "misa.profile.v1",
+                  "samples": self.total,
+                  "interval_ms": self.interval_ms,
+                  "profile": self.rows()}
+        if self.memory_peak_bytes is not None:
+            result["memory"] = {
+                "kind": "tracemalloc_peak",
+                "peak_bytes": self.memory_peak_bytes,
+                "scope": "CPython heap, including interpreter overhead; excludes native RSS",
+            }
+        return json.dumps(result, indent=2)
 
     # -- run ------------------------------------------------------------
 
     def run_program(self, prog: ast.Program) -> None:
+        if self.track_memory:
+            self._owns_tracemalloc = not tracemalloc.is_tracing()
+            if self._owns_tracemalloc:
+                tracemalloc.start()
+            else:
+                tracemalloc.reset_peak()
         self.start()
         try:
             self.interp.load(prog)
@@ -237,11 +262,16 @@ class ProfileSession:
             self.stop()
             # Detach so a reused interpreter doesn't keep profiling.
             self.interp._prof_session = None  # noqa: SLF001
+            if self.track_memory and tracemalloc.is_tracing():
+                _current, self.memory_peak_bytes = tracemalloc.get_traced_memory()
+                if self._owns_tracemalloc:
+                    tracemalloc.stop()
 
 
 def profile_file(path: str, mock_path: Optional[str],
                  as_json: bool, interval_ms: float,
-                 prog_argv: Optional[List[str]] = None) -> int:
+                 prog_argv: Optional[List[str]] = None,
+                 track_memory: bool = False) -> int:
     """Load, check, and profile a program. Returns process exit code."""
     from .checker import Checker
     from .loader import load as load_with_imports
@@ -267,7 +297,8 @@ def profile_file(path: str, mock_path: Optional[str],
         argv=prog_argv or [])
     interp.file_of = file_of
     session = ProfileSession(interp, merged, file_of, path,
-                             interval_ms=interval_ms)
+                             interval_ms=interval_ms,
+                             track_memory=track_memory)
     failed = False
     try:
         session.run_program(merged)

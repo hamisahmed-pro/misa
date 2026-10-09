@@ -1,0 +1,30 @@
+// Typed list indexing in AOT must return raw scalars without boxing.
+fn sum_ints(xs: [Int]) -> Int {
+  var total: Int = 0
+  var i: Int = 0
+  while i < len(xs) {
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+
+fn sum_floats(xs: [Float]) -> Float {
+  var total: Float = 0.0
+  var i: Int = 0
+  while i < len(xs) {
+    total = total + xs[i]
+    i = i + 1
+  }
+  return total
+}
+
+let ints: [Int] = [1, 2, 3, 4]
+let floats: [Float] = [0.5, 1.25, 2.0]
+print(sum_ints(ints))
+print(sum_floats(floats))
+try {
+  print(ints[99])
+} catch e {
+  print(e.code)
+}

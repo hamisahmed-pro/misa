@@ -138,7 +138,10 @@ _RT_SIGS = {
     "misa_list_int_push": (ir.VoidType(), [PTR, I64]),
     "misa_list_push": (ir.VoidType(), [PTR, PTR]),
     "misa_list_append": (ir.VoidType(), [PTR, PTR, I32, I32]),
+    "misa_list_reserve": (ir.VoidType(), [PTR, I64, I32, I32]),
     "misa_list_get": (PTR, [PTR, I64]),
+    "misa_list_get_int_raw": (I64, [PTR, I64, I32, I32]),
+    "misa_list_get_float_raw": (DBL, [PTR, I64, I32, I32]),
     # Phase 8 (overtake): wrap each element of a list as an interface
     # value with the given impl tag.
     "misa_iface_wrap_list": (PTR, [I64, PTR]),
@@ -385,6 +388,8 @@ class Emitter:
         # P-2 Level 2: raw i64 specializations for Int->Int functions.
         # int_fns[name] -> ir.Function with signature i64 (i64, ...).
         self.int_fns = {}
+        self.float_fns = {}
+        self.mir_scalar_modules = {}
         self.models = {}    # model name -> (ir.Function, meta_global)
         self.screens = {}   # screen name -> ir.Function
         self.screen_bodies = {}  # screen name -> _body ir.Function
@@ -1384,6 +1389,50 @@ class Emitter:
         b.cbranch(ok, cont, ctx.err_stack[-1])
         b.position_at_end(cont)
 
+    def _lower_scalar_mir(self, decl):
+        """Return optimized MIR for a small pure numeric function, else None.
+
+        The initial production bridge is deliberately narrow: one scalar
+        numeric signature and straight-line lets/return only. All other code
+        remains on the proven general AOT emitter.
+        """
+        ret_is_int = self._te_is_int(decl.ret)
+        ret_is_float = self._te_is_float(decl.ret)
+        if not (ret_is_int or ret_is_float) or not decl.params:
+            return None
+        wanted = "Int" if ret_is_int else "Float"
+        if not all((self._te_is_int(te) if ret_is_int
+                    else self._te_is_float(te))
+                   for _name, te in decl.params):
+            return None
+        if ret_is_int:
+            stack = list(decl.body)
+            while stack:
+                node = stack.pop()
+                if isinstance(node, A.BinOp) and node.op in ("/", "%"):
+                    # Preserve the runtime's checked E300 integer division.
+                    return None
+                if isinstance(node, A.Node):
+                    for value in vars(node).values():
+                        if isinstance(value, A.Node):
+                            stack.append(value)
+                        elif isinstance(value, (list, tuple)):
+                            stack.extend(x for x in value if isinstance(x, A.Node))
+        from ..mir import optimize, verify
+        from ..mir_lower import MIRLowerError, lower_program
+        try:
+            module = lower_program(A.Program(items=[decl]))
+            optimize(module)
+            if verify(module):
+                return None
+            if len(module.functions) != 1 or len(module.functions[0].blocks) != 1:
+                return None
+            return module
+        except MIRLowerError:
+            # MIR is an optimization path, never a correctness prerequisite.
+            # The ordinary emitter remains responsible for the function.
+            return None
+
     # -- top-level ------------------------------------------------------
 
     def emit(self) -> ir.Module:
@@ -1406,6 +1455,18 @@ class Emitter:
                 rty = ir.FunctionType(I64, [I64] * len(decl.params))
                 self.int_fns[name] = ir.Function(
                     self.mod, rty, name=f"misa_fn_{name}__int")
+                mir = self._lower_scalar_mir(decl)
+                if mir is not None:
+                    self.mir_scalar_modules[name] = mir
+            elif (not decl.type_params and self._te_is_float(decl.ret)
+                  and decl.params
+                  and all(self._te_is_float(p[1]) for p in decl.params)):
+                mir = self._lower_scalar_mir(decl)
+                if mir is not None:
+                    rty = ir.FunctionType(DBL, [DBL] * len(decl.params))
+                    self.float_fns[name] = ir.Function(
+                        self.mod, rty, name=f"misa_fn_{name}__float")
+                    self.mir_scalar_modules[name] = mir
         # Phase 8 (overtake): declare impl method functions.
         self.declare_impl_fns()
         for name, decl in self.model_decls.items():
@@ -1702,26 +1763,32 @@ class Emitter:
         if name in self.int_fns:
             self.emit_int_fn(name, decl)
             return
+        if name in self.float_fns:
+            self.emit_float_fn(name, decl)
+            return
         fn = self.fns[name]
         self.emit_fn_body_direct(fn, decl)
 
     def emit_int_fn(self, name: str, decl: A.FnDecl):
         """Emit `misa_fn_<name>__int(i64...) -> i64` and the MVal* wrapper."""
         raw_fn = self.int_fns[name]
-        ctx = self.new_fn_ctx(raw_fn, int_mode=True)
-        b = ctx.builder
-        # Params are raw i64; alloca as i64 at entry.
-        for (pn, _), arg in zip(decl.params, raw_fn.args):
-            arg.name = f"p_{pn}"
-            save = b.block
-            b.position_at_start(raw_fn.basic_blocks[0])
-            a = b.alloca(I64, name=f"i_{pn}")
-            b.position_at_end(save)
-            b.store(arg, a)
-            ctx.scope.declare(pn, a)
-            ctx.int_vars.add(pn)
-        self.emit_block(decl.body, ctx)
-        self.finish_fn_ctx(ctx)
+        mir_module = self.mir_scalar_modules.get(name)
+        if mir_module is not None:
+            self._emit_mir_scalar_body(raw_fn, mir_module)
+        else:
+            ctx = self.new_fn_ctx(raw_fn, int_mode=True)
+            b = ctx.builder
+            for (pn, _), arg in zip(decl.params, raw_fn.args):
+                arg.name = f"p_{pn}"
+                save = b.block
+                b.position_at_start(raw_fn.basic_blocks[0])
+                a = b.alloca(I64, name=f"i_{pn}")
+                b.position_at_end(save)
+                b.store(arg, a)
+                ctx.scope.declare(pn, a)
+                ctx.int_vars.add(pn)
+            self.emit_block(decl.body, ctx)
+            self.finish_fn_ctx(ctx)
         # MVal* wrapper for generic callers: unbox args, call raw, box.
         fn = self.fns[name]
         wctx = self.new_fn_ctx(fn)
@@ -1735,6 +1802,79 @@ class Emitter:
         boxed = self.call(wctx, "misa_int", [r], decl, check=False)
         self.emit_ret(wctx, boxed)
         self.finish_fn_ctx(wctx)
+
+    def emit_float_fn(self, name: str, decl: A.FnDecl):
+        raw_fn = self.float_fns[name]
+        self._emit_mir_scalar_body(raw_fn, self.mir_scalar_modules[name])
+        fn = self.fns[name]
+        wctx = self.new_fn_ctx(fn)
+        raw_args = [self.call(wctx, "misa_as_float", [arg], decl,
+                              check=True)
+                    for arg in fn.args]
+        result = wctx.builder.call(raw_fn, raw_args, name="_raw_float")
+        self.check(wctx, decl)
+        boxed = self.call(wctx, "misa_float", [result], decl, check=False)
+        self.emit_ret(wctx, boxed)
+        self.finish_fn_ctx(wctx)
+
+    def _emit_mir_scalar_body(self, raw_fn, module):
+        """Translate verified single-block scalar MIR into LLVM instructions."""
+        from ..mir import I64 as MIR_I64, F64 as MIR_F64, BOOL as MIR_BOOL
+        mir_fn = module.functions[0]
+        block = raw_fn.append_basic_block("mir.entry")
+        b = ir.IRBuilder(block)
+        values = {}
+        llvm_types = {MIR_I64: I64, MIR_F64: DBL, MIR_BOOL: I1}
+        for param, arg in zip(mir_fn.params, raw_fn.args):
+            arg.name = f"p_{param.id}"
+            values[param.id] = arg
+        for ins in mir_fn.blocks[0].instructions:
+            if ins.op == "const":
+                ty = llvm_types[ins.result.type]
+                if ty == I1:
+                    value = ir.Constant(I1, int(bool(ins.imm)))
+                elif ty == DBL:
+                    value = ir.Constant(DBL, float(ins.imm))
+                else:
+                    value = ir.Constant(I64, int(ins.imm))
+                values[ins.result.id] = value
+                continue
+            if ins.op == "return":
+                if ins.args:
+                    b.ret(values[ins.args[0].id])
+                else:
+                    b.ret_void()
+                continue
+            args = [values[a.id] for a in ins.args]
+            if ins.op in {"add", "sub", "mul"}:
+                ty = ins.result.type
+                if ty == MIR_F64:
+                    op = {"add": b.fadd, "sub": b.fsub,
+                          "mul": b.fmul}[ins.op]
+                else:
+                    op = {"add": b.add, "sub": b.sub,
+                          "mul": b.mul}[ins.op]
+                value = op(args[0], args[1], name=f"mir_{ins.op}")
+            elif ins.op == "div" and ins.result.type == MIR_F64:
+                value = b.fdiv(args[0], args[1], name="mir_fdiv")
+            elif ins.op.startswith("cmp_"):
+                pred = {"cmp_eq": "==", "cmp_ne": "!=", "cmp_lt": "<",
+                        "cmp_le": "<=", "cmp_gt": ">", "cmp_ge": ">="}[ins.op]
+                if ins.args[0].type == MIR_F64:
+                    value = (b.fcmp_unordered(pred, args[0], args[1],
+                                              name="mir_fcmp")
+                             if pred == "!=" else
+                             b.fcmp_ordered(pred, args[0], args[1],
+                                            name="mir_fcmp"))
+                else:
+                    value = b.icmp_signed(pred, args[0], args[1],
+                                          name="mir_icmp")
+            else:
+                raise AOTError("E600", f"unsupported verified MIR op '{ins.op}'")
+            if ins.result is not None:
+                values[ins.result.id] = value
+        if not block.is_terminated:
+            raise AOTError("E600", "MIR function has no terminal return")
 
     def emit_fn_body_direct(self, fn, decl: A.FnDecl):
         ctx = self.new_fn_ctx(fn)
@@ -2497,9 +2637,9 @@ class Emitter:
             obj = self.emit_expr(e.obj, ctx)
             self.check(ctx, e)
             obj = self._ensure_mval(obj, e.obj, ctx)
+            line, col = self.loc(e)
             idx = self.emit_expr(e.idx, ctx)
             self.check(ctx, e)
-            line, col = self.loc(e)
             # Fast path: raw i64 index avoids boxing — ONLY for lists.
             # For Text (and other types), use the generic path which
             # dispatches correctly. Using misa_list_get_raw on a Text
@@ -2651,6 +2791,22 @@ class Emitter:
                 and not te.is_map and not te.is_func
                 and not te.optional and not te.type_args)
 
+    @staticmethod
+    def _list_elem_kind(te):
+        """Return a primitive element type only for a non-optional list."""
+        if (te is None or not getattr(te, "is_list", False)
+                or getattr(te, "is_map", False)
+                or getattr(te, "is_func", False)
+                or getattr(te, "optional", False)
+                or getattr(te, "type_args", ())):
+            return None
+        return te.name if te.name in {"Int", "Float", "Bool"} else None
+
+    def _list_expr_elem_kind(self, e, ctx: FnCtx):
+        if isinstance(e, A.Ident):
+            return self._list_elem_kind(ctx.var_types.get(e.name))
+        return None
+
     def _is_int_expr(self, e, ctx: FnCtx) -> bool:
         """Conservative provability: is e definitely an Int value?"""
         if isinstance(e, A.IntLit):
@@ -2662,6 +2818,9 @@ class Emitter:
                 return (self._is_int_expr(e.left, ctx)
                         and self._is_int_expr(e.right, ctx))
             return False
+        if isinstance(e, A.Index):
+            return (self._list_expr_elem_kind(e.obj, ctx) == "Int"
+                    and self._is_int_expr(e.idx, ctx))
         if isinstance(e, A.UnOp):
             return e.op == "-" and self._is_int_expr(e.operand, ctx)
         if isinstance(e, A.Call):
@@ -2693,6 +2852,12 @@ class Emitter:
             return True
         if isinstance(e, A.Ident):
             return e.name in ctx.raw_float_vars
+        if isinstance(e, A.Index):
+            return (self._list_expr_elem_kind(e.obj, ctx) == "Float"
+                    and self._is_int_expr(e.idx, ctx))
+        if isinstance(e, A.Call) and e.callee is None \
+                and e.name in self.float_fns:
+            return all(self._is_float_expr(a, ctx) for a in e.args)
         if isinstance(e, A.BinOp):
             if e.op in ("+", "-", "*", "/"):
                 return (self._is_float_expr(e.left, ctx)
@@ -2704,6 +2869,17 @@ class Emitter:
         """Emit e and produce its double value (unboxing if boxed)."""
         if isinstance(e, A.FloatLit):
             return ir.Constant(DBL, e.value)
+        if isinstance(e, A.Index) and \
+                self._list_expr_elem_kind(e.obj, ctx) == "Float" and \
+                self._is_int_expr(e.idx, ctx):
+            obj = self.emit_expr(e.obj, ctx)
+            self.check(ctx, e)
+            obj = self._ensure_mval(obj, e.obj, ctx)
+            idx = self._to_i64(e.idx, ctx)
+            self.check(ctx, e)
+            line, col = self.loc(e)
+            return self.call(ctx, "misa_list_get_float_raw",
+                             [obj, idx, line, col], e)
         v = self.emit_expr(e, ctx)
         if v.type == DBL:
             return v
@@ -2733,6 +2909,17 @@ class Emitter:
         # Fast path: integer literals need no boxing at all.
         if isinstance(e, A.IntLit):
             return self.const_i64(e.value)
+        if isinstance(e, A.Index) and \
+                self._list_expr_elem_kind(e.obj, ctx) == "Int" and \
+                self._is_int_expr(e.idx, ctx):
+            obj = self.emit_expr(e.obj, ctx)
+            self.check(ctx, e)
+            obj = self._ensure_mval(obj, e.obj, ctx)
+            idx = self._to_i64(e.idx, ctx)
+            self.check(ctx, e)
+            line, col = self.loc(e)
+            return self.call(ctx, "misa_list_get_int_raw",
+                             [obj, idx, line, col], e)
         v = self.emit_expr(e, ctx)
         if v.type == I64:
             return v
@@ -3020,6 +3207,17 @@ class Emitter:
                 raw_args = [self._emit_int(a, ctx) for a in e.args]
                 return ctx.builder.call(
                     self.int_fns[name], raw_args, name=f"_raw_{name}")
+            if name in self.int_fns and all(
+                    self._is_int_expr(a, ctx) for a in e.args):
+                raw_args = [self._to_i64(a, ctx) for a in e.args]
+                return ctx.builder.call(
+                    self.int_fns[name], raw_args, name=f"_raw_{name}")
+            if name in self.float_fns and all(
+                    self._is_float_expr(a, ctx) for a in e.args):
+                raw_args = [self._to_f64(a, ctx) for a in e.args]
+                return ctx.builder.call(
+                    self.float_fns[name], raw_args,
+                    name=f"_raw_float_{name}")
             args = []
             for a in e.args:
                 v = self.emit_expr(a, ctx)
@@ -3477,6 +3675,11 @@ class Emitter:
         if name == "list.push":
             self.call(ctx, "misa_list_append",
                       [arg(0), arg(1), line, col], e)
+            return self.get_nil(ctx)
+        if name == "list.reserve":
+            cap = self.call(ctx, "misa_as_int", [arg(1)], e)
+            self.call(ctx, "misa_list_reserve",
+                      [arg(0), cap, line, col], e)
             return self.get_nil(ctx)
         if name == "list.flat":
             return self.call(ctx, "misa_list_flat",
