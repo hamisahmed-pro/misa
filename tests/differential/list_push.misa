@@ -1,0 +1,12 @@
+var xs: [Int] = []
+let alias = xs
+var i = 0
+while i < 1000 {
+  list.push(xs, i)
+  i = i + 1
+}
+print(len(alias))
+print(alias[999])
+var flags = [true]
+list.push(flags, false)
+print(flags[1])

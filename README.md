@@ -31,9 +31,9 @@ impl/           the reference implementation (Python 3, stdlib only)
                JSON, blocking model calls, budgets)
   bin/misa     the CLI
 examples/       runnable .misa programs
-tests/          zero-dependency test suite (74 checks)
+tests/          interpreter, compiler, tooling, and platform contract tests
 tests/aot/      AOT parity suite: native binaries vs the interpreter
-                (12 programs, byte-identical stdout/exit/errors)
+                (program fixtures compare outputs, errors, and exits)
 ```
 
 ## Quick start
@@ -58,10 +58,13 @@ arrays while adding `schema_version: "misa.check.v1"` and a normalized
 interpreting (including interpreter overhead); it is not process RSS. Use
 `misa benchmark` for process-level RSS measurements.
 
-`misa build` needs Python `llvmlite==0.50.0` (`pip install -r impl/requirements.txt`), a C
-compiler, and (for model calls / `http.get`) libcurl. The Boehm GC is
-built from source automatically when absent. Streaming model calls are
-rejected at build time with `E402` — use `misa run` for those.
+`misa build` needs Python `llvmlite==0.50.0` (`pip install -r impl/requirements.txt`)
+and a C compiler. On Debian/Ubuntu, install `libgc-dev` to enable the Boehm
+collector; it is **not** installed automatically. Without it, the runtime uses
+a plain-`malloc` fallback that does not reclaim temporary Misa values, so
+allocation-heavy processes can grow substantially. The benchmark manifest
+records which allocator was used. `libcurl` enables model calls and `http.get`.
+Streaming model calls are rejected at build time with `E402` — use `misa run`.
 
 A model call needs a provider key from the environment:
 
@@ -102,15 +105,10 @@ eval diagnose_healthy_plant {
 
 ## Status
 
-- [x] Phase 0 — spec frozen (v0.1)
-- [x] Phase 1 — interpreter: `misa run` with hot-reload-style dev loop,
-      real model calls, budgets, evals, streams
-- [x] Phase 2 (tooling, partial) — `misa fmt` (canonical, idempotent),
-      `misa check` (+ `--json` for agents), `misa test`
-- [ ] Phase 3 — LLVM AOT backend
-- [ ] Phase 4 — iOS/Android toolchains, native widget rendering, WASM web
-- [ ] Phase 5 — `misa pkg`, stdlib growth, on-device inference
-- [ ] Phase 6 — self-hosting
+The project status and test inventory below are generated from
+[`spec/roadmap.json`](spec/roadmap.json). The performance report distinguishes
+measured results from roadmap goals; the limited MIR-to-AOT path is experimental
+and does not replace the established emitter for unsupported functions.
 
 ## License
 
@@ -129,12 +127,12 @@ the same arrangement as Rust.
 | 3 | Type System (generics, sum types, match) | ✅ complete |
 | 4 | Concurrency (structured, typed, budgeted) | ✅ complete |
 | 5 | Package Registry | ✅ complete |
-| 6 | Cross-Platform (Android, iOS, WASM) | 🚧 in-progress — Android beta, iOS beta (ABI fixed), WASM broken (time.parse) |
-| 7 | Performance Optimization | 🚧 in-progress — LLVM O2 AOT passes and amortized `list.push` shipped; Int/float unboxing and string builder done; typed arrays and optimizing MIR remain planned |
-| 8 | Ignition (public launch) | ⏳ not-started — Waiting for community, visibility, launch strategy per Hamis |
+| 6 | Cross-Platform (Android, iOS, WASM) | 🚧 in-progress — Android beta, iOS beta (ABI fixed); web/WASM validation remains in progress |
+| 7 | Performance Optimization | 🚧 in-progress — LLVM O2, amortized list.push/list.reserve, typed list reads, and an experimental verified scalar MIR-to-LLVM path shipped; broader MIR CFG/effects and broader optimized array layouts remain planned |
+| 8 | Ignition (public launch) | ⏳ not-started — Compiler/runtime stabilization and independent benchmark validation before public launch |
 | 9 | Flywheel (ecosystem growth) | ⏳ not-started |
 
-**Tests:** 473 unit, 36 AOT parity, 10 differential
+**Tests:** 477 unit, 40 AOT parity, 11 differential
 
 <!-- STATUS:GENERATED — do not hand-edit. Run tools/gen_readme.py to regenerate. -->
 <!-- STATUS:END -->

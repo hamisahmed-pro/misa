@@ -17,6 +17,27 @@ def main():
         "n-body", "-0.1690\n", "-0.1689\n")
     assert benchmark._same_benchmark_output("fannkuch-redux", "7\n", "7\n")
     assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
+    passing = {"results": [{
+        "name": "n-body", "status": "ok", "ratio_misa_python": 1.2,
+        "misa": {"times": [0.1, 0.2]},
+        "python": {"times": [0.1, 0.1]},
+    }]}
+    assert benchmark.validate_required_cases(passing, ["n-body"], 2) == []
+    assert any("expected exactly one" in e for e in
+               benchmark.validate_required_cases(passing, ["fasta"], 2))
+    assert any("expected 3" in e for e in
+               benchmark.validate_required_cases(passing, ["n-body"], 3))
+    failed = {"results": [{**passing["results"][0], "status": "checksum-mismatch"}]}
+    assert any("checksum-mismatch" in e for e in
+               benchmark.validate_required_cases(failed, ["n-body"], 2))
+    duplicated = {"results": passing["results"] * 2}
+    assert any("exactly one" in e for e in
+               benchmark.validate_required_cases(duplicated, ["n-body"], 2))
+    metadata = benchmark._toolchain_metadata()
+    assert metadata["python"]
+    assert metadata["runtime_memory_manager"] in {
+        "Boehm GC", "malloc fallback (no collector)", "unknown"
+    }
 
     # The harness now exposes a five-element run_cmd result including RSS.
     wall, out, err, rc, rss = benchmark.run_cmd(

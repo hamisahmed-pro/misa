@@ -17,6 +17,7 @@ import hashlib
 import math
 import platform
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -67,14 +68,22 @@ def run_cmd(cmd, timeout=300):
     # /usr/bin/time is not installed on every supported host. Use the
     # platform Python to collect child peak RSS via resource, with a private
     # stderr sentinel removed before returning program diagnostics.
-    wrapper = (
-        "import resource,subprocess,sys; "
-        "p=subprocess.run(sys.argv[1:],capture_output=True); "
-        "sys.stdout.buffer.write(p.stdout); sys.stderr.buffer.write(p.stderr); "
-        "print('\\n__MISA_CHILD_RSS_KB__=' + str(resource.getrusage("
-        "resource.RUSAGE_CHILDREN).ru_maxrss), file=sys.stderr); "
-        "sys.exit(p.returncode)"
-    )
+    wrapper = '''import subprocess, sys
+try:
+    import resource
+except ImportError:
+    resource = None
+p = subprocess.run(sys.argv[1:], capture_output=True)
+sys.stdout.buffer.write(p.stdout)
+sys.stderr.buffer.write(p.stderr)
+if resource is not None:
+    rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    # macOS reports bytes; Linux and the BSDs report KiB.
+    if sys.platform == "darwin":
+        rss = (rss + 1023) // 1024
+    print("\\n__MISA_CHILD_RSS_KB__=" + str(rss), file=sys.stderr)
+sys.exit(p.returncode)
+'''
     timed = [sys.executable, "-c", wrapper, *cmd]
 
     start = time.perf_counter()
@@ -123,6 +132,95 @@ def _same_benchmark_output(name, left, right):
         except (ValueError, IndexError):
             return False
     return left == right
+
+
+def validate_required_cases(data, required, runs):
+    """Return acceptance-gate errors for required correctness-passing cases."""
+    errors = []
+    by_name = {}
+    for result in data.get("results", []):
+        by_name.setdefault(result.get("name"), []).append(result)
+    for name in required:
+        matches = by_name.get(name, [])
+        if len(matches) != 1:
+            errors.append(f"{name}: expected exactly one result, found {len(matches)}")
+            continue
+        result = matches[0]
+        if result.get("status") != "ok":
+            errors.append(f"{name}: status is {result.get('status', 'missing')}")
+            continue
+        if result.get("ratio_misa_python") is None:
+            errors.append(f"{name}: no validated runtime ratio")
+        for impl in ("misa", "python"):
+            samples = result.get(impl, {}).get("times", [])
+            if len(samples) != runs:
+                errors.append(f"{name}: {impl} has {len(samples)} samples, expected {runs}")
+    return errors
+
+
+def _source_provenance(root):
+    """Capture source identity before benchmark execution begins."""
+    revision = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=False)
+    status = subprocess.run(["git", "-C", root, "status", "--porcelain",
+                             "--untracked-files=all"], capture_output=True,
+                            text=True, check=False)
+    diff = subprocess.run(["git", "-C", root, "diff", "--binary", "HEAD"],
+                          capture_output=True, check=False)
+    status_text = status.stdout or ""
+    return {
+        "source_revision": (revision.stdout.strip() or None),
+        "source_dirty": bool(status_text),
+        "source_status_sha256": hashlib.sha256(status_text.encode()).hexdigest(),
+        "tracked_diff_sha256": hashlib.sha256(diff.stdout or b"").hexdigest(),
+    }
+
+
+def _toolchain_metadata():
+    """Best-effort exact compiler/runtime version metadata."""
+    try:
+        import llvmlite
+        from llvmlite import binding as llvm
+        llvmlite_version = llvmlite.__version__
+        llvm_version = ".".join(map(str, llvm.llvm_version_info))
+    except Exception:
+        llvmlite_version = None
+        llvm_version = None
+    cc = shutil.which("gcc")
+    cc_version = None
+    if cc:
+        try:
+            result = subprocess.run([cc, "--version"], capture_output=True,
+                                    text=True, timeout=5, check=False)
+            cc_version = (result.stdout or result.stderr).splitlines()[0]
+        except (OSError, subprocess.TimeoutExpired, IndexError):
+            pass
+    gc_mode = None
+    gc_package_version = None
+    try:
+        from .aot.build import host_triple, runtime_flags
+        defines, _cflags, _libs = runtime_flags(host_triple())
+        gc_mode = ("Boehm GC" if "-DMISA_USE_GC" in defines
+                   else "malloc fallback (no collector)")
+    except Exception:
+        gc_mode = "unknown"
+    try:
+        pkg = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Version}", "libgc-dev"],
+            capture_output=True, text=True, timeout=3, check=False)
+        if pkg.returncode == 0:
+            gc_package_version = pkg.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return {
+        "python": platform.python_version(),
+        "llvmlite": llvmlite_version,
+        "llvm": llvm_version,
+        "c_compiler": cc_version,
+        "runtime_memory_manager": gc_mode,
+        "boehm_gc_package_version": gc_package_version,
+        "aot_optimization": "LLVM O2; fast-math disabled",
+    }
 
 
 def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
@@ -276,6 +374,8 @@ def bench_compile(misa_bin, runs=3):
 def run_benchmarks(runs=10, only=None, scale="default"):
     """Run the full suite, return results dict."""
     root = _find_misa_root()
+    provenance = _source_provenance(root)
+    toolchain = _toolchain_metadata()
     bench_dir = os.path.join(root, "bench", "external")
     misa_bin = os.path.join(root, "impl", "bin", "misa")
 
@@ -330,13 +430,6 @@ def run_benchmarks(runs=10, only=None, scale="default"):
             sum(math.log(x) for x in valid_ratios) / len(valid_ratios)), 4)
             if valid_ratios else None),
     }
-    revision = subprocess.run(
-        ["git", "-C", root, "rev-parse", "HEAD"], capture_output=True,
-        text=True, check=False).stdout.strip() or None
-    dirty = bool(subprocess.run(
-        ["git", "-C", root, "status", "--porcelain"], capture_output=True,
-        text=True, check=False).stdout.strip())
-
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "misa_version": "AOT",
@@ -354,11 +447,9 @@ def run_benchmarks(runs=10, only=None, scale="default"):
         },
         "scale": scale,
         "random_seed": 20261009,
-        "source_revision": revision,
-        "source_dirty": dirty,
+        **provenance,
+        "toolchain": toolchain,
         "aggregate": aggregate,
-        "random_seed": 20261009,
-        "python_version": "3.12",
         "results": results,
     }
 
@@ -425,6 +516,7 @@ def main(argv):
     fmt = "json"
     out = None
     scale = "default"
+    required = []
     i = 0
     while i < len(argv):
         if argv[i] == "--runs" and i + 1 < len(argv):
@@ -432,6 +524,9 @@ def main(argv):
             i += 2
         elif argv[i] == "--only" and i + 1 < len(argv):
             only = set(argv[i + 1].split(","))
+            i += 2
+        elif argv[i] == "--require" and i + 1 < len(argv):
+            required = [name for name in argv[i + 1].split(",") if name]
             i += 2
         elif argv[i] == "--format" and i + 1 < len(argv):
             fmt = argv[i + 1]
@@ -447,11 +542,22 @@ def main(argv):
             i += 2
         else:
             print(f"usage: misa benchmark [--runs N] [--only a,b] "
-                  "[--scale small|default|large] "
+                  "[--require a,b] [--scale small|default|large] "
                   f"[--format json|md|csv] [-o file]", file=sys.stderr)
             return 1
 
+    if runs < 1:
+        print("--runs must be at least 1", file=sys.stderr)
+        return 1
+
     data = run_benchmarks(runs=runs, only=only, scale=scale)
+    gate_errors = validate_required_cases(data, required, runs) if required else []
+    if required:
+        data["acceptance"] = {
+            "required_cases": required,
+            "passed": not gate_errors,
+            "errors": gate_errors,
+        }
 
     if fmt == "json":
         text = json.dumps(data, indent=2)
@@ -469,4 +575,8 @@ def main(argv):
         print(f"wrote {out}")
     else:
         print(text)
+    if gate_errors:
+        print("benchmark acceptance failed: " + "; ".join(gate_errors),
+              file=sys.stderr)
+        return 1
     return 0

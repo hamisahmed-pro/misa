@@ -1,6 +1,10 @@
 name: benchmark
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: "17 2 * * 1"
@@ -14,27 +18,52 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install native AOT runtime dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev
       - name: Install Misa toolchain
         run: pip install llvmlite==0.50.0
       - name: Run Misa benchmark suite
         run: |
           chmod +x impl/bin/misa
-          python3 impl/bin/misa benchmark --runs 10 --format json -o bench/results/benchmark-ci.json
-      - name: Validate benchmark artifact
+          mkdir -p bench/results
+          python3 impl/bin/misa benchmark \
+            --runs 10 --only n-body,spectral-norm,fannkuch-redux \
+            --require n-body,spectral-norm,fannkuch-redux \
+            --scale default --format json -o bench/results/benchmark-ci.json
+      - name: Validate benchmark artifact and provenance
+        if: always()
         run: |
           python3 - <<'PY'
-          import json
+          import json, os
           p="bench/results/benchmark-ci.json"
-          d=json.load(open(p))
-          assert d.get("results"), "benchmark produced no results"
-          for r in d["results"]:
-              if r.get("status") == "ok" and r["name"] not in ("startup","compile"):
-                  assert len(r["misa"]["times"]) == 10
-                  assert len(r["python"]["times"]) == 10
-          print("benchmark artifact valid")
+          assert os.path.isfile(p), "benchmark artifact is missing"
+          with open(p) as f: d=json.load(f)
+          expected={"n-body", "spectral-norm", "fannkuch-redux"}
+          results={r["name"]: r for r in d.get("results", [])}
+          assert set(results) == expected, f"unexpected benchmark cases: {set(results)}"
+          assert d.get("source_revision") == os.environ["GITHUB_SHA"], "source SHA mismatch"
+          assert d.get("source_dirty") is False, "benchmark source tree is dirty"
+          assert d.get("aggregate", {}).get("scored_cases") == len(expected), "not all cases scored"
+          assert d.get("acceptance", {}).get("passed") is True, d.get("acceptance")
+          for name in expected:
+              r=results[name]
+              assert r.get("status") == "ok", f"{name}: {r.get('status')}"
+              assert len(r["misa"]["times"]) == 10, f"{name}: missing Misa samples"
+              assert len(r["python"]["times"]) == 10, f"{name}: missing Python samples"
+          t=d.get("toolchain", {})
+          assert t.get("python") and t.get("llvmlite") and t.get("llvm")
+          assert t.get("c_compiler"), "C compiler version is missing"
+          assert t.get("runtime_memory_manager") == "Boehm GC", t.get("runtime_memory_manager")
+          assert t.get("boehm_gc_package_version"), "Boehm GC package version is missing"
+          print("benchmark acceptance and provenance valid")
           PY
       - name: Upload benchmark artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: misa-benchmark
           path: bench/results/benchmark-ci.json
+          if-no-files-found: warn
+          retention-days: 30

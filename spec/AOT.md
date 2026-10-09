@@ -2,8 +2,9 @@
 
 `misa build <file.misa> [-o output]` compiles a Misa program to a
 native machine-code binary ahead of time, through LLVM. This is Misa's
-flagship execution mode: one small native binary per platform, no
-runtime install needed on the target machine.
+flagship execution mode. Required system libraries vary with the build
+target and enabled runtime features; a native executable is not necessarily
+a fully self-contained static binary.
 
 ## Pipeline
 
@@ -42,15 +43,19 @@ parsing all wrap identically in the interpreter and AOT. Out-of-range
 
 ## Memory management
 
-The runtime allocates through the Boehm conservative garbage collector
-(`GC_malloc`), built from source and statically linked. Generated code
-holds values in LLVM allocas and the C stack, which Boehm scans as
-roots. A 200,000-iteration allocate-and-drop loop peaks at ~8 MB RSS.
+When Boehm GC development headers and a linkable library are available,
+the host runtime allocates through `GC_malloc`; generated code keeps values
+in LLVM allocas and the C stack, which Boehm scans as roots. On Debian or
+Ubuntu, install `libgc-dev` to enable this mode. Misa does not currently
+download or build the collector automatically.
 
-If Boehm headers are not available at build time, the runtime falls
-back to `malloc` without collection (long-running allocation-heavy
-programs will grow). `misa build` reports which mode it used in the
-runtime cache key.
+If Boehm headers are absent, the runtime deliberately degrades to plain
+`malloc` without collection. In that fallback, temporary boxed values are
+not reclaimed during process execution and allocation-heavy programs can
+consume substantially more memory. The benchmark JSON records the selected
+memory manager and collector package version; comparisons must keep this
+setting fixed. The fallback is useful for portability, not a recommended
+configuration for long-running or allocation-heavy programs.
 
 ## Errors
 
@@ -130,14 +135,14 @@ Each is a documented improvement, not a gap:
   `E402`; lambdas remain available as component event handlers
   (`onTap: || { … }`), printed as `<handler>` like the interpreter.
 
-## Binary characteristics (measured, Linux x86-64)
+## Binary and startup measurements
 
-- Hello-world binary: ~690 KB (Boehm GC statically linked, libcurl
-  dynamically linked).
-- Cold startup to first output: ~6 ms.
-- For comparison, a minimal Flutter release app is typically 15–50 MB
-  with ~200–500 ms startup. Misa clears that floor by an order of
-  magnitude on both axes.
+Binary size and cold-start time depend on LLVM, the C toolchain, garbage
+collector configuration, and linked runtime features. Use `misa benchmark`
+to measure them on the target host. Its JSON records source revision,
+toolchain versions, sample distributions, and allocator mode; do not treat
+old single-host figures or comparisons with unrelated application
+frameworks as general performance claims.
 
 ## Not yet
 

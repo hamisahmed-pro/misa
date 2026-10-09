@@ -9,8 +9,8 @@ from misa.mir import optimize, dump
 def main():
     prog = parse_source("""
 fn add(a: Int, b: Int) -> Int {
-    let x: Int = a + b;
-    return x * 2;
+    let x: Int = a + b
+    return x * 2
 }
 """)
     mod = lower_program(prog)
