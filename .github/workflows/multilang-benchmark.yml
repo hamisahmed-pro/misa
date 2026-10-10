@@ -1,0 +1,77 @@
+name: multilang-benchmark
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matched-sieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Misa AOT dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev
+          python -m pip install --upgrade pip
+          python -m pip install llvmlite==0.50.0
+      - name: Verify toolchain availability
+        run: |
+          python --version
+          node --version
+          php --version
+          go version
+          rustc --version
+          gcc --version
+      - name: Run matched six-language benchmark
+        run: |
+          python bench/multilang/run.py --n 500000 --runs 9 --warmups 2 --json bench/results/multilang.json
+      - name: Validate benchmark artifact
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, math, os
+          path = "bench/results/multilang.json"
+          assert os.path.isfile(path), "six-language benchmark artifact is missing"
+          data = json.load(open(path, encoding="utf-8"))
+          assert data.get("schema") == "misa-multilang-sieve-v1"
+          assert data.get("workload", {}).get("validated_stdout") == "41538 9914236195"
+          assert data.get("source_dirty") is False, "benchmark source tree must be clean"
+          expected = {"python", "node", "php", "go", "rust", "misa"}
+          results = data.get("results", {})
+          assert set(results) == expected, f"unexpected implementations: {set(results)}"
+          for name, result in results.items():
+              samples = result.get("samples_seconds", [])
+              assert len(samples) == 9, f"{name}: expected 9 samples, got {len(samples)}"
+              assert all(isinstance(x, (int, float)) and math.isfinite(x) and x > 0 for x in samples), name
+              assert math.isfinite(result.get("ratio_to_python", float("nan"))), name
+          assert data["toolchains"].get("llvmlite") is None or True
+          print("Six-language benchmark artifact is valid.")
+          PY
+      - name: Upload raw benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: misa-multilang-sieve
+          path: bench/results/multilang.json
+          if-no-files-found: warn
+          retention-days: 30
