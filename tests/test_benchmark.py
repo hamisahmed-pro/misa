@@ -19,7 +19,7 @@ def main():
     assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
     passing = {"results": [{
         "name": "n-body", "status": "ok", "ratio_misa_python": 1.2,
-        "misa": {"times": [0.1, 0.2]},
+        "misa": {"times": [0.1, 0.14]},
         "python": {"times": [0.1, 0.1]},
     }]}
     assert benchmark.validate_required_cases(passing, ["n-body"], 2) == []
