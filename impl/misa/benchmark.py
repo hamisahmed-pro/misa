@@ -122,6 +122,34 @@ def _p95(values):
     return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
 
 
+def _bootstrap_ratio_ci95(misa_times, python_times, resamples=2000, seed=20261009):
+    """Deterministic paired-bootstrap 95% interval for the ratio of medians.
+
+    Pairing follows each randomized benchmark trial index. The interval is
+    descriptive, not proof of universal performance or independence across
+    separate benchmark sessions.
+    """
+    if (len(misa_times) != len(python_times) or len(misa_times) < 2
+            or resamples < 100):
+        raise ValueError("paired bootstrap requires equal samples >= 2 and resamples >= 100")
+    pairs = list(zip(misa_times, python_times))
+    rng = random.Random(seed)
+    ratios = []
+    count = len(pairs)
+    for _ in range(resamples):
+        draw = [pairs[rng.randrange(count)] for _ in range(count)]
+        left = statistics.median(pair[0] for pair in draw)
+        right = statistics.median(pair[1] for pair in draw)
+        if right > 0 and math.isfinite(left) and math.isfinite(right):
+            ratios.append(left / right)
+    if not ratios:
+        raise ValueError("bootstrap produced no valid ratios")
+    ratios.sort()
+    lower = ratios[max(0, math.ceil(0.025 * len(ratios)) - 1)]
+    upper = ratios[max(0, math.ceil(0.975 * len(ratios)) - 1)]
+    return [round(lower, 6), round(upper, 6)]
+
+
 def _same_benchmark_output(name, left, right):
     """Compare official results semantically where reference formatting differs."""
     if name in {"n-body", "spectral-norm"}:
@@ -363,7 +391,8 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
             "stddev": round(statistics.stdev(py_times), 6) if len(py_times)>1 else 0,
             "peak_rss_kb": max(py_rss),
         },
-        "ratio_misa_python": round(ratio, 2) if ratio else None,
+        "ratio_misa_python": round(ratio, 6) if ratio else None,
+        "ratio_ci95": _bootstrap_ratio_ci95(misa_times, py_times),
         "verdict": "faster" if ratio and ratio < 1 else "slower",
     }
 
