@@ -182,11 +182,16 @@ def validate_required_cases(data, required, runs):
 
         for impl in ("misa", "python"):
             median = result.get(impl, {}).get("median")
-            if median is not None and (
-                not isinstance(median, (int, float)) or isinstance(median, bool)
-                or not math.isfinite(median) or median <= 0
+            if (not isinstance(median, (int, float)) or isinstance(median, bool)
+                    or not math.isfinite(median) or median <= 0):
+                errors.append(f"{name}: {impl} median must be a finite positive number")
+            elif impl in medians and not math.isclose(
+                median, medians[impl], rel_tol=0.0, abs_tol=0.00000051
             ):
-                errors.append(f"{name}: {impl} median must be finite positive seconds")
+                errors.append(
+                    f"{name}: reported {impl} median {median} disagrees with "
+                    f"sample median {medians[impl]:.9g}"
+                )
 
         if "misa" in medians and "python" in medians:
             expected_ratio = medians["misa"] / medians["python"]
@@ -343,7 +348,7 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
         "input_argument": arg,
         "status": "ok",
         "misa": {
-            "median": round(misa_med, 3),
+            "median": round(misa_med, 6),
             "times": [round(t, 6) for t in misa_times],
             "p95": round(_p95(misa_times), 6),
             "min": round(min(misa_times), 6), "max": round(max(misa_times), 6),
@@ -351,7 +356,7 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
             "peak_rss_kb": max(misa_rss),
         },
         "python": {
-            "median": round(py_med, 3),
+            "median": round(py_med, 6),
             "times": [round(t, 6) for t in py_times],
             "p95": round(_p95(py_times), 6),
             "min": round(min(py_times), 6), "max": round(max(py_times), 6),
