@@ -155,6 +155,24 @@ def main() -> int:
                             cwd=ROOT, capture_output=True, text=True, check=False).stdout
     tracked_diff = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=ROOT,
                                   capture_output=True, check=False).stdout
+    sys.path.insert(0, str(ROOT / "impl"))
+    llvmlite_version = None
+    llvm_version = None
+    memory_manager = "unknown"
+    try:
+        import llvmlite
+        from llvmlite import binding as llvm
+        llvmlite_version = llvmlite.__version__
+        llvm_version = ".".join(map(str, llvm.llvm_version_info))
+        from misa.aot.build import host_triple, runtime_flags
+        defines, _cflags, _libs = runtime_flags(host_triple())
+        memory_manager = ("Boehm GC" if "-DMISA_USE_GC" in defines
+                          else "malloc fallback (no collector)")
+    except Exception:
+        # Toolchain setup is validated separately; retain explicit metadata
+        # instead of hiding a benchmark result behind optional introspection.
+        pass
+
     payload = {
         "schema": "misa-multilang-sieve-v1",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -182,6 +200,9 @@ def main() -> int:
             "go": version(["go", "version"]),
             "rustc": version(["rustc", "--version"]),
             "c_compiler": version(["gcc", "--version"]),
+            "llvmlite": llvmlite_version,
+            "llvm": llvm_version,
+            "runtime_memory_manager": memory_manager,
             "misa": "repository revision; LLVM AOT",
         },
         "results": results,
