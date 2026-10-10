@@ -48,6 +48,30 @@ def version(command: list[str]) -> str:
         return "unavailable"
 
 
+def bootstrap_ratio_ci95(
+    times: list[float], baseline: list[float], *, resamples: int = 2000,
+    seed: int = SEED,
+) -> list[float]:
+    """Deterministic paired-bootstrap 95% interval for median runtime ratio."""
+    if len(times) != len(baseline) or len(times) < 2 or resamples < 100:
+        raise ValueError("paired bootstrap requires equal samples >= 2 and resamples >= 100")
+    if any(not math.isfinite(x) or x <= 0 for x in times + baseline):
+        raise ValueError("bootstrap samples must be finite positive seconds")
+    pairs = list(zip(times, baseline))
+    rng = random.Random(seed)
+    ratios = []
+    for _ in range(resamples):
+        draw = [pairs[rng.randrange(len(pairs))] for _ in pairs]
+        left = statistics.median(pair[0] for pair in draw)
+        right = statistics.median(pair[1] for pair in draw)
+        ratios.append(left / right)
+    ratios.sort()
+    return [
+        ratios[max(0, math.ceil(0.025 * len(ratios)) - 1)],
+        ratios[max(0, math.ceil(0.975 * len(ratios)) - 1)],
+    ]
+
+
 def compile_programs() -> dict[str, list[str]]:
     """Build ahead of timing so compiler work is not charged to execution."""
     out = Path(os.environ.get("TMPDIR", "/tmp")) / f"misa-multilang-{os.getpid()}"
@@ -147,6 +171,10 @@ def main() -> int:
             "stdev_seconds": statistics.stdev(values),
             "samples_seconds": values,
             "ratio_to_python": medians[name] / medians["python"],
+            "ratio_ci95_to_python": (
+                [1.0, 1.0] if name == "python"
+                else bootstrap_ratio_ci95(values, samples["python"], seed=args.seed)
+            ),
         }
 
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
