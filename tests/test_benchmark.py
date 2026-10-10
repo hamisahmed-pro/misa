@@ -27,6 +27,24 @@ def main():
                benchmark.validate_required_cases(passing, ["fasta"], 2))
     assert any("expected 3" in e for e in
                benchmark.validate_required_cases(passing, ["n-body"], 3))
+    # Fail closed on non-finite, non-positive, or internally inconsistent timings.
+    bad_nan = {"results": [{**passing["results"][0],
+                            "misa": {"times": [0.1, float("nan")]}}]}
+    assert any("finite positive seconds" in e for e in
+               benchmark.validate_required_cases(bad_nan, ["n-body"], 2))
+    bad_zero = {"results": [{**passing["results"][0],
+                             "python": {"times": [0.0, 0.1]}}]}
+    assert any("finite positive seconds" in e for e in
+               benchmark.validate_required_cases(bad_zero, ["n-body"], 2))
+    bad_ratio = {"results": [{**passing["results"][0],
+                              "ratio_misa_python": float("inf")}]}
+    assert any("finite positive number" in e for e in
+               benchmark.validate_required_cases(bad_ratio, ["n-body"], 2))
+    inconsistent = {"results": [{**passing["results"][0],
+                                 "ratio_misa_python": 8.0}]}
+    assert any("disagrees with sample medians" in e for e in
+               benchmark.validate_required_cases(inconsistent, ["n-body"], 2))
+
     failed = {"results": [{**passing["results"][0], "status": "checksum-mismatch"}]}
     assert any("checksum-mismatch" in e for e in
                benchmark.validate_required_cases(failed, ["n-body"], 2))
