@@ -19,10 +19,18 @@ def main():
     assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
     passing = {"results": [{
         "name": "n-body", "status": "ok", "ratio_misa_python": 1.2,
-        "misa": {"times": [0.1, 0.14]},
-        "python": {"times": [0.1, 0.1]},
+        "misa": {"times": [0.1, 0.14], "median": 0.12},
+        "python": {"times": [0.1, 0.1], "median": 0.1},
     }]}
     assert benchmark.validate_required_cases(passing, ["n-body"], 2) == []
+    bad_median = {"results": [{**passing["results"][0],
+                                 "misa": {"times": [0.1, 0.14], "median": 0.2}}]}
+    assert any("disagrees with sample median" in e for e in
+               benchmark.validate_required_cases(bad_median, ["n-body"], 2))
+    missing_median = {"results": [{**passing["results"][0],
+                                   "python": {"times": [0.1, 0.1]}}]}
+    assert any("median must be a finite positive number" in e for e in
+               benchmark.validate_required_cases(missing_median, ["n-body"], 2))
     assert any("expected exactly one" in e for e in
                benchmark.validate_required_cases(passing, ["fasta"], 2))
     assert any("expected 3" in e for e in
