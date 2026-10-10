@@ -11,6 +11,10 @@ permissions:
 
 jobs:
   matched-sieve:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [50000, 200000, 500000]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -44,17 +48,20 @@ jobs:
           gcc --version
       - name: Run matched six-language benchmark
         run: |
-          python bench/multilang/run.py --n 500000 --runs 9 --warmups 2 --json bench/results/multilang.json
+          python bench/multilang/run.py --n ${{ matrix.n }} --runs 9 --warmups 2 --json bench/results/multilang-${{ matrix.n }}.json
       - name: Validate benchmark artifact
         if: always()
         run: |
           python - <<'PY'
           import json, math, os
-          path = "bench/results/multilang.json"
+          n = int(os.environ["BENCHMARK_N"])
+          path = f"bench/results/multilang-{n}.json"
           assert os.path.isfile(path), "six-language benchmark artifact is missing"
           data = json.load(open(path, encoding="utf-8"))
           assert data.get("schema") == "misa-multilang-sieve-v1"
-          assert data.get("workload", {}).get("validated_stdout") == "41538 9914236195"
+          assert data.get("workload", {}).get("n") == n
+          if n == 500000:
+              assert data.get("workload", {}).get("validated_stdout") == "41538 9914236195"
           assert data.get("source_dirty") is False, "benchmark source tree must be clean"
           expected = {"python", "node", "php", "go", "rust", "misa"}
           results = data.get("results", {})
@@ -67,13 +74,15 @@ jobs:
           assert data["toolchains"].get("llvmlite"), "llvmlite version is missing"
           assert data["toolchains"].get("llvm"), "LLVM version is missing"
           assert data["toolchains"].get("runtime_memory_manager") == "Boehm GC", data["toolchains"].get("runtime_memory_manager")
-          print("Six-language benchmark artifact is valid.")
+          print(f"Six-language benchmark artifact is valid for N={n}.")
           PY
+        env:
+          BENCHMARK_N: ${{ matrix.n }}
       - name: Upload raw benchmark artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: misa-multilang-sieve
-          path: bench/results/multilang.json
+          name: misa-multilang-sieve-${{ matrix.n }}
+          path: bench/results/multilang-${{ matrix.n }}.json
           if-no-files-found: warn
           retention-days: 30
