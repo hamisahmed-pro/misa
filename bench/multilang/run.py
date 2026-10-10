@@ -96,6 +96,11 @@ def main() -> int:
     expected = run_checked(programs["python"] + [str(args.n)]).stdout.strip()
     if not expected or len(expected.split()) != 2:
         raise RuntimeError(f"Python reference emitted malformed result: {expected!r}")
+    if args.n == 500000 and expected != "41538 9914236195":
+        raise AssertionError(
+            "Known-answer check failed for N=500000: expected '41538 9914236195', "
+            f"got {expected!r}"
+        )
 
     # Check all implementations before collecting any timing samples.
     for name in required:
