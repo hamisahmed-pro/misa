@@ -17,6 +17,17 @@ def main():
         "n-body", "-0.1690\n", "-0.1689\n")
     assert benchmark._same_benchmark_output("fannkuch-redux", "7\n", "7\n")
     assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
+    ci = benchmark._bootstrap_ratio_ci95(
+        [0.11, 0.13, 0.12, 0.10, 0.14],
+        [0.10, 0.10, 0.11, 0.09, 0.12],
+        resamples=500, seed=17,
+    )
+    assert len(ci) == 2 and 0 < ci[0] <= ci[1]
+    assert ci == benchmark._bootstrap_ratio_ci95(
+        [0.11, 0.13, 0.12, 0.10, 0.14],
+        [0.10, 0.10, 0.11, 0.09, 0.12],
+        resamples=500, seed=17,
+    ), "bootstrap intervals must be reproducible"
     passing = {"results": [{
         "name": "n-body", "status": "ok", "ratio_misa_python": 1.2,
         "misa": {"times": [0.1, 0.14], "median": 0.12},
