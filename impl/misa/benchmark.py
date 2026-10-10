@@ -135,26 +135,68 @@ def _same_benchmark_output(name, left, right):
 
 
 def validate_required_cases(data, required, runs):
-    """Return acceptance-gate errors for required correctness-passing cases."""
+    """Fail closed unless each required case has valid, positive measurements.
+
+    This gate intentionally validates the shape and numeric quality of the
+    measurements in addition to status/sample counts. It does not trust a
+    non-null ratio alone: corrupted JSON, NaN/Infinity, zero/negative timing,
+    or an inconsistent reported ratio must never enter a performance score.
+    """
     errors = []
     by_name = {}
     for result in data.get("results", []):
         by_name.setdefault(result.get("name"), []).append(result)
+
     for name in required:
         matches = by_name.get(name, [])
         if len(matches) != 1:
             errors.append(f"{name}: expected exactly one result, found {len(matches)}")
             continue
+
         result = matches[0]
         if result.get("status") != "ok":
             errors.append(f"{name}: status is {result.get('status', 'missing')}")
             continue
-        if result.get("ratio_misa_python") is None:
-            errors.append(f"{name}: no validated runtime ratio")
+
+        ratio = result.get("ratio_misa_python")
+        if (not isinstance(ratio, (int, float)) or isinstance(ratio, bool)
+                or not math.isfinite(ratio) or ratio <= 0):
+            errors.append(f"{name}: runtime ratio must be a finite positive number")
+
+        medians = {}
         for impl in ("misa", "python"):
             samples = result.get(impl, {}).get("times", [])
-            if len(samples) != runs:
-                errors.append(f"{name}: {impl} has {len(samples)} samples, expected {runs}")
+            if not isinstance(samples, list) or len(samples) != runs:
+                count = len(samples) if isinstance(samples, list) else "invalid"
+                errors.append(f"{name}: {impl} has {count} samples, expected {runs}")
+                continue
+            valid_samples = all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value > 0
+                for value in samples
+            )
+            if not valid_samples:
+                errors.append(f"{name}: {impl} samples must all be finite positive seconds")
+                continue
+            medians[impl] = statistics.median(samples)
+
+        for impl in ("misa", "python"):
+            median = result.get(impl, {}).get("median")
+            if median is not None and (
+                not isinstance(median, (int, float)) or isinstance(median, bool)
+                or not math.isfinite(median) or median <= 0
+            ):
+                errors.append(f"{name}: {impl} median must be finite positive seconds")
+
+        if "misa" in medians and "python" in medians:
+            expected_ratio = medians["misa"] / medians["python"]
+            if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and math.isfinite(ratio):
+                # The canonical report rounds ratios to two decimal places.
+                if not math.isclose(ratio, expected_ratio, rel_tol=0.015, abs_tol=0.005):
+                    errors.append(
+                        f"{name}: reported ratio {ratio} disagrees with sample medians "
+                        f"({expected_ratio:.6g})"
+                    )
     return errors
 
 
