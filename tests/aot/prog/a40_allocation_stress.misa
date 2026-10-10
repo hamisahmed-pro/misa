@@ -1,0 +1,17 @@
+// Allocation/collection churn regression: each loop iteration drops a list
+// after using it. The AOT parity and memory-stress test exercise the collector
+// across repeated temporary aggregate allocation.
+var i = 0
+var checksum = 0
+while i < 20000 {
+  var temp: [Int] = []
+  list.reserve(temp, 12)
+  var j = 0
+  while j < 12 {
+    list.push(temp, i + j)
+    j = j + 1
+  }
+  checksum = checksum + temp[11]
+  i = i + 1
+}
+print(checksum)
