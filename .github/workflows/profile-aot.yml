@@ -10,8 +10,6 @@ on:
         type: choice
         options:
           - bench/multilang/sieve.misa
-          - bench/external/nbody.misa
-          - bench/external/spectralnorm.misa
       argument:
         description: "Single program argument"
         required: true
