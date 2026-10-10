@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from datetime import datetime, timezone
 
 # Benchmarks with working Misa ports and their configs.
@@ -50,6 +51,20 @@ BENCHMARKS = [
 # synthesize simplified data internally. Skipping is both safer and more
 # honest than comparing unmatched workloads or blocking on an unprovided stream.
 STDIN_MISMATCHED = {"reverse-complement", "knucleotide", "regex-redux"}
+
+
+_TEMP_DIRS = []
+
+
+def _temporary_path(prefix):
+    """Return a collision-free path in a private temp directory.
+
+    Keeping the TemporaryDirectory objects alive makes cleanup automatic at
+    process exit while isolating concurrent benchmark invocations.
+    """
+    directory = tempfile.TemporaryDirectory(prefix="misa-benchmark-")
+    _TEMP_DIRS.append(directory)
+    return os.path.join(directory.name, prefix)
 
 
 def _find_misa_root():
@@ -311,7 +326,7 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
         return {"name": name, "status": "missing-misa-port"}
 
     # Build Misa once (not timed)
-    bin_path = f"/tmp/misa_bench_{name}"
+    bin_path = _temporary_path(f"misa_bench_{name}")
     ok, err = build_misa(misa_bin, misa_path, bin_path)
     if not ok:
         return {"name": name, "status": "build-failed", "error": err[:200]}
@@ -400,11 +415,11 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
 def bench_startup(misa_bin, runs=5):
     """Measure hello-world startup time (launch to first output)."""
     prog = 'print("hi")\n'
-    path = "/tmp/bench_hello.misa"
+    path = _temporary_path("bench_hello.misa")
     with open(path, "w") as f:
         f.write(prog)
     # Build once
-    bin_path = "/tmp/bench_hello_bin"
+    bin_path = _temporary_path("bench_hello_bin")
     wall, out, err, rc, _rss = run_cmd([misa_bin, "build", path, "-o", bin_path])
     if rc != 0:
         return {"status": "build-failed", "error": err[:200]}
@@ -430,9 +445,7 @@ def bench_compile(misa_bin, runs=3):
         return {"status": "missing-source"}
     times = []
     for _ in range(runs):
-        out_path = "/tmp/bench_compile_out"
-        if os.path.exists(out_path):
-            os.remove(out_path)
+        out_path = _temporary_path("bench_compile_out")
         wall, out, err, rc, _rss = run_cmd([misa_bin, "build", src, "-o", out_path])
         if rc != 0:
             return {"status": "build-failed", "error": err[:200]}
