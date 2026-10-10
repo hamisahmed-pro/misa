@@ -229,7 +229,7 @@ def validate_required_cases(data, required, runs):
                     or not math.isfinite(median) or median <= 0):
                 errors.append(f"{name}: {impl} median must be a finite positive number")
             elif impl in medians and not math.isclose(
-                median, medians[impl], rel_tol=0.0, abs_tol=0.00000051
+                median, medians[impl], rel_tol=0.0, abs_tol=0.00000000051
             ):
                 errors.append(
                     f"{name}: reported {impl} median {median} disagrees with "
@@ -240,7 +240,7 @@ def validate_required_cases(data, required, runs):
             expected_ratio = medians["misa"] / medians["python"]
             if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and math.isfinite(ratio):
                 # The canonical report rounds ratios to two decimal places.
-                if not math.isclose(ratio, expected_ratio, rel_tol=0.015, abs_tol=0.005):
+                if not math.isclose(ratio, expected_ratio, rel_tol=0.00005, abs_tol=0.000005):
                     errors.append(
                         f"{name}: reported ratio {ratio} disagrees with sample medians "
                         f"({expected_ratio:.6g})"
@@ -391,19 +391,19 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
         "input_argument": arg,
         "status": "ok",
         "misa": {
-            "median": round(misa_med, 6),
-            "times": [round(t, 6) for t in misa_times],
-            "p95": round(_p95(misa_times), 6),
-            "min": round(min(misa_times), 6), "max": round(max(misa_times), 6),
-            "stddev": round(statistics.stdev(misa_times), 6) if len(misa_times)>1 else 0,
+            "median": round(misa_med, 9),
+            "times": [round(t, 9) for t in misa_times],
+            "p95": round(_p95(misa_times), 9),
+            "min": round(min(misa_times), 9), "max": round(max(misa_times), 9),
+            "stddev": round(statistics.stdev(misa_times), 9) if len(misa_times)>1 else 0,
             "peak_rss_kb": max(misa_rss),
         },
         "python": {
-            "median": round(py_med, 6),
-            "times": [round(t, 6) for t in py_times],
-            "p95": round(_p95(py_times), 6),
-            "min": round(min(py_times), 6), "max": round(max(py_times), 6),
-            "stddev": round(statistics.stdev(py_times), 6) if len(py_times)>1 else 0,
+            "median": round(py_med, 9),
+            "times": [round(t, 9) for t in py_times],
+            "p95": round(_p95(py_times), 9),
+            "min": round(min(py_times), 9), "max": round(max(py_times), 9),
+            "stddev": round(statistics.stdev(py_times), 9) if len(py_times)>1 else 0,
             "peak_rss_kb": max(py_rss),
         },
         "ratio_misa_python": round(ratio, 6) if ratio else None,
