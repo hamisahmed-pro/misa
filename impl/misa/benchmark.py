@@ -407,7 +407,7 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
             "peak_rss_kb": max(py_rss),
         },
         "ratio_misa_python": round(ratio, 6) if ratio else None,
-        "ratio_ci95": _bootstrap_ratio_ci95(misa_times, py_times),
+        "ratio_ci95": (_bootstrap_ratio_ci95(misa_times, py_times) if len(misa_times) >= 2 else None),
         "verdict": "faster" if ratio and ratio < 1 else "slower",
     }
 
