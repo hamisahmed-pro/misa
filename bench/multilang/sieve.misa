@@ -42,3 +42,5 @@ fn main() throws E300 {
   }
   print("{count} {total}")
 }
+
+main()
