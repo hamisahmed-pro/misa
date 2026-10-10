@@ -140,7 +140,7 @@ the same arrangement as Rust.
 | 8 | Ignition (public launch) | ⏳ not-started — Compiler/runtime stabilization and independent benchmark validation before public launch |
 | 9 | Flywheel (ecosystem growth) | ⏳ not-started |
 
-**Tests:** 477 unit, 40 AOT parity, 11 differential
+**Tests:** 477 unit, 41 AOT parity, 11 differential
 
 <!-- STATUS:GENERATED — do not hand-edit. Run tools/gen_readme.py to regenerate. -->
 <!-- STATUS:END -->
