@@ -24,7 +24,7 @@
     "9": {"name": "Flywheel (ecosystem growth)", "status": "not-started"}
   },
   "test_counts": {
-    "aot_parity": 40,
+    "aot_parity": 41,
     "differential": 11,
     "unit": 477
   },
