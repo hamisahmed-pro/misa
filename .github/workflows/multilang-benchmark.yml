@@ -46,6 +46,8 @@ jobs:
           go version
           rustc --version
           gcc --version
+      - name: Test benchmark statistics
+        run: python tests/test_multilang_benchmark.py
       - name: Run matched six-language benchmark
         run: |
           python bench/multilang/run.py --n ${{ matrix.n }} --runs 9 --warmups 2 --json bench/results/multilang-${{ matrix.n }}.json
