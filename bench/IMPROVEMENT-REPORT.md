@@ -1,92 +1,112 @@
 # Misa compiler, runtime, and AI-native improvement report
 
 **Updated:** 2026-10-10
-**Repository:** `hamisahmed-pro/misa`, branch `main`
-**Scope:** implement the prior review recommendations, validate interpreter/AOT behavior, and run fresh Misa-versus-Python benchmarks.
+**Repository:** [`hamisahmed-pro/misa`](https://github.com/hamisahmed-pro/misa), branch `main`
+**Implementation commit:** `51cc5f0` (follow-up build-artifact hygiene: `c20fcb4`)
+**Scope:** implement the supplied technical review, validate interpreter/AOT behavior, and compare Misa AOT against the checked-in CPython references.
 
 ## Executive summary
 
-This implementation advances performance and agent usability without changing Misa's source-level philosophy: typed, explicit operations; reliable diagnostics; and a native AOT path. It delivers:
+The work improves Misa without changing its AI-native philosophy: keep operations and failures explicit, expose stable machine-readable feedback, and make optimized execution safe rather than silently guessing. It adds a deliberately narrow, verifier-gated MIR-to-LLVM path, useful amortized list APIs and typed-list reads, an agent-oriented check/profile surface, and a correctness-first benchmark harness.
 
-1. **A verified scalar MIR-to-AOT bridge** for a deliberately narrow, pure straight-line Int/Float subset. LLVM emission is now driven by verified, optimized MIR for eligible functions. Unsupported constructs safely retain the established emitter.
-2. **Safer typed-list fast reads** for Int/Float arithmetic contexts, while ordinary indexed expressions remain boxed. Broader benchmark testing uncovered and helped eliminate an invalid raw-value-to-pointer LLVM cast.
-3. **`list.reserve(xs, capacity)`** for explicit AOT storage preallocation, with length/content preservation and interpreter-compatible validation.
-4. **Agent-facing diagnostics and profiling improvements:** versioned `misa check --json` diagnostics retain legacy fields, and `misa profile --memory` reports opt-in peak interpreter heap via `tracemalloc`, explicitly not process RSS. Existing profile output continues to expose CPU hotspots.
-5. **A more reproducible benchmark harness:** selectable small/default/large inputs, seeded paired random ordering, semantic preflight and repeated-output checks, percentile/variance reporting, RSS measurement without `/usr/bin/time`, and explicit skip states for source pairs that cannot be compared fairly.
+The final clean-checkout small benchmark used **10 measured samples per implementation** after warmups, with randomized paired execution order and semantic output checks. All three scored programs passed. Misa AOT's geometric-mean median runtime was **1.5287× CPython's** (about **52.9% more elapsed time**); it was slower in every measured case. This is a measured baseline, not a claim that the work makes Misa faster than Python.
 
-The validated small-scale suite still shows Python ahead on all three comparable, correctness-passing workloads. The geometric mean is **2.0074× Misa/Python runtime** (greater than 1 means Misa is slower): n-body 2.51×, spectral norm 2.62×, fannkuch-redux 1.23×. This is evidence about three small workloads on one sandbox, not a general language ranking. There is no claim that the current changes make Misa faster than CPython.
+A separate same-source allocator A/B on spectral norm (`N=100`) resolved the apparent extreme RSS anomaly: with Boehm GC, Misa peak RSS fell from **207,812 KiB to 11,540 KiB** (**94.45% lower, 18.01× smaller**) and median time improved from **0.173 s to 0.113 s** (**34.7% faster**). The paired A/B has three samples per mode and is diagnostic; its benchmark metadata truthfully records that generated build artifacts made the source tree appear dirty. The later definitive three-workload result is from a clean pushed revision and reports the collector/package explicitly.
 
-## Implemented changes
+## Scorecard
+
+Subjective engineering score for **this implementation against the stated goals**, not a ranking of the whole language or ecosystem. Weights emphasize measured performance and correctness rather than feature count.
+
+| Dimension | Score | Weight | Review |
+|---|---:|---:|---|
+| Measured performance vs CPython | 6.0/10 | 25% | Misa remains slower on all three validated small numeric cases; allocator mode materially changes both RSS and time. |
+| Compiler/runtime correctness | 7.5/10 | 20% | Fail-closed verifier and parity gates are strong; MIR coverage remains intentionally narrow and AOT has known unsupported benchmark ports. |
+| AI-native diagnostics/tooling | 8.5/10 | 20% | Versioned JSON diagnostics, optional memory profiling, structured benchmark provenance, and a more reliable feedback loop. |
+| Benchmark reproducibility | 9.0/10 | 20% | Ten paired randomized samples, correctness gates, source/toolchain/GC provenance, variance and RSS; still one host and small workloads. |
+| Maturity and portability | 6.0/10 | 15% | Cross-platform work continues; Boehm GC is an optional host dependency and non-GC fallback has an important memory limitation. |
+| **Weighted implementation score** | **7.4/10** | **100%** | Strong, carefully bounded engineering progress; not yet evidence of Python-beating performance or production-wide maturity. |
+
+## Implemented
 
 ### Compiler and runtime
 
-- AOT keeps LLVM O2 with strict floating-point behavior and the versioned AOT cache.
-- Eligible pure scalar functions are lowered through the existing AST→MIR stage, verified, optimized, and emitted as LLVM scalar instructions. Int division/modulo is intentionally excluded from this path to preserve checked runtime error behavior. Float scalar signatures receive raw-double implementations and boxed wrappers; calls use raw paths only when expression types are proven.
-- The MIR integration is conservative: it does not pretend that all language constructs are in MIR. Control flow, effects, aggregates, unsupported operators, and other unsupported declarations continue using the established emitter.
-- Typed `[Int]`/`[Float]` indexing can load raw scalar values when the value is immediately consumed in a proven scalar conversion/arithmetic context. Generic value expressions continue through the boxed path. A real fannkuch compilation caught an unsafe early version; the current path narrows raw loads to `_to_i64`/`_to_f64` and the normal suites were rerun afterward.
-- `list.reserve([T], Int)` allocates at least the requested capacity for boxed and specialized bool/int/float AOT lists. It does not change list length or contents; the interpreter validates and treats it as a no-op because Python already over-allocates.
-- Regression fixtures cover raw typed reads, scalar MIR Int/Float functions, and reserve semantics. `list.reserve` handles negative/invalid capacity with E300.
+- Added a **verified scalar MIR-to-AOT bridge** for pure, straight-line Int/Float functions. Eligible functions lower through AST→MIR, verification, optimization, and LLVM emission; unsupported functions fail closed to the established emitter. This is a real but deliberately limited MIR backend, not full MIR coverage.
+- Kept LLVM **O2** with strict floating-point semantics (fast-math disabled). Checked/error-sensitive integer operations remain outside the specialized slice.
+- Added **typed-list fast reads** in proven Int/Float arithmetic contexts; generic indexed expressions retain the boxed path.
+- Added **`list.push(xs, value)`** with amortized O(1) append and **`list.reserve(xs, capacity)`** for capacity preallocation in interpreter/AOT-compatible APIs. The AOT runtime supports specialized bool/int/float list storage as well as boxed lists.
+- Extended MIR verifier/optimizer contracts and tests, including conservative handling of unsupported effects/operations.
 
 ### Agent-facing development loop
 
-- `misa check --json` exposes a versioned `diagnostics` projection while retaining the existing `errors` / `warnings` schema for compatibility with current tools.
-- `misa profile --memory --json` can report peak interpreter heap and its measurement scope; it does not claim native RSS or allocation-site attribution.
-- The benchmark command now accepts `--scale small|default|large`; raw JSON identifies scale, arguments, host, sample counts, timing distribution and peak RSS. `/usr/bin/time` is no longer a required system package.
-- Misa source now documents the new standard-library and compiler behaviors.
+- `misa check --json` now includes versioned `schema_version: "misa.check.v1"` normalized diagnostics while retaining the legacy `errors`/`warnings` fields.
+- `misa profile --memory` reports opt-in peak **interpreter Python heap** via `tracemalloc`; it explicitly does not represent process RSS or allocation-site attribution.
+- Benchmark JSON records source revision/dirty state and hashes, exact toolchain details, allocator mode and package version, workload/sample provenance, output validation, timing distributions, and child-process peak RSS.
+- Acceptance gates reject missing, duplicate, failed, under-sampled, or semantically mismatched required cases instead of quietly including them in a score.
 
-## Fresh benchmark run
+## Definitive Misa-vs-Python benchmark
 
-Headline raw data: [`results-20261010-small.json`](external/results-20261010-small.json). The run used three measured samples per implementation after warmups, randomized paired order, process-level wall-clock timing, output preflight, and repeated output validation. AOT build time is outside execution timings. `n-body` and `spectral-norm` compare their canonical final numeric output to the Python reference within an absolute tolerance of 1e-8; other supported cases require exact stdout. The wider diagnostic pass (including every invalid/mismatched outcome) is in [`results-20261010-sweep-small.json`](external/results-20261010-sweep-small.json); it predates the definitive three-case sample and is not used for the headline score.
+Raw artifact: [`external/results-20261010-small.json`](external/results-20261010-small.json). The run used source revision `c20fcb4165e76f822f8e358d4ff709b1c85d40c2`, `source_dirty: false`, Python 3.12.3, llvmlite 0.50.0 / LLVM 22.1.0, GCC 13.3.0, Boehm GC package `1:8.2.6-1build1`, and LLVM O2. It used three warmups and ten measured runs per implementation. Build time is excluded from execution timing. Numeric outputs are compared canonically within absolute tolerance `1e-8`; the other selected case requires exact output.
 
-| Workload | Input | Misa median | Python median | Misa/Python | Peak RSS Misa / Python |
-|---|---:|---:|---:|---:|---:|
-| n-body | 5,000 | 0.101 s | 0.040 s | 2.51× slower | 80,204 / 11,496 KiB |
-| spectral norm | 100 | 0.196 s | 0.075 s | 2.62× slower | 207,812 / 11,528 KiB |
-| fannkuch-redux | 8 | 0.054 s | 0.044 s | 1.23× slower | 11,720 / 11,524 KiB |
-| **Geometric mean (3 valid cases)** | — | — | — | **2.0074× slower** | — |
+| Workload (small input) | Misa AOT median | CPython median | Misa/Python time | Peak RSS Misa / Python |
+|---|---:|---:|---:|---:|
+| n-body (`5,000`) | 0.073 s | 0.038 s | 1.90× slower | 11,704 / 11,704 KiB |
+| spectral norm (`100`) | 0.102 s | 0.064 s | 1.58× slower | 11,572 / 11,704 KiB |
+| fannkuch-redux (`8`) | 0.050 s | 0.042 s | 1.19× slower | 11,568 / 11,540 KiB |
+| **Geometric mean, 3 validated cases** | — | — | **1.5287× slower** | — |
 
-Warmups and runs are small-scale smoke/representative workloads. These sizes are intentionally not directly merged with the prior default-size results in `results-20261009.json`. The sample is too small and host-specific for cross-machine conclusions. The memory figures are peak child RSS from `resource.getrusage` on Linux; RSS is not directly comparable to `tracemalloc` heap peaks from `misa profile --memory`.
+The small-input sample is useful for an implementation smoke/representative comparison, not a universal language ranking. It is one sandbox/host, covers only three numeric workloads, and is not a substitute for larger inputs or multiple machines. The raw file retains all 10 timings per case and all available metadata.
 
-### Cases deliberately not scored
+### Collector A/B memory investigation
 
-The runner records, rather than conceals, non-comparable or invalid cases:
+Raw paired runs: [`external/results-20261010-gc-ab.json`](external/results-20261010-gc-ab.json). Both used the same `007968c` source revision and the same tracked-diff SHA. The status hashes differ because each allocator mode left its own untracked native object cache; this is why the later `.gitignore` change ignores generated Python/AOT artifacts and the definitive run was repeated cleanly. The experiment is three runs per mode, so treat the precise timings as diagnostic, not as a broad speed claim.
 
-- **Mandelbrot and FASTA:** the current Misa ports do not produce the same full output/algorithmic result as their selected Python reference programs; the harness reports checksum mismatch and does not time-score them.
-- **Binary trees:** the checked-in Misa program currently fails native compilation (`i64`/`i8**` store mismatch) and is not scored.
-- **Reverse-complement, knucleotide, regex-redux:** the Python references require stdin fixtures, while the current Misa ports do not consume equivalent inputs. They are skipped to avoid hanging or comparing different work.
-- **pidigits:** remains excluded in the existing suite pending repair of the Misa port.
+| Mode | Misa median | Misa peak RSS | Python peak RSS | Misa/Python |
+|---|---:|---:|---:|---:|
+| malloc fallback (no collector) | 0.173 s | 207,812 KiB | 11,540 KiB | 2.66× |
+| Boehm GC | 0.113 s | 11,540 KiB | 11,704 KiB | 1.63× |
+| **Change with GC** | **34.7% lower time** | **94.45% lower; 18.01× smaller** | — | — |
 
-These failures are meaningful follow-up work; they are not benchmark wins or silently filtered data. The benchmark sweep also exposed the typed-read codegen regression, which was fixed before producing the final passing three-workload results.
+This isolates allocator configuration as the cause of the dramatic Misa-specific memory peak in this workload. The selected Python reference already stayed near 11.5 MiB. The A/B also suggests allocator overhead affected runtime, but does not imply that GC makes Misa faster than CPython: even with the collector it remained slower on spectral norm.
 
 ## Validation
 
-- `tests/test_benchmark.py`: **PASS**, including semantic N-body comparison and exact-output rejection checks.
-- `tests/run_tests.py`: **477 passed, 0 failed**.
-- `tests/aot/run_aot_tests.py`: **37/40 passed**. The three failures are database AOT cases that cannot build because the optional SQLite amalgamation is absent at `~/workspace/deps/sqlite/`. Typed list reads, scalar MIR, and reserve fixtures pass.
-- Fresh benchmark suite: three comparable workload cases pass correctness and all timed repeated-output checks; mismatched stdin cases are explicitly skipped and known broken/unequal source pairs are not scored.
-- `git diff --check` and Python syntax checks are required before commit/push.
+- Unit suite: **477 passed, 0 failed**.
+- AOT parity: **40/40 passed**, including typed reads, MIR scalar functions, `list.push` and `list.reserve`.
+- Differential interpreter-versus-AOT suite: **11/11 passed**.
+- Benchmark acceptance: all **3/3 required workloads passed** semantic/output checks; ten measured samples per implementation.
+- Generated README: `python3 tools/gen_readme.py --check` passed; `README.md` and `spec/roadmap.json` agree on phases and test counts.
+- Python syntax checks and `git diff --check` passed.
+- The current raw benchmark artifact identifies Boehm GC and exact package version. CI installs `libgc-dev`, checks benchmark provenance, and uploads the JSON artifact. Generated Python/AOT build products are now ignored to preserve clean-source measurements.
 
-## Review: what is and is not solved
+## Known gaps and limitations
 
-This is an incremental production bridge, **not a complete MIR compiler**. The first MIR slice is limited to scalar, straight-line numeric functions. It provides a real backend path without destabilizing the much larger existing language surface, and establishes a safe expansion gate: unsupported functions must fall back explicitly. Float specializations and typed indexing also need broader generated/property-based parity coverage before extending their eligibility further.
+- The current numeric suite still shows Python ahead. A scalar MIR bridge and LLVM O2 are foundations, not evidence of overall performance parity.
+- The MIR subset excludes control flow/CFG, effects, aggregates, and unsupported operations; this boundary should remain verifier-gated.
+- The suite scores only n-body, spectral norm, and fannkuch-redux. Mandelbrot/FASTA references are currently mismatched, binary trees fail native compilation, stdin-based pairs lack equivalent fixture plumbing, and pidigits remains excluded. These are correctness/comparability gaps, not benchmark wins.
+- `libgc-dev` is not bundled or auto-installed for local builds. Without it, Misa falls back to plain `malloc` with no collection; long-running allocation-heavy programs can retain temporary values until exit and grow substantially. CI and benchmarks now explicitly install/report Boehm GC.
+- The memory profiler is interpreter-only and provides a peak heap, not native allocation-site detail. The benchmark RSS is process-level and should not be compared directly with `tracemalloc` values.
+- Results are host- and toolchain-specific; startup/compile costs are separate from the reported runtime score.
 
-Misa remains slower on the validated numeric cases, and spectral norm has a particularly high memory peak in AOT. LLVM O2 alone cannot erase tagged-value traffic, indirect calls, allocation costs, or runtime checks. The next performance boundary is a coherent typed IR plus workload-informed allocation/representation work, not more optimizer flags.
+## Prioritized recommendations
 
-## Prioritized next recommendations
-
-1. **Complete MIR coverage in explicit increments:** add CFG/basic blocks, branches/loops, checked arithmetic and effect annotations; use a verifier and differential tests at every stage. Expand the production bridge only when semantics and error propagation can be preserved.
-2. **Investigate memory and allocation behavior:** profile peak RSS and allocation counts by runtime subsystem; reduce temporary boxed values and validate spectral-norm allocation hotspots. Keep interpreter heap measurements distinct from process RSS.
-3. **Fix benchmark-suite validity:** repair and parity-test Mandelbrot, FASTA, and binary trees; add deterministic shared stdin fixture plumbing for the three stdin workloads; repair pidigits. Make only validated cases contribute to aggregate scores.
-4. **Expand compiler correctness tests:** generate typed-list aliasing, out-of-bounds, mixed generic use and scalar-call combinations; add float NaN/Inf/comparison tests and optimizer differential fuzzing.
-5. **Improve agent diagnostics and repairs:** add source spans/fix-its where trustworthy, stable schema versioning, and protocol tests across checker/CLI changes. Suggestions must remain optional and machine-readable.
-6. **Scale benchmarks only after correctness:** retain paired repetitions, exact raw data, variance, memory, startup and compile costs as separate measures. Use at least 10–20 trials for claims and compare on multiple hosts before asserting general speedups.
+1. **Expand MIR in safe slices:** add CFG/basic blocks, branch/loop lowering, explicit effects and checked arithmetic, then differentially test before allowing new nodes through the AOT gate.
+2. **Optimize the demonstrated hot paths:** investigate dynamic dispatch, boxing, collection representation, and loop overhead with native profiling; target the verified three-case workloads and larger scales rather than adding optimization flags alone.
+3. **Strengthen benchmark coverage:** repair and parity-test Mandelbrot, FASTA, binary trees, pidigits and shared stdin fixtures; add larger sizes and repeat across independent hosts. Keep invalid pairs excluded until repaired.
+4. **Deepen correctness testing:** generated/property-based tests for list aliasing, bounds errors, mixed generic/typed use, scalar calls, Float NaN/Inf, and optimizer differential fuzzing.
+5. **Make agent diagnostics more actionable:** trustworthy source spans, stable fix-it structures, and protocol/schema compatibility tests; keep speculative repairs optional and machine-readable.
+6. **Improve native memory observability:** add AOT allocation counts/subsystem profiles (separate from RSS and interpreter heap), and test collection under long-running/retained-reference workloads.
+7. **Clarify target support:** document runtime-library requirements per platform and validate collector or fallback behavior in each supported native build.
 
 ## Reproduction
 
 ```sh
+sudo apt-get install -y libgc-dev       # recommended for host AOT builds
 PYTHONPATH=impl python3 tests/test_benchmark.py
 PYTHONPATH=impl python3 tests/run_tests.py
 PYTHONPATH=impl python3 tests/aot/run_aot_tests.py
-PYTHONPATH=impl impl/bin/misa benchmark --runs 3 --scale small \
-  -o /tmp/misa-benchmark-small.json
+PYTHONPATH=impl impl/bin/misa benchmark \
+  --runs 10 --scale small \
+  --only n-body,spectral-norm,fannkuch-redux \
+  --require n-body,spectral-norm,fannkuch-redux \
+  -o bench/external/results-20261010-small.json
 ```

@@ -1,0 +1,181 @@
+{
+  "study": "Misa AOT spectral-norm allocator A/B",
+  "date": "2026-10-10",
+  "input_argument": "100",
+  "interpretation": "Same base revision and identical tracked_diff_sha256 in both runs. source_dirty=true in both because build outputs were untracked at the time; source_status_sha256 differs due mode-specific generated object caches. The later .gitignore change excludes these build artifacts. Three measured samples per mode; diagnostic comparison, not a broad performance claim.",
+  "rss_reduction_percent": 94.45,
+  "rss_reduction_factor": 18.01,
+  "misa_median_time_change_percent": -34.68,
+  "malloc_fallback": {
+    "timestamp": "2026-10-09T23:53:53.867109+00:00",
+    "misa_version": "AOT",
+    "host": "Linux-6.18.38+-x86_64-with-glibc2.39",
+    "cpu": "x86_64",
+    "methodology": {
+      "timing": "external wall-clock per independent process; paired randomized implementation order",
+      "warmups": 3,
+      "measured_runs": 3,
+      "aot_build": "outside runtime measurements",
+      "statistics": [
+        "median",
+        "p95",
+        "min",
+        "max",
+        "stddev"
+      ],
+      "memory": "peak child-process RSS from resource.getrusage in a Python wrapper",
+      "correctness": "exact stdout equality except n-body/spectral-norm compare canonical numeric result within 1e-8",
+      "checksum": "SHA-256 reported on output mismatch"
+    },
+    "scale": "small",
+    "random_seed": 20261009,
+    "source_revision": "007968cd71c96e2c3c318bb1a8d7d3890c662369",
+    "source_dirty": true,
+    "source_status_sha256": "7ebc9a5646f8f987b4f416c2d0045064248e33b5df71f54a12e856d829e886ac",
+    "tracked_diff_sha256": "f0ac4ee3f2a7bd9face9ace1e3edbc088b657057aa6539b309207bbcabbcc642",
+    "toolchain": {
+      "python": "3.12.3",
+      "llvmlite": "0.50.0",
+      "llvm": "22.1.0",
+      "c_compiler": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "runtime_memory_manager": "malloc fallback (no collector)",
+      "boehm_gc_package_version": null,
+      "aot_optimization": "LLVM O2; fast-math disabled"
+    },
+    "aggregate": {
+      "scored_cases": 1,
+      "score_definition": "geometric mean of Misa median / Python median; >1 means Misa slower",
+      "misa_python_geomean": 2.66
+    },
+    "results": [
+      {
+        "name": "spectral-norm",
+        "case_id": "spectral-norm:small",
+        "input_argument": "100",
+        "status": "ok",
+        "misa": {
+          "median": 0.173,
+          "times": [
+            0.177152,
+            0.173262,
+            0.17116
+          ],
+          "p95": 0.177152,
+          "min": 0.17116,
+          "max": 0.177152,
+          "stddev": 0.00304,
+          "peak_rss_kb": 207812
+        },
+        "python": {
+          "median": 0.065,
+          "times": [
+            0.065116,
+            0.066254,
+            0.065129
+          ],
+          "p95": 0.066254,
+          "min": 0.065116,
+          "max": 0.066254,
+          "stddev": 0.000653,
+          "peak_rss_kb": 11540
+        },
+        "ratio_misa_python": 2.66,
+        "verdict": "slower",
+        "description": "Spectral norm"
+      }
+    ],
+    "acceptance": {
+      "required_cases": [
+        "spectral-norm"
+      ],
+      "passed": true,
+      "errors": []
+    }
+  },
+  "boehm_gc": {
+    "timestamp": "2026-10-09T23:53:13.022061+00:00",
+    "misa_version": "AOT",
+    "host": "Linux-6.18.38+-x86_64-with-glibc2.39",
+    "cpu": "x86_64",
+    "methodology": {
+      "timing": "external wall-clock per independent process; paired randomized implementation order",
+      "warmups": 3,
+      "measured_runs": 3,
+      "aot_build": "outside runtime measurements",
+      "statistics": [
+        "median",
+        "p95",
+        "min",
+        "max",
+        "stddev"
+      ],
+      "memory": "peak child-process RSS from resource.getrusage in a Python wrapper",
+      "correctness": "exact stdout equality except n-body/spectral-norm compare canonical numeric result within 1e-8",
+      "checksum": "SHA-256 reported on output mismatch"
+    },
+    "scale": "small",
+    "random_seed": 20261009,
+    "source_revision": "007968cd71c96e2c3c318bb1a8d7d3890c662369",
+    "source_dirty": true,
+    "source_status_sha256": "8733367907ad5a4547c3f800fda19243d0fad1c4bceb1045020c6b2ae19cbc8f",
+    "tracked_diff_sha256": "f0ac4ee3f2a7bd9face9ace1e3edbc088b657057aa6539b309207bbcabbcc642",
+    "toolchain": {
+      "python": "3.12.3",
+      "llvmlite": "0.50.0",
+      "llvm": "22.1.0",
+      "c_compiler": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "runtime_memory_manager": "Boehm GC",
+      "boehm_gc_package_version": "1:8.2.6-1build1",
+      "aot_optimization": "LLVM O2; fast-math disabled"
+    },
+    "aggregate": {
+      "scored_cases": 1,
+      "score_definition": "geometric mean of Misa median / Python median; >1 means Misa slower",
+      "misa_python_geomean": 1.63
+    },
+    "results": [
+      {
+        "name": "spectral-norm",
+        "case_id": "spectral-norm:small",
+        "input_argument": "100",
+        "status": "ok",
+        "misa": {
+          "median": 0.113,
+          "times": [
+            0.12179,
+            0.113396,
+            0.109515
+          ],
+          "p95": 0.12179,
+          "min": 0.109515,
+          "max": 0.12179,
+          "stddev": 0.006274,
+          "peak_rss_kb": 11540
+        },
+        "python": {
+          "median": 0.069,
+          "times": [
+            0.074568,
+            0.068479,
+            0.069364
+          ],
+          "p95": 0.074568,
+          "min": 0.068479,
+          "max": 0.074568,
+          "stddev": 0.00329,
+          "peak_rss_kb": 11704
+        },
+        "ratio_misa_python": 1.63,
+        "verdict": "slower",
+        "description": "Spectral norm"
+      }
+    ],
+    "acceptance": {
+      "required_cases": [
+        "spectral-norm"
+      ],
+      "passed": true,
+      "errors": []
+    }
+  }
+}
