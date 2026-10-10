@@ -1,0 +1,62 @@
+name: profile-aot
+
+on:
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: "Misa source file to profile"
+        required: true
+        default: "bench/multilang/sieve.misa"
+        type: choice
+        options:
+          - bench/multilang/sieve.misa
+          - bench/external/nbody.misa
+          - bench/external/spectralnorm.misa
+      argument:
+        description: "Single program argument"
+        required: true
+        default: "500000"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install AOT dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev linux-tools-common linux-tools-generic
+          python -m pip install --upgrade pip
+          python -m pip install llvmlite==0.50.0
+      - name: Record host and profiler capabilities
+        run: |
+          uname -a
+          python --version
+          perf --version
+          cat /proc/sys/kernel/perf_event_paranoid || true
+          git rev-parse HEAD
+      - name: Profile AOT workload
+        run: |
+          chmod +x impl/bin/misa
+          mkdir -p bench/results/profile
+          bash bench/profile_aot.sh "${{ inputs.workload }}" bench/results/profile "${{ inputs.argument }}"
+      - name: Upload CPU profile and metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: misa-aot-profile-${{ github.run_id }}
+          path: |
+            bench/results/profile/metadata.txt
+            bench/results/profile/stdout.txt
+            bench/results/profile/perf.data
+            bench/results/profile/hot-symbols.txt
+          if-no-files-found: warn
+          retention-days: 14
