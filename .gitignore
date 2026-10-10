@@ -8,3 +8,6 @@ impl/misa/aot/rt/build/
 # Ephemeral CI benchmark artifact (retained results live under bench/external/)
 bench/results/benchmark-ci.json
 bench/results/multilang.json
+# Local task database and native compiler object files
+tasks.db
+*.o
