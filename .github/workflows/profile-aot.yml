@@ -66,5 +66,8 @@ jobs:
             bench/results/profile/hot-symbols.txt
             bench/results/profile/perf-stderr.txt
             bench/results/profile/callgrind-stderr.txt
+            bench/results/profile/misa-profile-target
+            bench/results/profile/symbols.txt
+            bench/results/profile/nm-stderr.txt
           if-no-files-found: warn
           retention-days: 14
