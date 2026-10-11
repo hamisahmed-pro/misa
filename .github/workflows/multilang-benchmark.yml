@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [50000, 200000, 500000]
+        n: [50000, 200000, 500000, 1000000, 2000000, 5000000]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
