@@ -39,14 +39,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install llvmlite==0.50.0
       - name: Record host and profiler capabilities
+        continue-on-error: true
         run: |
-          uname -a
-          python --version
-          perf --version
-          valgrind --version
-          callgrind_annotate --version
+          uname -a || true
+          python --version || true
+          perf --version || true
+          valgrind --version || true
+          callgrind_annotate --version || true
           cat /proc/sys/kernel/perf_event_paranoid || true
-          git rev-parse HEAD
+          git rev-parse HEAD || true
       - name: Profile AOT workload
         run: |
           chmod +x impl/bin/misa
