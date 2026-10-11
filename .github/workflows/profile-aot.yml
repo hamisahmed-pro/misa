@@ -1,6 +1,8 @@
 name: profile-aot
 
 on:
+  push:
+    branches: [engineering/benchmark-ci-hardening]
   workflow_dispatch:
     inputs:
       workload:
@@ -45,7 +47,7 @@ jobs:
         run: |
           chmod +x impl/bin/misa
           mkdir -p bench/results/profile
-          bash bench/profile_aot.sh "${{ inputs.workload }}" bench/results/profile "${{ inputs.argument }}"
+          bash bench/profile_aot.sh "${{ inputs.workload || 'bench/multilang/sieve.misa' }}" bench/results/profile "${{ inputs.argument || '500000' }}"
       - name: Upload CPU profile and metadata
         if: always()
         uses: actions/upload-artifact@v4
