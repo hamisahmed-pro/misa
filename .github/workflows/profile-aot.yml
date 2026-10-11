@@ -35,7 +35,7 @@ jobs:
       - name: Install AOT dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgc-dev linux-tools-common linux-tools-generic
+          sudo apt-get install -y libgc-dev linux-tools-common linux-tools-generic valgrind
           python -m pip install --upgrade pip
           python -m pip install llvmlite==0.50.0
       - name: Record host and profiler capabilities
@@ -43,6 +43,8 @@ jobs:
           uname -a
           python --version
           perf --version
+          valgrind --version
+          callgrind_annotate --version
           cat /proc/sys/kernel/perf_event_paranoid || true
           git rev-parse HEAD
       - name: Profile AOT workload
@@ -59,6 +61,9 @@ jobs:
             bench/results/profile/metadata.txt
             bench/results/profile/stdout.txt
             bench/results/profile/perf.data
+            bench/results/profile/callgrind.out
             bench/results/profile/hot-symbols.txt
+            bench/results/profile/perf-stderr.txt
+            bench/results/profile/callgrind-stderr.txt
           if-no-files-found: warn
           retention-days: 14
