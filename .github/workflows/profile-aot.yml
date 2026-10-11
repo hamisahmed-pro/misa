@@ -3,6 +3,8 @@ name: profile-aot
 on:
   push:
     branches: [engineering/benchmark-ci-hardening]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       workload:
