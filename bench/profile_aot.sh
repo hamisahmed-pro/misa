@@ -27,6 +27,12 @@ BIN="$TMP/misa-profile-target"
 
 cd "$ROOT"
 python3 impl/bin/misa build "$SOURCE" -o "$BIN"
+# Keep the exact executable and a symbol table with the profile artifact so
+# address-only Callgrind entries can be resolved after the runner is gone.
+cp "$BIN" "$OUT/misa-profile-target"
+if command -v nm >/dev/null 2>&1; then
+  nm -n "$BIN" > "$OUT/symbols.txt" 2> "$OUT/nm-stderr.txt" || true
+fi
 {
   echo "source=$SOURCE"
   echo "revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
