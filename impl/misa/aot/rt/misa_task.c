@@ -1518,6 +1518,13 @@ void misa_task_shutdown(void) {
  *    A handler that throws is isolated per connection (-> 500).
  */
 #ifdef __EMSCRIPTEN__
+/* The scheduler calls these hooks unconditionally. Web builds have no raw
+ * TCP sockets, so provide inert hooks while the public socket operations
+ * below report E600. Keep the definitions here (outside the POSIX-only
+ * implementation) so wasm links without pulling in select()/socket APIs. */
+static void sock_wait_remove(SockWait *w) { (void)w; }
+static void pump_socks(void) {}
+
 /* Web: no raw TCP sockets under wasm — clean E600, never a trap. */
 MVal *misa_net_connect(MVal *host, MVal *port, int line, int col) {
     (void)host; (void)port;
