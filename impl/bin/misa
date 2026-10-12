@@ -775,7 +775,7 @@ def main(argv):
         return cmd_benchmark(args)
     if cmd == "fuzz":
         return cmd_fuzz(args)
-    if cmd == "build" and 1 <= len(args) <= 12:
+    if cmd == "build" and 1 <= len(args) <= 16:
         if "--list-targets" in args:
             return cmd_list_targets()
         out = None
