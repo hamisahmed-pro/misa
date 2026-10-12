@@ -26,6 +26,8 @@ trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/misa-profile-target"
 
 cd "$ROOT"
+rm -f "$OUT/metadata.txt" "$OUT/symbols.txt" "$OUT/nm-stderr.txt" \
+  "$OUT/misa-profile-target"
 python3 impl/bin/misa build "$SOURCE" -o "$BIN" --keep-symbols
 # Keep the exact executable and symbol table so address-only samples can be
 # resolved after the temporary directory has been removed.
