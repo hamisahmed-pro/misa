@@ -114,8 +114,8 @@ For performance work, `python impl/bin/misa benchmark` is the canonical
 correctness-gated Misa-vs-Python harness. The separate
 [`bench/multilang`](bench/multilang/README.md) harness compares a matched
 sieve workload across Misa, Python, Node.js, PHP, Go, and Rust; it is explicitly
-a single-workload smoke benchmark, not a general language ranking. Comparative
-The [comparative AI-agent evaluation protocol](agent-trials/BENCHMARK-PROTOCOL.md)
+a single-workload smoke benchmark, not a general language ranking. The
+[comparative AI-agent evaluation protocol](agent-trials/BENCHMARK-PROTOCOL.md)
 defines a controlled approach for future language/productivity trials. See
 [`bench/multilang/README.md`](bench/multilang/README.md) for the six-language
 benchmark matrix and `bench/profile_aot.sh` for Linux AOT profiling.
