@@ -26,12 +26,15 @@ trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/misa-profile-target"
 
 cd "$ROOT"
-python3 impl/bin/misa build "$SOURCE" -o "$BIN"
-# Keep the exact executable and a symbol table with the profile artifact so
-# address-only Callgrind entries can be resolved after the runner is gone.
+python3 impl/bin/misa build "$SOURCE" -o "$BIN" --keep-symbols
+# Keep the exact executable and symbol table so address-only samples can be
+# resolved after the temporary directory has been removed.
 cp "$BIN" "$OUT/misa-profile-target"
 if command -v nm >/dev/null 2>&1; then
   nm -n "$BIN" > "$OUT/symbols.txt" 2> "$OUT/nm-stderr.txt" || true
+fi
+if [[ ! -s "$OUT/symbols.txt" ]]; then
+  echo "warning: native symbol table is empty; hot-symbol attribution may be incomplete" >&2
 fi
 {
   echo "source=$SOURCE"
@@ -41,15 +44,20 @@ fi
   echo "command=$BIN $*"
 } > "$OUT/metadata.txt"
 
-# Try sampling first. Some CI VMs set perf_event_paranoid=4, which cannot be
-# overridden by an unprivileged job. In that case, fall back to Callgrind.
+# Start clean: repeated runs must not leave stale profiler data that could be
+# mistaken for output from this invocation.
+rm -f "$OUT/perf.data" "$OUT/callgrind.out" "$OUT/hot-symbols.txt" \
+  "$OUT/stdout.txt" "$OUT/perf-stderr.txt" "$OUT/callgrind-stderr.txt"
+# Try sampling first. A perf executable alone does not imply kernel access.
+# Only record the selected profiler after it successfully produces a profile.
 if command -v perf >/dev/null 2>&1; then
-  echo "profiler=perf" >> "$OUT/metadata.txt"
   if perf record --call-graph dwarf -o "$OUT/perf.data" -- "$BIN" "$@" > "$OUT/stdout.txt" 2> "$OUT/perf-stderr.txt"; then
-    perf report --stdio --no-children --sort symbol -i "$OUT/perf.data" > "$OUT/hot-symbols.txt"
-    echo "profile_mode=perf-sampling" >> "$OUT/metadata.txt"
-    echo "Profile written using perf sampling to $OUT"
-    exit 0
+    if perf report --stdio --no-children --sort symbol -i "$OUT/perf.data" > "$OUT/hot-symbols.txt"; then
+      echo "profiler=perf" >> "$OUT/metadata.txt"
+      echo "profile_mode=perf-sampling" >> "$OUT/metadata.txt"
+      echo "Profile written using perf sampling to $OUT"
+      exit 0
+    fi
   fi
   echo "perf sampling unavailable; attempting Callgrind fallback." >&2
   cat "$OUT/perf-stderr.txt" >&2 || true
@@ -57,12 +65,16 @@ if command -v perf >/dev/null 2>&1; then
 fi
 
 if command -v valgrind >/dev/null 2>&1 && command -v callgrind_annotate >/dev/null 2>&1; then
-  echo "profiler=valgrind-callgrind" >> "$OUT/metadata.txt"
-  valgrind --tool=callgrind --callgrind-out-file="$OUT/callgrind.out" --collect-jumps=yes -- "$BIN" "$@" > "$OUT/stdout.txt" 2> "$OUT/callgrind-stderr.txt"
-  callgrind_annotate --inclusive=yes --auto=yes "$OUT/callgrind.out" > "$OUT/hot-symbols.txt"
-  echo "profile_mode=callgrind-instrumentation" >> "$OUT/metadata.txt"
-  echo "Profile written using Callgrind instrumentation to $OUT"
-  exit 0
+  if valgrind --tool=callgrind --callgrind-out-file="$OUT/callgrind.out" --collect-jumps=yes -- "$BIN" "$@" > "$OUT/stdout.txt" 2> "$OUT/callgrind-stderr.txt"; then
+    if callgrind_annotate --inclusive=yes --auto=yes "$OUT/callgrind.out" > "$OUT/hot-symbols.txt"; then
+      echo "profiler=valgrind-callgrind" >> "$OUT/metadata.txt"
+      echo "profile_mode=callgrind-instrumentation" >> "$OUT/metadata.txt"
+      echo "Profile written using Callgrind instrumentation to $OUT"
+      exit 0
+    fi
+  fi
+  echo "Callgrind profiling failed; see $OUT/callgrind-stderr.txt" >&2
+  exit 2
 fi
 
 echo "Neither perf sampling nor Callgrind profiling is available." >&2
