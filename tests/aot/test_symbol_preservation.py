@@ -16,7 +16,16 @@ def run(command):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="misa-symbols-") as tmp:
-        binary = os.path.join(tmp, "sieve")
+        stripped = os.path.join(tmp, "sieve-release")
+        release = run([MISA, "build", SOURCE, "-o", stripped])
+        if release.returncode:
+            raise SystemExit("default release build failed:\n" +
+                             release.stdout + release.stderr)
+        release_sections = run(["readelf", "-S", stripped])
+        if release_sections.returncode or ".symtab" in release_sections.stdout:
+            raise SystemExit("default release build unexpectedly retained .symtab")
+
+        binary = os.path.join(tmp, "sieve-profile")
         build = run([MISA, "build", SOURCE, "-o", binary, "--keep-symbols"])
         if build.returncode:
             raise SystemExit("symbol-preserving build failed:\n" +
@@ -26,16 +35,12 @@ def main():
         if nm.returncode:
             raise SystemExit("nm could not inspect symbol-preserving binary:\n" +
                              nm.stdout + nm.stderr)
-        if not any(line.rstrip().endswith((" main", " main.main"))
-                   for line in nm.stdout.splitlines()):
-            # Misa's emitted entrypoint names are compiler-specific; require
-            # at least one named text symbol instead of assuming a mangling.
-            named_text = [
-                line for line in nm.stdout.splitlines()
-                if len(line.split()) >= 3 and line.split()[-2] in ("T", "t")
-            ]
-            if not named_text:
-                raise SystemExit("symbol-preserving binary has no named text symbols")
+        named_text = [
+            line for line in nm.stdout.splitlines()
+            if len(line.split()) >= 3 and line.split()[-2] in ("T", "t")
+        ]
+        if not named_text:
+            raise SystemExit("symbol-preserving binary has no named text symbols")
 
         readelf = run(["readelf", "-S", binary])
         if readelf.returncode or ".symtab" not in readelf.stdout:
