@@ -17,16 +17,53 @@ def main():
         "n-body", "-0.1690\n", "-0.1689\n")
     assert benchmark._same_benchmark_output("fannkuch-redux", "7\n", "7\n")
     assert not benchmark._same_benchmark_output("fannkuch-redux", "7\n", "8\n")
+    ci = benchmark._bootstrap_ratio_ci95(
+        [0.11, 0.13, 0.12, 0.10, 0.14],
+        [0.10, 0.10, 0.11, 0.09, 0.12],
+        resamples=500, seed=17,
+    )
+    assert len(ci) == 2 and 0 < ci[0] <= ci[1]
+    assert ci == benchmark._bootstrap_ratio_ci95(
+        [0.11, 0.13, 0.12, 0.10, 0.14],
+        [0.10, 0.10, 0.11, 0.09, 0.12],
+        resamples=500, seed=17,
+    ), "bootstrap intervals must be reproducible"
     passing = {"results": [{
         "name": "n-body", "status": "ok", "ratio_misa_python": 1.2,
-        "misa": {"times": [0.1, 0.2]},
-        "python": {"times": [0.1, 0.1]},
+        "misa": {"times": [0.1, 0.14], "median": 0.12},
+        "python": {"times": [0.1, 0.1], "median": 0.1},
     }]}
     assert benchmark.validate_required_cases(passing, ["n-body"], 2) == []
+    bad_median = {"results": [{**passing["results"][0],
+                                 "misa": {"times": [0.1, 0.14], "median": 0.2}}]}
+    assert any("disagrees with sample median" in e for e in
+               benchmark.validate_required_cases(bad_median, ["n-body"], 2))
+    missing_median = {"results": [{**passing["results"][0],
+                                   "python": {"times": [0.1, 0.1]}}]}
+    assert any("median must be a finite positive number" in e for e in
+               benchmark.validate_required_cases(missing_median, ["n-body"], 2))
     assert any("expected exactly one" in e for e in
                benchmark.validate_required_cases(passing, ["fasta"], 2))
     assert any("expected 3" in e for e in
                benchmark.validate_required_cases(passing, ["n-body"], 3))
+    # Fail closed on non-finite, non-positive, or internally inconsistent timings.
+    bad_nan = {"results": [{**passing["results"][0],
+                            "misa": {"times": [0.1, float("nan")]}}]}
+    assert any("finite positive seconds" in e for e in
+               benchmark.validate_required_cases(bad_nan, ["n-body"], 2))
+    bad_zero = {"results": [{**passing["results"][0],
+                             "python": {"times": [0.0, 0.1]}}]}
+    assert any("finite positive seconds" in e for e in
+               benchmark.validate_required_cases(bad_zero, ["n-body"], 2))
+    bad_ratio = {"results": [{**passing["results"][0],
+                              "ratio_misa_python": float("inf")}]}
+    assert any("finite positive number" in e for e in
+               benchmark.validate_required_cases(bad_ratio, ["n-body"], 2))
+    inconsistent = {"results": [{**passing["results"][0],
+                                 "ratio_misa_python": 8.0}]}
+    assert any("disagrees with sample medians" in e for e in
+               benchmark.validate_required_cases(inconsistent, ["n-body"], 2))
+
     failed = {"results": [{**passing["results"][0], "status": "checksum-mismatch"}]}
     assert any("checksum-mismatch" in e for e in
                benchmark.validate_required_cases(failed, ["n-body"], 2))

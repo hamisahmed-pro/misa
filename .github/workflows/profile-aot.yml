@@ -1,0 +1,73 @@
+name: profile-aot
+
+on:
+  push:
+    branches: [engineering/benchmark-ci-hardening]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: "Misa source file to profile"
+        required: true
+        default: "bench/multilang/sieve.misa"
+        type: choice
+        options:
+          - bench/multilang/sieve.misa
+      argument:
+        description: "Single program argument"
+        required: true
+        default: "500000"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install AOT dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev linux-tools-common linux-tools-generic valgrind
+          python -m pip install --upgrade pip
+          python -m pip install llvmlite==0.50.0
+      - name: Record host and profiler capabilities
+        continue-on-error: true
+        run: |
+          uname -a || true
+          python --version || true
+          perf --version || true
+          valgrind --version || true
+          callgrind_annotate --version || true
+          cat /proc/sys/kernel/perf_event_paranoid || true
+          git rev-parse HEAD || true
+      - name: Profile AOT workload
+        run: |
+          chmod +x impl/bin/misa
+          mkdir -p bench/results/profile
+          bash bench/profile_aot.sh "${{ inputs.workload || 'bench/multilang/sieve.misa' }}" bench/results/profile "${{ inputs.argument || '500000' }}"
+      - name: Upload CPU profile and metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: misa-aot-profile-${{ github.run_id }}
+          path: |
+            bench/results/profile/metadata.txt
+            bench/results/profile/stdout.txt
+            bench/results/profile/perf.data
+            bench/results/profile/callgrind.out
+            bench/results/profile/hot-symbols.txt
+            bench/results/profile/perf-stderr.txt
+            bench/results/profile/callgrind-stderr.txt
+            bench/results/profile/misa-profile-target
+            bench/results/profile/symbols.txt
+            bench/results/profile/nm-stderr.txt
+          if-no-files-found: warn
+          retention-days: 14

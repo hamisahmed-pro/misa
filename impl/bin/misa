@@ -10,7 +10,7 @@ Usage:
   misa mir <file.misa> [--opt]
   misa fmt <file.misa> [--write]
   misa test [path] [--mock mocks.json] [--json]
-  misa build <file.misa> [-o output] [--emit-llvm file.ll] [--target triple] [--preload-file src@dst]... [--json]
+  misa build <file.misa> [-o output] [--emit-llvm file.ll] [--target triple] [--preload-file src@dst]... [--keep-symbols] [--json]
   misa build --list-targets
   misa serve <file.misa> [--port PORT] [--key KEY] [--key-env VAR] [--base-url URL]
   misa lsp
@@ -626,7 +626,8 @@ def cmd_test(path, mock_path, as_json):
 
 
 
-def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
+def cmd_build(path, out, emit_llvm, target, as_json, preload_files,
+              keep_symbols=False):
     from misa.aot.build import build, canonical_target, host_triple
     from misa.aot.emit import AOTError
     if not out:
@@ -646,7 +647,8 @@ def cmd_build(path, out, emit_llvm, target, as_json, preload_files):
     try:
         ok, errors = build(path, out, emit_llvm=emit_llvm or "",
                            target=target or "",
-                           preload_files=preload_files)
+                           preload_files=preload_files,
+                           keep_symbols=keep_symbols)
     except AOTError as e:
         # C-2: surface the E-code (was a raw die() string).
         die(f"{e.code}: {e.message}")
@@ -773,17 +775,21 @@ def main(argv):
         return cmd_benchmark(args)
     if cmd == "fuzz":
         return cmd_fuzz(args)
-    if cmd == "build" and 1 <= len(args) <= 12:
+    if cmd == "build" and 1 <= len(args) <= 16:
         if "--list-targets" in args:
             return cmd_list_targets()
         out = None
         emit_llvm = ""
         target = ""
         preload_files = []
+        keep_symbols = False
         rest = []
         i = 0
         while i < len(args):
-            if args[i] == "-o" and i + 1 < len(args):
+            if args[i] == "--keep-symbols":
+                keep_symbols = True
+                i += 1
+            elif args[i] == "-o" and i + 1 < len(args):
                 out = args[i + 1]
                 i += 2
             elif args[i] == "--emit-llvm" and i + 1 < len(args):
@@ -803,9 +809,9 @@ def main(argv):
         if len(rest) != 1:
             die(f"usage: misa build <file.misa> [-o output] "
                 f"[--emit-llvm file.ll] [--target triple] "
-                f"[--preload-file src@dst]")
+                f"[--preload-file src@dst] [--keep-symbols]")
         return cmd_build(rest[0], out, emit_llvm, target, as_json,
-                         preload_files)
+                         preload_files, keep_symbols=keep_symbols)
     if cmd == "debug" and 1 <= len(args) <= 4:
         agent = "--agent" in args
         if "--" in args:

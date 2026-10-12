@@ -110,6 +110,16 @@ The project status and test inventory below are generated from
 measured results from roadmap goals; the limited MIR-to-AOT path is experimental
 and does not replace the established emitter for unsupported functions.
 
+For performance work, `python impl/bin/misa benchmark` is the canonical
+correctness-gated Misa-vs-Python harness. The separate
+[`bench/multilang`](bench/multilang/README.md) harness compares a matched
+sieve workload across Misa, Python, Node.js, PHP, Go, and Rust; it is explicitly
+a single-workload smoke benchmark, not a general language ranking. The
+[comparative AI-agent evaluation protocol](agent-trials/BENCHMARK-PROTOCOL.md)
+defines a controlled approach for future language/productivity trials. See
+[`bench/multilang/README.md`](bench/multilang/README.md) for the six-language
+benchmark matrix and `bench/profile_aot.sh` for Linux AOT profiling.
+
 ## License
 
 Dual-licensed MIT / Apache-2.0 (see LICENSE-MIT, LICENSE-APACHE),
@@ -132,7 +142,7 @@ the same arrangement as Rust.
 | 8 | Ignition (public launch) | ⏳ not-started — Compiler/runtime stabilization and independent benchmark validation before public launch |
 | 9 | Flywheel (ecosystem growth) | ⏳ not-started |
 
-**Tests:** 477 unit, 40 AOT parity, 11 differential
+**Tests:** 477 unit, 41 AOT parity, 11 differential
 
 <!-- STATUS:GENERATED — do not hand-edit. Run tools/gen_readme.py to regenerate. -->
 <!-- STATUS:END -->

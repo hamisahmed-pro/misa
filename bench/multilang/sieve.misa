@@ -1,0 +1,47 @@
+// Matched Sieve of Eratosthenes workload used by the six-language benchmark.
+fn main() throws E300 {
+  var n = 500000
+  let args = argv()
+  if len(args) > 0 {
+    n = int(args[0])
+  }
+  if n < 2 {
+    print("0 0")
+    return
+  }
+
+  var prime: [Bool] = []
+  list.reserve(prime, n + 1)
+  var i = 0
+  while i <= n {
+    list.push(prime, true)
+    i = i + 1
+  }
+  prime[0] = false
+  prime[1] = false
+  i = 2
+  while i * i <= n {
+    if prime[i] {
+      var j = i * i
+      while j <= n {
+        prime[j] = false
+        j = j + i
+      }
+    }
+    i = i + 1
+  }
+
+  var count = 0
+  var total = 0
+  i = 2
+  while i <= n {
+    if prime[i] {
+      count = count + 1
+      total = total + i
+    }
+    i = i + 1
+  }
+  print("{count} {total}")
+}
+
+main()

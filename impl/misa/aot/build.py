@@ -736,7 +736,8 @@ def _emit_object(mod, triple: str) -> bytes:
 
 
 def build(path: str, out_path: str, *, emit_llvm: str = "",
-          target: str = "", verbose: bool = False, preload_files=()):
+          target: str = "", verbose: bool = False, preload_files=(),
+          keep_symbols: bool = False):
     """Compile path -> out_path. Returns (ok: bool, errors: list).
 
     `target` is an LLVM triple (see --list-targets). Empty (or the
@@ -895,11 +896,14 @@ def build(path: str, out_path: str, *, emit_llvm: str = "",
         prog_o = os.path.join(td, "prog.o")
         with open(prog_o, "wb") as f:
             f.write(obj_bytes)
-        # W-2: --gc-sections drops unreferenced runtime code; -s strips
-        # the (large, -g-built) vendored libgc.a debug info. Neither is
-        # needed at runtime (no backtraces/dLaddr in the runtime).
+        # Keep release binaries small by default, but allow profilers and
+        # debuggers to retain the executable symbol table. This flag only
+        # controls linker stripping; it does not change generated code.
+        link_flags = [GC_LINK_FLAG]
+        if not keep_symbols:
+            link_flags.append("-Wl,-s")
         cmd = (["gcc", prog_o] + rt_objs +
-               ["-o", out_path, GC_LINK_FLAG, "-Wl,-s"] + libs)
+               ["-o", out_path] + link_flags + libs)
         if verbose:
             print("link:", " ".join(cmd), file=sys.stderr)
         r = subprocess.run(cmd, capture_output=True, text=True)

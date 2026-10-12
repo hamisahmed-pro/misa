@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from datetime import datetime, timezone
 
 # Benchmarks with working Misa ports and their configs.
@@ -50,6 +51,20 @@ BENCHMARKS = [
 # synthesize simplified data internally. Skipping is both safer and more
 # honest than comparing unmatched workloads or blocking on an unprovided stream.
 STDIN_MISMATCHED = {"reverse-complement", "knucleotide", "regex-redux"}
+
+
+_TEMP_DIRS = []
+
+
+def _temporary_path(prefix):
+    """Return a collision-free path in a private temp directory.
+
+    Keeping the TemporaryDirectory objects alive makes cleanup automatic at
+    process exit while isolating concurrent benchmark invocations.
+    """
+    directory = tempfile.TemporaryDirectory(prefix="misa-benchmark-")
+    _TEMP_DIRS.append(directory)
+    return os.path.join(directory.name, prefix)
 
 
 def _find_misa_root():
@@ -122,6 +137,34 @@ def _p95(values):
     return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
 
 
+def _bootstrap_ratio_ci95(misa_times, python_times, resamples=2000, seed=20261009):
+    """Deterministic paired-bootstrap 95% interval for the ratio of medians.
+
+    Pairing follows each randomized benchmark trial index. The interval is
+    descriptive, not proof of universal performance or independence across
+    separate benchmark sessions.
+    """
+    if (len(misa_times) != len(python_times) or len(misa_times) < 2
+            or resamples < 100):
+        raise ValueError("paired bootstrap requires equal samples >= 2 and resamples >= 100")
+    pairs = list(zip(misa_times, python_times))
+    rng = random.Random(seed)
+    ratios = []
+    count = len(pairs)
+    for _ in range(resamples):
+        draw = [pairs[rng.randrange(count)] for _ in range(count)]
+        left = statistics.median(pair[0] for pair in draw)
+        right = statistics.median(pair[1] for pair in draw)
+        if right > 0 and math.isfinite(left) and math.isfinite(right):
+            ratios.append(left / right)
+    if not ratios:
+        raise ValueError("bootstrap produced no valid ratios")
+    ratios.sort()
+    lower = ratios[max(0, math.ceil(0.025 * len(ratios)) - 1)]
+    upper = ratios[max(0, math.ceil(0.975 * len(ratios)) - 1)]
+    return [round(lower, 6), round(upper, 6)]
+
+
 def _same_benchmark_output(name, left, right):
     """Compare official results semantically where reference formatting differs."""
     if name in {"n-body", "spectral-norm"}:
@@ -135,26 +178,73 @@ def _same_benchmark_output(name, left, right):
 
 
 def validate_required_cases(data, required, runs):
-    """Return acceptance-gate errors for required correctness-passing cases."""
+    """Fail closed unless each required case has valid, positive measurements.
+
+    This gate intentionally validates the shape and numeric quality of the
+    measurements in addition to status/sample counts. It does not trust a
+    non-null ratio alone: corrupted JSON, NaN/Infinity, zero/negative timing,
+    or an inconsistent reported ratio must never enter a performance score.
+    """
     errors = []
     by_name = {}
     for result in data.get("results", []):
         by_name.setdefault(result.get("name"), []).append(result)
+
     for name in required:
         matches = by_name.get(name, [])
         if len(matches) != 1:
             errors.append(f"{name}: expected exactly one result, found {len(matches)}")
             continue
+
         result = matches[0]
         if result.get("status") != "ok":
             errors.append(f"{name}: status is {result.get('status', 'missing')}")
             continue
-        if result.get("ratio_misa_python") is None:
-            errors.append(f"{name}: no validated runtime ratio")
+
+        ratio = result.get("ratio_misa_python")
+        if (not isinstance(ratio, (int, float)) or isinstance(ratio, bool)
+                or not math.isfinite(ratio) or ratio <= 0):
+            errors.append(f"{name}: runtime ratio must be a finite positive number")
+
+        medians = {}
         for impl in ("misa", "python"):
             samples = result.get(impl, {}).get("times", [])
-            if len(samples) != runs:
-                errors.append(f"{name}: {impl} has {len(samples)} samples, expected {runs}")
+            if not isinstance(samples, list) or len(samples) != runs:
+                count = len(samples) if isinstance(samples, list) else "invalid"
+                errors.append(f"{name}: {impl} has {count} samples, expected {runs}")
+                continue
+            valid_samples = all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value > 0
+                for value in samples
+            )
+            if not valid_samples:
+                errors.append(f"{name}: {impl} samples must all be finite positive seconds")
+                continue
+            medians[impl] = statistics.median(samples)
+
+        for impl in ("misa", "python"):
+            median = result.get(impl, {}).get("median")
+            if (not isinstance(median, (int, float)) or isinstance(median, bool)
+                    or not math.isfinite(median) or median <= 0):
+                errors.append(f"{name}: {impl} median must be a finite positive number")
+            elif impl in medians and not math.isclose(
+                median, medians[impl], rel_tol=0.0, abs_tol=0.00000000051
+            ):
+                errors.append(
+                    f"{name}: reported {impl} median {median} disagrees with "
+                    f"sample median {medians[impl]:.9g}"
+                )
+
+        if "misa" in medians and "python" in medians:
+            expected_ratio = medians["misa"] / medians["python"]
+            if isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and math.isfinite(ratio):
+                # The canonical report rounds ratios to two decimal places.
+                if not math.isclose(ratio, expected_ratio, rel_tol=0.00005, abs_tol=0.000005):
+                    errors.append(
+                        f"{name}: reported ratio {ratio} disagrees with sample medians "
+                        f"({expected_ratio:.6g})"
+                    )
     return errors
 
 
@@ -236,7 +326,7 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
         return {"name": name, "status": "missing-misa-port"}
 
     # Build Misa once (not timed)
-    bin_path = f"/tmp/misa_bench_{name}"
+    bin_path = _temporary_path(f"misa_bench_{name}")
     ok, err = build_misa(misa_bin, misa_path, bin_path)
     if not ok:
         return {"name": name, "status": "build-failed", "error": err[:200]}
@@ -301,22 +391,23 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
         "input_argument": arg,
         "status": "ok",
         "misa": {
-            "median": round(misa_med, 3),
-            "times": [round(t, 6) for t in misa_times],
-            "p95": round(_p95(misa_times), 6),
-            "min": round(min(misa_times), 6), "max": round(max(misa_times), 6),
-            "stddev": round(statistics.stdev(misa_times), 6) if len(misa_times)>1 else 0,
+            "median": round(misa_med, 9),
+            "times": [round(t, 9) for t in misa_times],
+            "p95": round(_p95(misa_times), 9),
+            "min": round(min(misa_times), 9), "max": round(max(misa_times), 9),
+            "stddev": round(statistics.stdev(misa_times), 9) if len(misa_times)>1 else 0,
             "peak_rss_kb": max(misa_rss),
         },
         "python": {
-            "median": round(py_med, 3),
-            "times": [round(t, 6) for t in py_times],
-            "p95": round(_p95(py_times), 6),
-            "min": round(min(py_times), 6), "max": round(max(py_times), 6),
-            "stddev": round(statistics.stdev(py_times), 6) if len(py_times)>1 else 0,
+            "median": round(py_med, 9),
+            "times": [round(t, 9) for t in py_times],
+            "p95": round(_p95(py_times), 9),
+            "min": round(min(py_times), 9), "max": round(max(py_times), 9),
+            "stddev": round(statistics.stdev(py_times), 9) if len(py_times)>1 else 0,
             "peak_rss_kb": max(py_rss),
         },
-        "ratio_misa_python": round(ratio, 2) if ratio else None,
+        "ratio_misa_python": round(ratio, 6) if ratio else None,
+        "ratio_ci95": (_bootstrap_ratio_ci95(misa_times, py_times) if len(misa_times) >= 2 else None),
         "verdict": "faster" if ratio and ratio < 1 else "slower",
     }
 
@@ -324,11 +415,11 @@ def bench_one(name, misa_file, python_file, arg, misa_bin, bench_dir, runs,
 def bench_startup(misa_bin, runs=5):
     """Measure hello-world startup time (launch to first output)."""
     prog = 'print("hi")\n'
-    path = "/tmp/bench_hello.misa"
+    path = _temporary_path("bench_hello.misa")
     with open(path, "w") as f:
         f.write(prog)
     # Build once
-    bin_path = "/tmp/bench_hello_bin"
+    bin_path = _temporary_path("bench_hello_bin")
     wall, out, err, rc, _rss = run_cmd([misa_bin, "build", path, "-o", bin_path])
     if rc != 0:
         return {"status": "build-failed", "error": err[:200]}
@@ -354,9 +445,7 @@ def bench_compile(misa_bin, runs=3):
         return {"status": "missing-source"}
     times = []
     for _ in range(runs):
-        out_path = "/tmp/bench_compile_out"
-        if os.path.exists(out_path):
-            os.remove(out_path)
+        out_path = _temporary_path("bench_compile_out")
         wall, out, err, rc, _rss = run_cmd([misa_bin, "build", src, "-o", out_path])
         if rc != 0:
             return {"status": "build-failed", "error": err[:200]}
