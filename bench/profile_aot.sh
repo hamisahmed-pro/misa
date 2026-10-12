@@ -40,10 +40,18 @@ if [[ ! -s "$OUT/symbols.txt" ]]; then
 fi
 {
   echo "source=$SOURCE"
+  echo "source_sha256=$(sha256sum "$SOURCE" 2>/dev/null | awk '{print $1}' || echo unavailable)"
+  echo "binary_sha256=$(sha256sum "$BIN" 2>/dev/null | awk '{print $1}' || echo unavailable)"
   echo "revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "platform=$(uname -a)"
+  echo "python=$(python3 --version 2>&1)"
+  echo "gcc=$(gcc -dumpfullversion -dumpversion 2>/dev/null || echo unavailable)"
+  echo "llvmlite=$(python3 -c 'import llvmlite; print(llvmlite.__version__)' 2>/dev/null || echo unavailable)"
+  echo "llvm=$(python3 -c 'from llvmlite import binding; print(binding.llvm_version_info)' 2>/dev/null || echo unavailable)"
   echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unavailable)"
-  echo "command=$BIN $*"
+  printf 'arguments='
+  printf '%q ' "$@"
+  printf '\n'
 } > "$OUT/metadata.txt"
 
 # Start clean: repeated runs must not leave stale profiler data that could be
